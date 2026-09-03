@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  buildBanParams,
-  buildModActionFields,
-  buildWarningCommentText,
+  buildFailureToast,
+  buildSuccessToast,
   CommentLike,
   PostLike,
   resolveTargetIdFromContext,
@@ -11,7 +10,7 @@ import {
   targetFromComment,
   targetFromPost,
 } from '../src/actions/escalate.js';
-import { escalate } from '../src/lib/escalation.js';
+import type { EscalateResult } from '../src/lib/service.js';
 import { RULES } from '../src/lib/rules.js';
 
 const TOXICITY = RULES[1]; // R2 — Toxicity
@@ -33,6 +32,16 @@ const COMMENT: CommentLike = {
 
 const postTarget = targetFromPost(POST);
 const commentTarget = targetFromComment(COMMENT);
+
+const BAN_RESULT: EscalateResult = {
+  action: 'ban',
+  duration_days: 7,
+  label: '7 day ban',
+  comment_id: '',
+  priors: 2,
+  rule_name: 'Toxicity',
+  recorded: true,
+};
 
 describe('targetFromPost / targetFromComment', () => {
   it('maps a post to a post target with itself as the parent post', () => {
@@ -78,155 +87,78 @@ describe('ruleLabel', () => {
   });
 });
 
-describe('buildWarningCommentText', () => {
-  it('mentions the author, the thing kind, the rule label and ban escalation', () => {
-    const text = buildWarningCommentText({
+describe('buildSuccessToast', () => {
+  it('formats a warn with the rule label', () => {
+    const toast = buildSuccessToast({
+      result: {
+        action: 'warn',
+        duration_days: 0,
+        label: 'Warning',
+        comment_id: 't1_abc123',
+        priors: 0,
+        rule_name: 'Toxicity',
+        recorded: true,
+      },
+      targetUser: 'spammer99',
       rule: TOXICITY,
-      kind: 'comment',
-      authorName: 'spammer99',
     });
 
-    expect(text).toContain('u/spammer99');
-    expect(text).toContain('comment');
-    expect(text).toContain('R2 — Toxicity');
-    expect(/ban/i.test(text)).toBe(true);
+    expect(toast).toBe('Warned u/spammer99 (R2 — Toxicity)');
   });
 
-  it('says "post" for post targets and "comment" for comment targets', () => {
-    const forPost = buildWarningCommentText({ rule: TOXICITY, kind: 'post', authorName: 'a' });
-    const forComment = buildWarningCommentText({ rule: TOXICITY, kind: 'comment', authorName: 'a' });
-    expect(forPost).toContain('your post');
-    expect(forPost).not.toContain('your comment');
-    expect(forComment).toContain('your comment');
-  });
-
-  it('includes the reason when given and omits the reason line otherwise', () => {
-    const withReason = buildWarningCommentText({
+  it('formats a temporary ban with the ladder label from the service', () => {
+    const toast = buildSuccessToast({
+      result: BAN_RESULT,
+      targetUser: 'spammer99',
       rule: TOXICITY,
-      reason: 'Be civil',
-      kind: 'post',
-      authorName: 'a',
-    });
-    expect(withReason).toContain('Reason: Be civil');
-
-    const withoutReason = buildWarningCommentText({ rule: TOXICITY, kind: 'post', authorName: 'a' });
-    expect(withoutReason).not.toContain('Reason:');
-  });
-});
-
-describe('buildBanParams', () => {
-  it('builds a temporary ban with a duration, notification message and modlog note', () => {
-    const params = buildBanParams({
-      step: escalate(1), // 3 day ban
-      rule: TOXICITY,
-      target: commentTarget,
-      priors: 1,
-      reason: 'beeping at mods',
     });
 
-    expect(params.username).toBe('spammer99');
-    expect(params.subredditName).toBe('RPClipsGTA');
-    expect(params.duration).toBe(3);
-    expect(params.context).toBe(commentTarget.permalink);
-    expect(params.message).toContain('3 day(s)');
-    expect(params.message).toContain('R2 — Toxicity');
-    expect(params.message).toContain('beeping at mods');
-    expect(params.note).toContain('R2 — Toxicity');
-    expect(params.note).toContain('priors: 1');
-    expect(params.note).toContain('beeping at mods');
-    expect(params.reason).toBe('R2 — Toxicity — beeping at mods');
+    expect(toast).toBe('Banned u/spammer99 — 7 day ban');
   });
 
-  it('OMITS the duration key entirely for permanent bans', () => {
-    const params = buildBanParams({
-      step: escalate(4), // permanent
+  it('formats a permanent ban from its label', () => {
+    const toast = buildSuccessToast({
+      result: { ...BAN_RESULT, duration_days: 0, label: 'Permanent ban', priors: 4 },
+      targetUser: 'spammer99',
       rule: TOXICITY,
-      target: postTarget,
-      priors: 4,
-      reason: '',
     });
 
-    expect('duration' in params).toBe(false);
-    expect(params.message).toContain('permanently');
-    expect(params.note).not.toContain('reason:');
-    expect(params.reason).toBe('R2 — Toxicity');
+    expect(toast).toBe('Banned u/spammer99 — Permanent ban');
+  });
+
+  it('appends "(not recorded)" when the service could not write the record', () => {
+    const toast = buildSuccessToast({
+      result: { ...BAN_RESULT, recorded: false },
+      targetUser: 'spammer99',
+      rule: TOXICITY,
+    });
+
+    expect(toast).toBe('Banned u/spammer99 — 7 day ban (not recorded)');
+  });
+
+  it('appends "(not recorded)" to warns too', () => {
+    const toast = buildSuccessToast({
+      result: {
+        action: 'warn',
+        duration_days: 0,
+        label: 'Warning',
+        comment_id: 't1_abc123',
+        priors: 0,
+        rule_name: 'Toxicity',
+        recorded: false,
+      },
+      targetUser: 'spammer99',
+      rule: TOXICITY,
+    });
+
+    expect(toast).toBe('Warned u/spammer99 (R2 — Toxicity) (not recorded)');
   });
 });
 
-describe('buildModActionFields', () => {
-  const now = new Date('2025-06-01T12:00:00.000Z');
+describe('buildFailureToast', () => {
+  it('keeps the message short and includes the error detail', () => {
+    const toast = buildFailureToast('Escalation service returned 401 Unauthorized: bad token');
 
-  it('builds a warn record on a post with duration_days 0 and devvit source fields', () => {
-    const fields = buildModActionFields({
-      step: escalate(0), // warn
-      rule: TOXICITY,
-      target: postTarget,
-      modUsername: 'realmod',
-      reason: 'toxic clip title',
-      now,
-    });
-
-    expect(fields).toEqual({
-      action: 'warn',
-      rule: 2,
-      duration_days: 0,
-      target_user: 'spammer99',
-      mod_user: 'realmod',
-      command_comment_id: '',
-      thing_id: 't3_abc123',
-      permalink: '/r/RPClipsGTA/comments/abc123/some_clip/',
-      reason: 'toxic clip title',
-      rule_name: 'Toxicity',
-      action_date: '2025-06-01T12:00:00.000Z',
-      source: 'devvit',
-      source_ref: 'devvit:t3_abc123',
-      reddit_post_id: 't3_abc123',
-      reddit_comment_id: '',
-    });
-  });
-
-  it('builds a ban record on a comment: real duration, parent post id, comment id', () => {
-    const fields = buildModActionFields({
-      step: escalate(2), // 7 day ban
-      rule: TOXICITY,
-      target: commentTarget,
-      modUsername: 'realmod',
-      reason: '',
-      now,
-    });
-
-    expect(fields.action).toBe('ban');
-    expect(fields.duration_days).toBe(7);
-    expect(fields.thing_id).toBe('t1_xyz789');
-    expect(fields.reddit_comment_id).toBe('t1_xyz789');
-    expect(fields.reddit_post_id).toBe('t3_abc123'); // parent post
-    expect(fields.reason).toBe('');
-  });
-
-  it('records 0 duration_days for permanent bans', () => {
-    const fields = buildModActionFields({
-      step: escalate(4), // permanent
-      rule: TOXICITY,
-      target: postTarget,
-      modUsername: 'realmod',
-      now,
-    });
-    expect(fields.duration_days).toBe(0);
-  });
-
-  it('defaults action_date to the current time as ISO', () => {
-    const before = new Date();
-    const fields = buildModActionFields({
-      step: escalate(0),
-      rule: TOXICITY,
-      target: postTarget,
-      modUsername: 'realmod',
-    });
-    const after = new Date();
-
-    const ts = new Date(fields.action_date);
-    expect(fields.action_date).toBe(ts.toISOString());
-    expect(ts.getTime()).toBeGreaterThanOrEqual(before.getTime());
-    expect(ts.getTime()).toBeLessThanOrEqual(after.getTime());
+    expect(toast).toBe('Escalation failed: Escalation service returned 401 Unauthorized: bad token');
   });
 });

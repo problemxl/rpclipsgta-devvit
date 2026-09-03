@@ -1,82 +1,76 @@
 /**
- * r/RPClipsGTA one-button auto-escalating warn/ban Devvit app.
+ * r/RPClipsGTA thin-trigger escalate Devvit app.
  *
  * A mod presses "Escalate" on a post or comment, picks one of the 12 rules
- * (plus an optional reason), and the app:
- *  1. counts the target author's prior mod actions in PocketBase,
- *  2. picks the escalation ladder step (0 priors → warning, 1/2/3 → 3/7/30
- *     day bans, 4+ → permanent ban),
- *  3. executes it (warning comment reply vs. ban + notification PM),
- *  4. records the action back into PocketBase (`mod_actions`).
+ * (plus an optional reason), and the app POSTs it to the Python escalation
+ * service, which owns everything else: prior-count lookup, escalation ladder,
+ * warn/ban execution and the PocketBase record. The app then toasts the
+ * result.
  *
- * Failure handling:
- * - If the execution (comment/ban/PM or the PocketBase lookup) fails, the
- *   mod is notified via toast + PM and NOTHING is recorded.
- * - If the execution succeeded but the PocketBase write failed, the mod is
- *   notified via toast + PM that the action is applied but unrecorded, so
- *   they can backfill the record (otherwise the ladder under-counts).
+ * Failure handling is deliberately minimal: failures surface as a short
+ * error toast only. No PM fallbacks — the service handles user notification
+ * and its own recording fallbacks (see README).
  */
 
 import { Devvit, SettingScope } from '@devvit/public-api';
 
 import {
-  buildBanParams,
-  buildModActionFields,
-  buildWarningCommentText,
+  buildFailureToast,
+  buildSuccessToast,
   resolveTargetIdFromContext,
   targetFromComment,
   targetFromPost,
 } from './actions/escalate.js';
-import { escalate } from './lib/escalation.js';
-import { countModActions, createModAction, pbLogin } from './lib/pocketbase.js';
 import { ruleByNumber, RULES } from './lib/rules.js';
+import { callEscalate, type EscalatePayload } from './lib/service.js';
 
 // =============================================================================
 // ⚠️⚠️⚠️  EDIT ME BEFORE UPLOAD  ⚠️⚠️⚠️
 //
-// PB_HOST must be the PUBLIC hostname of the PocketBase server.
+// SERVICE_BASE_URL must be the PUBLIC base URL of the Python escalation
+// service (e.g. your Coolify deployment) — `https://` protocol, no path.
+// The app POSTs to `${SERVICE_BASE_URL}/devvit/escalate`.
 //
 // Devvit apps execute on Reddit's servers: `localhost` / LAN / 127.0.0.1
 // addresses are unreachable from there. Additionally, fetch domains are
-// STATIC — they are baked into the app bundle at upload time from this
-// constant (see API_NOTES.md §a). They cannot be set per-installation via
-// app settings, and wildcards are not supported. Changing the PocketBase
-// host means editing this constant and RE-UPLOADING the app.
+// STATIC — the host is baked into the app bundle at upload time from this
+// constant (see API_NOTES.md §a). It cannot be set per-installation via app
+// settings, and wildcards are not supported. Changing the service host means
+// editing this constant and RE-UPLOADING the app.
 //
-// Bare hostname only: no protocol, no port, no path. Example:
-//   const PB_HOST = 'pb.example.com';
+// Example:
+//   const SERVICE_BASE_URL = 'https://escalate.example.com';
 // =============================================================================
-const PB_HOST = 'pb.rpclips.example.com';
+const SERVICE_BASE_URL = 'https://escalate.rpclips.example.com';
+
+// The allowlist takes bare hostnames only (no protocol/port/path) and is
+// registered at upload time — derive it here, at module top, per the
+// platform's static-domain requirement (API_NOTES.md §a).
+const SERVICE_HOST = new URL(SERVICE_BASE_URL).host;
 
 Devvit.configure({
   redditAPI: true,
-  http: { domains: [PB_HOST] },
+  http: { domains: [SERVICE_HOST] },
 });
 
-// PocketBase credentials are app-scoped SECRETS, set via the CLI:
-//   devvit settings set pocketbase-url
-//   devvit settings set pocketbase-email
-//   devvit settings set pocketbase-password
+// The shared service token and its URL are app-scoped SECRETS, set via the CLI:
+//   devvit settings set escalate-token
+//   devvit settings set service-url
+// The token must match ESCALATE_TOKEN on the Python service.
 Devvit.addSettings([
   {
     type: 'string',
-    name: 'pocketbase-url',
-    label: 'PocketBase base URL',
-    helpText: `Full https:// URL of the PocketBase server (must use the public host baked into the app: ${PB_HOST}).`,
+    name: 'escalate-token',
+    label: 'Escalation service token (ESCALATE_TOKEN)',
+    helpText: 'Shared secret sent as X-Escalate-Token; must match the Python service.',
     scope: SettingScope.App,
     isSecret: true,
   },
   {
     type: 'string',
-    name: 'pocketbase-email',
-    label: 'PocketBase superuser email',
-    scope: SettingScope.App,
-    isSecret: true,
-  },
-  {
-    type: 'string',
-    name: 'pocketbase-password',
-    label: 'PocketBase superuser password',
+    name: 'service-url',
+    label: 'Escalation service base URL',
+    helpText: `Full https:// URL of the Python service (must use the host baked into this app: ${SERVICE_HOST}).`,
     scope: SettingScope.App,
     isSecret: true,
   },
@@ -86,8 +80,8 @@ const escalateForm = Devvit.createForm(
   {
     title: 'Escalate',
     description:
-      'Automatically warns or bans the author based on how many mod actions they ' +
-      'already have on record: 0 priors → warning, then 3 / 7 / 30 day bans, then permanent.',
+      'The escalation service decides the punishment automatically based on how many ' +
+      'prior mod actions the author already has: a warning first, then escalating bans.',
     acceptLabel: 'Apply',
     fields: [
       {
@@ -104,13 +98,88 @@ const escalateForm = Devvit.createForm(
         type: 'string',
         name: 'reason',
         label: 'Reason (optional)',
-        helpText: 'Included in the warning comment / ban message and the mod action record.',
+        helpText: 'Forwarded to the service and included in the warning / ban message.',
       },
     ],
   },
-  // Thin handler: all logic lives in runEscalation below.
+  // Thin handler: all real logic lives on the Python service.
   async (event, context) => {
-    await runEscalation(event.values, context);
+    // -- Form input -----------------------------------------------------------
+    const rule = ruleByNumber(Number(event.values.rule?.[0])); // select values are string[]
+    if (!rule) {
+      safeToast(context, 'No rule selected — action aborted.');
+      return;
+    }
+    const reason = typeof event.values.reason === 'string' ? event.values.reason.trim() : '';
+
+    // -- Target & actor -------------------------------------------------------
+    // showForm pass-through data is not delivered on the submit event in
+    // 0.14.2, so re-derive the target from the context ids (comment wins over
+    // post — on a comment menu press both may be set).
+    const targetId = resolveTargetIdFromContext(context.commentId, context.postId);
+    const modUsername = context.username;
+    if (!targetId || !modUsername) {
+      safeToast(
+        context,
+        !targetId
+          ? 'Could not determine the target post/comment — action aborted.'
+          : 'Could not determine the acting moderator — action aborted.'
+      );
+      return;
+    }
+
+    // -- Settings ---------------------------------------------------------------
+    const [token, rawServiceUrl] = await Promise.all([
+      context.settings.get<string>('escalate-token'),
+      context.settings.get<string>('service-url'),
+    ]);
+    const serviceUrl = normalizeBaseUrl(rawServiceUrl);
+    if (!token || !serviceUrl) {
+      safeToast(
+        context,
+        'Service settings are not configured ' +
+          '(devvit settings set escalate-token / service-url). Action aborted.'
+      );
+      return;
+    }
+    if (!isAllowedServiceHost(serviceUrl)) {
+      // Fetches to other hosts are blocked by the platform anyway — fail with
+      // a clear message instead of an opaque plugin error.
+      safeToast(
+        context,
+        `The service-url setting must use the host baked into this app (${SERVICE_HOST}) — ` +
+          'otherwise the fetch is blocked. Action aborted.'
+      );
+      return;
+    }
+
+    try {
+      // -- Resolve the target thing (comment vs post) -------------------------
+      const target = targetId.startsWith('t1_')
+        ? targetFromComment(await context.reddit.getCommentById(targetId))
+        : targetFromPost(await context.reddit.getPostById(targetId));
+
+      // -- Hand off to the service --------------------------------------------
+      const payload: EscalatePayload = {
+        target_user: target.authorName,
+        target_id: target.thingId,
+        rule: rule.number,
+        reason,
+        mod_user: modUsername,
+      };
+      const result = await callEscalate(fetch, serviceUrl, token, payload);
+      console.log(
+        `[escalate] service executed ${result.label} on u/${target.authorName} ` +
+          `(priors: ${result.priors}, recorded: ${result.recorded})`
+      );
+      safeToast(context, buildSuccessToast({ result, targetUser: target.authorName, rule }));
+    } catch (err) {
+      // No PM fallback: the service handles user notification and its own
+      // recording fallbacks. The mod gets a short toast; details are logged.
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error(`[escalate] action failed: ${detail}`);
+      safeToast(context, buildFailureToast(detail));
+    }
   }
 );
 
@@ -121,8 +190,7 @@ Devvit.addMenuItem({
   forUserType: 'moderator',
   onPress: (event, context) => {
     // The `showForm(formKey, data)` payload is NOT readable in onSubmit in
-    // 0.14.2 — it is passed along for forward-compat only. The submit handler
-    // re-derives the target from the context ids instead.
+    // 0.14.2 — the submit handler re-derives the target from the context ids.
     context.ui.showForm(escalateForm, { targetId: event.targetId });
   },
 });
@@ -136,170 +204,23 @@ function safeToast(context: Devvit.Context, text: string): void {
   try {
     context.ui.showToast(text);
   } catch {
-    // Swallow: the more important PM paths below have their own reporting.
+    // Swallow: a failed toast must not throw over the handler's result.
   }
 }
 
-/** Trim whitespace and trailing slashes so `${baseUrl}/api/...` never doubles up. */
+/** Trim whitespace and trailing slashes so `${baseUrl}/devvit/...` never doubles up. */
 function normalizeBaseUrl(url: string | undefined): string | undefined {
   const trimmed = url?.trim().replace(/\/+$/, '');
   return trimmed ? trimmed : undefined;
 }
 
 /** Host comparison lenient about a leading `www.`, like configure() is. */
-function isAllowedPbHost(baseUrl: string): boolean {
-  const host = new URL(baseUrl).host.replace(/^www\./, '');
-  return host === PB_HOST;
-}
-
-/**
- * The whole escalate flow for one form submission. Throws are caught inside;
- * the mod is always informed of the outcome.
- */
-async function runEscalation(
-  values: { rule?: string[]; reason?: string },
-  context: Devvit.Context
-): Promise<void> {
-  // -- Form input -----------------------------------------------------------
-  const rule = ruleByNumber(Number(values.rule?.[0])); // select values are string[]
-  if (!rule) {
-    safeToast(context, 'No rule selected — action aborted.');
-    return;
-  }
-  const reason = typeof values.reason === 'string' ? values.reason.trim() : '';
-
-  // -- Target & actor -------------------------------------------------------
-  // showForm pass-through data is not delivered on the submit event in
-  // 0.14.2, so re-derive the target from the context ids (comment wins over
-  // post — on a comment menu press both may be set).
-  const targetId = resolveTargetIdFromContext(context.commentId, context.postId);
-  const modUsername = context.username;
-  if (!targetId || !modUsername) {
-    safeToast(
-      context,
-      !targetId
-        ? 'Could not determine the target post/comment — action aborted.'
-        : 'Could not determine the acting moderator — action aborted.'
-    );
-    return;
-  }
-
+function isAllowedServiceHost(baseUrl: string): boolean {
   try {
-    // -- Resolve the target thing (comment vs post) --------------------------
-    const target = targetId.startsWith('t1_')
-      ? targetFromComment(await context.reddit.getCommentById(targetId))
-      : targetFromPost(await context.reddit.getPostById(targetId));
-
-    // -- PocketBase: credentials + prior count -------------------------------
-    const baseUrl = normalizeBaseUrl(await context.settings.get<string>('pocketbase-url'));
-    const email = await context.settings.get<string>('pocketbase-email');
-    const password = await context.settings.get<string>('pocketbase-password');
-    if (!baseUrl || !email || !password) {
-      safeToast(
-        context,
-        'PocketBase settings are not configured ' +
-          '(devvit settings set pocketbase-url / pocketbase-email / pocketbase-password). Action aborted.'
-      );
-      return;
-    }
-    let pbUrl: URL;
-    try {
-      pbUrl = new URL(baseUrl);
-    } catch {
-      safeToast(context, `"${baseUrl}" is not a valid https:// URL — fix the pocketbase-url setting. Action aborted.`);
-      return;
-    }
-    if (pbUrl.protocol !== 'https:' || !isAllowedPbHost(baseUrl)) {
-      safeToast(
-        context,
-        `PocketBase host must be https://${PB_HOST} (the domain baked into this app) — ` +
-          'otherwise the fetch is blocked. Fix the pocketbase-url setting. Action aborted.'
-      );
-      return;
-    }
-
-    const token = await pbLogin(fetch, baseUrl, email, password);
-    const priors = await countModActions(fetch, baseUrl, token, target.authorName);
-    const step = escalate(priors);
-
-    // -- Execute the ladder step ---------------------------------------------
-    if (step.action === 'warn') {
-      // Warns are a COMMENT REPLY on the target thing, NOT a private message.
-      const warning = await context.reddit.submitComment({
-        id: target.thingId,
-        text: buildWarningCommentText({
-          rule,
-          reason: reason || undefined,
-          kind: target.kind,
-          authorName: target.authorName,
-        }),
-        runAs: 'APP',
-      });
-      try {
-        // 0.14.2 exposes Comment.distinguish(makeSticky?) — distinguish as a
-        // mod (not sticky). If the app account lacks mod rights or the API
-        // hiccups, log it and continue: the warning text stands on its own.
-        await warning.distinguish();
-      } catch (err) {
-        console.warn(`[escalate] could not distinguish warning comment ${warning.id}: ${err}`);
-      }
-    } else {
-      // Bans: duration per ladder (key omitted entirely when permanent),
-      // notification `message` PM to the banned user, modlog `note`.
-      await context.reddit.banUser(buildBanParams({ step, rule, target, priors, reason }));
-      // One-line summary PM to the acting mod: ban confirmations are worth a
-      // durable record, toasts are ephemeral.
-      await context.reddit
-        .sendPrivateMessage({
-          to: modUsername,
-          subject: `[escalate] ${step.label} applied to u/${target.authorName}`,
-          text:
-            `${step.label} applied to u/${target.authorName} — R${rule.number} ${rule.name}` +
-            `${reason ? ` — ${reason}` : ''} (priors: ${priors}). Target: ${target.thingId}.`,
-        })
-        .catch(() => undefined); // best-effort; toast below still fires
-    }
-
-    // -- Record the action in PocketBase --------------------------------------
-    const fields = buildModActionFields({ step, rule, target, modUsername, reason });
-    try {
-      await createModAction(fetch, baseUrl, token, fields);
-    } catch (err) {
-      // Execution succeeded but the write failed: the ladder will UNDER-COUNT
-      // this user until the record is backfilled. Tell the acting mod.
-      const detail = err instanceof Error ? err.message : String(err);
-      console.error(`[escalate] PocketBase write failed after ${step.label}: ${detail}`);
-      safeToast(context, `${step.label} applied, but the PocketBase write FAILED — action NOT recorded. ${detail}`);
-      await context.reddit
-        .sendPrivateMessage({
-          to: modUsername,
-          subject: `[escalate] ACTION NOT RECORDED: ${step.label} on u/${target.authorName}`,
-          text:
-            `The ${step.label} on u/${target.authorName} (${target.thingId}) was applied on Reddit, ` +
-            `but writing the mod_actions record to PocketBase failed:\n\n${detail}\n\n` +
-            'Create the record manually, otherwise the escalation ladder will under-count this user.',
-        })
-        .catch(() => undefined); // best-effort
-      return;
-    }
-
-    safeToast(context, `${step.label} applied to u/${target.authorName} (priors: ${priors}) and recorded.`);
-  } catch (err) {
-    // Execution itself failed (target resolution, submission/ban, PB
-    // lookup): surface it and record NOTHING.
-    const detail = err instanceof Error ? err.message : String(err);
-    console.error(`[escalate] action failed: ${detail}`);
-    safeToast(context, `Escalation failed — nothing was executed or recorded. ${detail}`);
-    if (modUsername) {
-      await context.reddit
-        .sendPrivateMessage({
-          to: modUsername,
-          subject: '[escalate] action failed',
-          text:
-            `The escalation on ${targetId} failed before anything was executed or recorded:\n\n${detail}`,
-        })
-        .catch(() => undefined); // best-effort
-    }
+    const host = new URL(baseUrl).host.replace(/^www\./, '');
+    return host === SERVICE_HOST;
+  } catch {
+    return false;
   }
 }
 

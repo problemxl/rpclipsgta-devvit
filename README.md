@@ -1,156 +1,188 @@
 # rpclipsgta-modactions
 
-A one-button **auto-escalating warn/ban** Devvit app for r/RPClipsGTA.
+A one-button **escalate** Devvit app for r/RPClipsGTA — a thin trigger in
+front of the Python escalation service.
 
 A moderator presses **Escalate** on any post or comment, picks which of the 12
-rules was broken (plus an optional reason), and the app does the rest:
+rules was broken (plus an optional reason), and the app POSTs that to the
+Python service. The service owns everything else:
 
-1. Looks up how many prior mod actions the author already has in PocketBase.
-2. Picks the escalation ladder step for that count.
-3. Executes it — a distinguished warning comment reply for first offenses, or
-   a ban (with notification message) for repeat offenders.
-4. Writes the action back into the PocketBase `mod_actions` collection so the
+1. counts the author's prior mod actions in PocketBase,
+2. picks the escalation ladder rung for that count,
+3. executes it — a distinguished warning comment reply for first offenses, or
+   a ban for repeat offenders,
+4. records the action back into the PocketBase `mod_actions` collection so the
    Python-side `!w` / `!b` recorder and this app share one history.
 
-All rule data, the ladder and the PocketBase client live in `src/lib/`; the
-pure, unit-tested helpers (warning text, ban params, record fields) live in
-`src/actions/escalate.ts`; `src/main.ts` is only the Devvit wiring.
+The app itself does **no** ladder logic and **no** PocketBase access. It only
+resolves the target, forwards `{ target_user, target_id, rule, reason,
+mod_user }` to the service, and toasts the outcome.
 
-## Escalation ladder
+```
+┌──────────────────────────┐   POST /devvit/escalate   ┌──────────────────────────┐
+│  Devvit app (this repo)  │ ────────────────────────► │  Python escalation svc   │
+│  menu → form → POST →    │ ◄──────────────────────── │  priors · ladder ·       │
+│  toast                   │      EscalateResult       │  execution · PocketBase  │
+└──────────────────────────┘                           └────────────┬─────────────┘
+     reddit: resolve target                                         │
+                                                                    ▼
+                                                         ┌────────────────────┐
+                                                         │     PocketBase     │
+                                                         │    mod_actions     │
+                                                         └────────────────────┘
+```
 
-Prior mod actions are counted from PocketBase (`mod_actions` where
-`target_user = <author>`). The acting mod does not choose the punishment:
+## Endpoint contract
 
-| Priors | Action        | Length            |
-| ------ | ------------- | ----------------- |
-| 0      | ⚠️ Warning    | —                 |
-| 1      | 🔨 Ban        | 3 days            |
-| 2      | 🔨 Ban        | 7 days            |
-| 3      | 🔨 Ban        | 30 days           |
-| 4+     | 🔨 Ban        | **Permanent**     |
+`POST {SERVICE_BASE_URL}/devvit/escalate`
 
-(The ladder lives in `src/lib/escalation.ts` — counts above 4 clamp to
-permanent.)
+Headers:
 
-## What happens on each action
+| Header            | Value                                          |
+| ----------------- | ---------------------------------------------- |
+| `X-Escalate-Token` | shared secret — must equal the service's `ESCALATE_TOKEN` |
+| `Content-Type`    | `application/json`                             |
 
-### Warn (0 priors)
+Request body (sent by the app):
 
-- The app submits a **comment reply on the target post/comment** (not a PM),
-  as the app account, containing:
-  - the author handle and what was flagged (post vs. comment),
-  - the rule, as `R<number> — <name>` (e.g. `R2 — Toxicity`),
-  - the optional reason, if the mod typed one,
-  - a notice that repeat offenses escalate to temporary, then permanent, bans.
-- The reply is then **distinguished as a mod** via `Comment.distinguish()`
-  (exists in @devvit/public-api 0.14.2 — no sticky). If distinguishing fails
-  (e.g. the app account is not a moderator), the failure is logged and
-  skipped gracefully; the warning text stands on its own.
+```json
+{
+  "target_user": "spammer99",
+  "target_id": "t1_xyz789",
+  "rule": 2,
+  "reason": "toxic chat",
+  "mod_user": "realmod"
+}
+```
 
-### Ban (1+ priors)
+- `target_user` — author username, no leading `u/`.
+- `target_id` — thing id of the moderated content (`t3_...` post / `t1_...` comment).
+- `rule` — canonical rule number, 1–12.
+- `reason` — free text from the form; `''` when the mod skipped it.
+- `mod_user` — acting moderator's username, no leading `u/`.
 
-- `context.reddit.banUser(...)` with the ladder duration in days. For
-  permanent bans the `duration` key is **omitted entirely** (per the typings,
-  absence = permanent; `0` is not a documented permanent value).
-- A ban notification `message` (PM to the banned user) is included — that
-  part of the old flow stays.
-- A modlog `note` is attached: rule + reason + prior count.
+Success response (`200`, parsed by the app):
 
-### Confirmation to the acting mod
+```json
+{
+  "action": "warn",
+  "duration_days": 7,
+  "label": "7 day ban",
+  "comment_id": "",
+  "priors": 2,
+  "rule_name": "Toxicity",
+  "recorded": true
+}
+```
 
-- A **toast** is shown on every outcome (success, abort, failure). Toasts are
-  available in 0.14.2 via `context.ui.showToast`, so they are the primary
-  confirmation channel.
-- **Bans additionally PM the acting mod a one-line summary** — a toast is
-  ephemeral, and a durable record of who banned whom is worth the extra
-  message.
-- Warns need no extra PM: the distinguished comment on the thing *is* the
-  visible confirmation.
+- `action` — `"warn"` or `"ban"`.
+- `duration_days` — ban length in days; `0` for warnings and permanent bans.
+- `label` — human-readable ladder label (`Warning`, `3 day ban`, `7 day ban`,
+  `30 day ban`, `Permanent ban`).
+- `comment_id` — thing id of the submitted warning comment (`t1_...`); `''` for bans.
+- `priors` — prior mod-action count the service used to pick the rung.
+- `rule_name` — name of the violated rule.
+- `recorded` — `false` when the service executed the action but the PocketBase
+  write failed; the app then appends `(not recorded)` to the success toast.
 
-### Failure handling
+Errors: any non-2xx is surfaced to the mod as a short error toast. When the
+error body is JSON, the app includes the FastAPI-style `{ "detail": ... }`
+message, e.g. `Escalation failed: Escalation service returned 401
+Unauthorized: invalid escalation token`.
 
-- **Execution failed** (couldn't resolve the target, comment/ban submission
-  failed, PocketBase unreachable): toast + PM to the acting mod. **Nothing is
-  recorded.**
-- **Executed, but the PocketBase write failed**: the action has already
-  happened, so the mod gets a toast + PM saying the action is **applied but
-  NOT recorded**, with the error, so they can backfill the `mod_actions`
-  record manually (otherwise the ladder will under-count that user).
+The toast formats are:
 
-## PocketBase host requirement (⚠️ edit `PB_HOST`)
+- warn: `Warned u/x (R2 — Toxicity)`
+- ban: `Banned u/x — 7 day ban` (label comes from the service)
+- unrecorded: suffix ` (not recorded)`
 
-The PocketBase host is **hardcoded at the top of `src/main.ts`**:
+## What the app does on each press
+
+1. Opens the **rule + reason form** (select of the 12 rules, optional reason).
+2. Re-derives the target from the submit context (`context.commentId` wins
+   over `context.postId`; the `showForm` pass-through payload is not readable
+   in `onSubmit` in @devvit/public-api 0.14.2) and resolves the thing to get
+   the author name and thing id.
+3. Reads the two secret settings, **POSTs to the service** and **toasts** the
+   result.
+
+There are **no PM fallbacks** in the app: the service handles user
+notification (warning comment / ban message) and its own PocketBase recording
+fallbacks. Failures surface as a short toast, details go to the app logs.
+
+## Setup
+
+### 1. Edit `SERVICE_BASE_URL` (⚠️ required before upload)
+
+The service base URL is **hardcoded at the top of `src/main.ts`**:
 
 ```ts
-const PB_HOST = 'pb.rpclips.example.com';
+const SERVICE_BASE_URL = 'https://escalate.rpclips.example.com';
 ```
 
 This is a hard requirement of the Devvit platform:
 
 - Apps run on **Reddit's servers** — `localhost` and LAN addresses are
-  unreachable from there. The host must be a **public URL**.
-- Fetch domains are **static**: they are baked into the app bundle from
-  `Devvit.configure({ http: { domains: [PB_HOST] } })` **at upload time**.
-  They cannot be set per-installation via app settings, wildcards
-  (`*.example.com`) are not supported, and it must be a bare hostname (no
-  protocol/port/path).
-- **Changing the PocketBase host means editing `PB_HOST` and re-uploading the
-  app.** The `pocketbase-url` setting must use exactly this host (the app
-  aborts with a clear toast if it doesn't match — the fetch would be blocked
-  anyway).
+  unreachable from there. The host must be a **public URL** (e.g. your
+  Coolify deployment of the Python service).
+- Fetch domains are **static**: the host is derived from this constant via
+  `new URL(SERVICE_BASE_URL).host` and baked into the app bundle from
+  `Devvit.configure({ http: { domains: [SERVICE_HOST] } })` **at upload
+  time**. It cannot be set per-installation via app settings, wildcards
+  (`*.example.com`) are not supported, and the allowlist entry must be a bare
+  hostname.
+- **Changing the service host means editing `SERVICE_BASE_URL` and
+  re-uploading the app.** The `service-url` setting must use exactly this
+  host (the app aborts with a clear toast if it doesn't — the fetch would be
+  blocked anyway).
 
-## Secrets setup
+### 2. Deploy the Python service publicly
+
+The Python escalation service must be reachable at the public host above and
+started with `ESCALATE_TOKEN` set to **the same value** you put into the
+`escalate-token` app setting below — the app sends it as `X-Escalate-Token`
+and the service rejects requests with a wrong token (`401`).
+
+### 3. Set the app secrets
 
 Credentials are app-scoped secrets — never hardcoded:
 
 ```bash
-devvit settings set pocketbase-url      # e.g. https://pb.rpclips.example.com
-devvit settings set pocketbase-email    # PocketBase superuser email
-devvit settings set pocketbase-password # PocketBase superuser password
+devvit settings set escalate-token  # shared secret (== service ESCALATE_TOKEN)
+devvit settings set service-url     # full https:// URL of the service (same host as SERVICE_BASE_URL)
 ```
-
-(These correspond to the three `isSecret` settings declared in
-`src/main.ts`. `pocketbase-url` must be the full `https://` URL of the same
-host as `PB_HOST`.)
 
 ## Publish checklist
 
-1. **Edit `PB_HOST`** in `src/main.ts` to the public PocketBase host.
+1. **Edit `SERVICE_BASE_URL`** in `src/main.ts` to the public host of the
+   Python service.
 2. `npm run build && npm test` — both must be green.
 3. `devvit login`.
-4. Set the three secrets (see above) — `devvit settings set` works before or
+4. Set the two secrets (see above) — `devvit settings set` works before or
    after upload, but they must be set before the app is used.
 5. `devvit upload` (or `devvit publish`), then **install the app to the
    subreddit** via the app installation page
    (`https://developers.reddit.com/r/<subreddit>/apps`).
-6. Make sure the **app account is a moderator** of the subreddit — otherwise
-   the warning comment submits fine but the `distinguish()` call fails (it is
-   skipped gracefully, logged as a warning).
-7. Smoke-test: press **Escalate** on a post with a test account, confirm the
-   warning comment appears distinguished and a `mod_actions` record exists
-   with `source = 'devvit'`.
+6. Smoke-test: press **Escalate** on a post with a test account, confirm the
+   toast (`Warned u/... (R1 — Reddit Rules)` on a fresh account) and that a
+   `mod_actions` record exists with `source = 'devvit'`.
 
 ## Coexistence with the Python `!w` / `!b` recorder
 
-The Python-side `!w` / `!b` comment-command recorder **stays running** until
-you deliberately retire it by setting `MOD_COMMANDS_ENABLED=false` in the
-Python bot's environment. Both systems write to the same `mod_actions`
-collection with the same field conventions, so counts stay consistent:
-
-- `duration_days` is `0` for warnings recorded live (matches the live `!w`
-  recorder; only imported historical warnings carry real durations when
-  known) and for permanent bans.
-- This app writes `source = 'devvit'`, `source_ref = devvit:<thingId>` and
-  `command_comment_id = ''` (no chat command triggered it), while the Python
-  recorder uses its own `source` / `source_ref` values — records remain
-  attributable to their origin.
+The Python-side `!w` / `!b` comment-command recorder writes to the same
+`mod_actions` collection with the same field conventions, so counts stay
+consistent regardless of which surface (chat command or this app) triggered
+the action. The service attributes records to their origin via its `source` /
+`source_ref` fields.
 
 ## Development
 
 ```bash
 npm run build   # tsc --noEmit — type check
-npm test        # vitest run — 36 unit tests (no network, no Devvit runtime)
+npm test        # vitest run — 25 unit tests (no network, no Devvit runtime)
 ```
 
-The handler logic in `src/actions/escalate.ts` and `src/lib/` is pure and
-covered by `tests/`; `src/main.ts` is deliberately thin Devvit wiring.
+- `src/lib/service.ts` — typed client for `POST /devvit/escalate` (injectable fetch).
+- `src/actions/escalate.ts` — pure helpers: target resolution + toast text builders.
+- `src/lib/rules.ts` — the canonical 12 subreddit rules.
+- `src/main.ts` — deliberately thin Devvit wiring (menu, form, settings, POST, toast).
