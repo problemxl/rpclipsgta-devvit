@@ -116,26 +116,32 @@ subreddit field:
 | Development | `S17Cjn21GT` | `[DEV FIXTURE]` |
 | QA/staging | `rpclipsgta_mod_dev` | `[QA FIXTURE]` |
 
-The app resolves the source post, validates that its submitted URL is a
-Twitch or Kick clip URL, and calls `reddit.submitPost` with `runAs: 'APP'`, the
-original URL, and a bounded title. The title includes `source:<post id>` and
-the source permalink for traceability. It deliberately does **not** call
+The app resolves the source post, requires that it belongs to
+`r/rpclipsgta`, verifies the acting username in Reddit's moderator listing,
+validates that its submitted URL is a Twitch or Kick clip URL, and calls
+`reddit.submitPost` with `runAs: 'APP'`, the original URL, and a bounded title.
+The title includes `source:<post id>` and the source permalink for visible
+traceability. A structured copy of that source/actor/target/destination data is
+also stored in global Redis metadata. It deliberately does **not** call
 `crosspost()` and never calls `submitComment()`.
 
 Fixture creation is deduplicated by source post ID + target using a global
-Redis `SET NX` claim. A repeated press reports that the fixture already exists;
-a failed Reddit submission releases the claim so it can be retried. Deleting a
-fixture manually does not clear the claim, so an operator should treat the
-command as create-once.
+Redis `SET NX` claim. A repeated press reports that the fixture is already
+claimed and returns the stored destination metadata when available. A pending
+claim expires after ten minutes, and a failed Reddit submission releases it so
+it can be retried. Deleting a fixture manually does not clear a successful
+claim, so an operator should treat the command as create-once.
 
 The menu is registered with Devvit's existing `forUserType: 'moderator'`
-convention. The form handler also requires a logged-in moderator username
-before it reads or writes fixture state. Reddit/Devvit remains the final
-authorization boundary; no non-moderator menu item is registered.
+convention. Because that setting controls menu visibility rather than being a
+complete authorization boundary, the form handler also checks the source
+subreddit and verifies current moderator membership through the Reddit API
+before it reads or writes fixture state. No
+non-moderator menu item is registered.
 
-Errors are shown in a toast for missing source posts, missing/non-clip URLs,
-invalid target selection, missing moderator identity, duplicate requests, or
-Reddit submission failures. The source and target receive no comments.
+Errors are shown in a toast for an unauthorized source/moderator,
+missing/non-clip URLs, invalid target selection, duplicate requests, or Reddit
+submission failures. The source and target receive no comments.
 
 ## What the app does on each press
 
@@ -211,9 +217,11 @@ and global Redis provides the duplicate claim.
    after upload, but they must be set before the app is used.
 5. `devvit upload` (or `devvit publish`), then **install the app to the
    source and test subreddits** via the app installation page
-   (`https://developers.reddit.com/r/<subreddit>/apps`). The moderator must
-   be a moderator where the menu is used, and the app account must be allowed
-   to submit link posts in both `S17Cjn21GT` and `rpclipsgta_mod_dev`.
+   (`https://developers.reddit.com/r/<subreddit>/apps`). The fixture menu is
+   intended only for source posts in `r/rpclipsgta`; the handler rejects other
+   source subreddits. The invoking user must be a current moderator of
+   `r/rpclipsgta`, and the app account must be allowed to submit link posts in
+   both `S17Cjn21GT` and `rpclipsgta_mod_dev`.
 6. Smoke-test escalation by pressing **Escalate** on a post with a test
    account, confirm the toast (`Warned u/... (R1 — Reddit Rules)` on a fresh
    account) and that a `mod_actions` record exists with `source = 'devvit'`.

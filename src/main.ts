@@ -22,8 +22,11 @@ import {
 } from './actions/escalate.js';
 import {
   createFixture,
+  FIXTURE_SOURCE_SUBREDDIT,
   FIXTURE_TARGETS,
   fixtureTargetFromSelection,
+  isAllowedFixtureSourceSubreddit,
+  isAuthorizedFixtureActor,
   type FixturePost,
 } from './actions/fixture.js';
 import { ruleByNumber, RULES } from './lib/rules.js';
@@ -242,6 +245,23 @@ const fixtureForm = Devvit.createForm(
 
     try {
       const source = await context.reddit.getPostById(sourceId);
+      if (!isAllowedFixtureSourceSubreddit(source.subredditName)) {
+        safeToast(
+          context,
+          `Fixtures may only be created from r/${FIXTURE_SOURCE_SUBREDDIT}.`
+        );
+        return;
+      }
+      const authorized = await isAuthorizedFixtureActor(
+        context.reddit,
+        source.subredditName,
+        actor
+      );
+      if (!authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+
       const fixture = await createFixture({
         source: {
           id: source.id,
@@ -254,11 +274,7 @@ const fixtureForm = Devvit.createForm(
         reddit: {
           submitPost: async (options: FixturePost) => {
             const created = await context.reddit.submitPost(options);
-            return {
-              id: created.id,
-              permalink: created.permalink,
-              edit: (editOptions: { text: string }) => created.edit(editOptions),
-            };
+            return { id: created.id, permalink: created.permalink };
           },
         },
         // Global app Redis makes the source+target claim stable across app
@@ -266,16 +282,21 @@ const fixtureForm = Devvit.createForm(
         dedupe: context.redis.global,
       });
 
+      const destination = fixture.record?.fixturePermalink;
       safeToast(
         context,
         fixture.created
-          ? `Created ${target.label} fixture for ${source.id}.`
-          : `A ${target.label} fixture already exists for ${source.id}.`
+          ? `Created ${target.label} fixture for ${source.id}${
+              destination ? `: ${destination}` : '.'
+            }`
+          : `A ${target.label} fixture is already claimed for ${source.id}.`
       );
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      console.error(`[fixture] action failed: ${detail}`);
-      safeToast(context, `Fixture failed: ${detail}`);
+      console.error(
+        `[fixture] action failed for ${sourceId}/${target.key}: ${detail}`
+      );
+      safeToast(context, 'Fixture creation failed. Check the app logs for details.');
     }
   }
 );
