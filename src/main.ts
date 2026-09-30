@@ -1,11 +1,10 @@
 /**
- * r/RPClipsGTA thin-trigger escalate Devvit app.
+ * r/RPClipsGTA moderator-actions Devvit app.
  *
- * A mod presses "Escalate" on a post or comment, picks one of the 12 rules
- * (plus an optional reason), and the app POSTs it to the Python escalation
- * service, which owns everything else: prior-count lookup, escalation ladder,
- * warn/ban execution and the PocketBase record. The app then toasts the
- * result.
+ * A mod can press "Escalate" on a post or comment, or explicitly create a
+ * clip fixture from a source post for the development/QA subreddits. Fixture
+ * creation makes a normal link post with the original Twitch/Kick URL; it is
+ * never automatic and never creates a comment or crosspost.
  *
  * Failure handling is deliberately minimal: failures surface as a short
  * error toast only. No PM fallbacks — the service handles user notification
@@ -21,6 +20,15 @@ import {
   targetFromComment,
   targetFromPost,
 } from './actions/escalate.js';
+import {
+  createFixture,
+  FIXTURE_SOURCE_SUBREDDIT,
+  FIXTURE_TARGETS,
+  fixtureTargetFromSelection,
+  isAllowedFixtureSourceSubreddit,
+  isAuthorizedFixtureActor,
+  type FixturePost,
+} from './actions/fixture.js';
 import { ruleByNumber, RULES } from './lib/rules.js';
 import { callEscalate, type EscalatePayload } from './lib/service.js';
 
@@ -50,6 +58,7 @@ const SERVICE_HOST = new URL(SERVICE_BASE_URL).host;
 
 Devvit.configure({
   redditAPI: true,
+  redis: true,
   http: { domains: [SERVICE_HOST] },
 });
 
@@ -192,6 +201,115 @@ Devvit.addMenuItem({
     // The `showForm(formKey, data)` payload is NOT readable in onSubmit in
     // 0.14.2 — the submit handler re-derives the target from the context ids.
     context.ui.showForm(escalateForm, { targetId: event.targetId });
+  },
+});
+
+const fixtureForm = Devvit.createForm(
+  {
+    title: 'Create clip fixture',
+    description:
+      'Creates one ordinary link post in a non-production test subreddit. ' +
+      'The source Twitch/Kick URL is preserved for detector testing.',
+    acceptLabel: 'Create fixture',
+    fields: [
+      {
+        type: 'select',
+        name: 'target',
+        label: 'Target subreddit',
+        required: true,
+        options: FIXTURE_TARGETS.map((target) => ({
+          label: target.label,
+          value: target.key,
+        })),
+      },
+    ],
+  },
+  async (event, context) => {
+    const target = fixtureTargetFromSelection(event.values.target);
+    if (!target) {
+      safeToast(context, 'Choose exactly Development or QA/staging.');
+      return;
+    }
+
+    const sourceId = context.postId;
+    if (!sourceId) {
+      safeToast(context, 'Could not determine the source post. Action aborted.');
+      return;
+    }
+
+    const actor = context.username?.trim();
+    if (!actor) {
+      safeToast(context, 'Could not determine the acting moderator. Action aborted.');
+      return;
+    }
+
+    try {
+      const source = await context.reddit.getPostById(sourceId);
+      if (!isAllowedFixtureSourceSubreddit(source.subredditName)) {
+        safeToast(
+          context,
+          `Fixtures may only be created from r/${FIXTURE_SOURCE_SUBREDDIT}.`
+        );
+        return;
+      }
+      const authorized = await isAuthorizedFixtureActor(
+        context.reddit,
+        source.subredditName,
+        actor
+      );
+      if (!authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+
+      const fixture = await createFixture({
+        source: {
+          id: source.id,
+          title: source.title,
+          url: source.url,
+          permalink: source.permalink,
+        },
+        target,
+        actor,
+        reddit: {
+          submitPost: async (options: FixturePost) => {
+            const created = await context.reddit.submitPost(options);
+            return { id: created.id, permalink: created.permalink };
+          },
+        },
+        // Global app Redis makes the source+target claim stable across app
+        // installations while NX prevents two simultaneous presses racing.
+        dedupe: context.redis.global,
+      });
+
+      const destination = fixture.record?.fixturePermalink;
+      safeToast(
+        context,
+        fixture.created
+          ? `Created ${target.label} fixture for ${source.id}${
+              destination ? `: ${destination}` : '.'
+            }`
+          : `A ${target.label} fixture is already claimed for ${source.id}.`
+      );
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[fixture] action failed for ${sourceId}/${target.key}: ${detail}`
+      );
+      safeToast(context, 'Fixture creation failed. Check the app logs for details.');
+    }
+  }
+);
+
+Devvit.addMenuItem({
+  label: 'Create clip fixture',
+  description: 'Copy this clip URL to the development or QA subreddit for testing',
+  location: 'post',
+  forUserType: 'moderator',
+  onPress: (event, context) => {
+    // The menu is moderator-only; the source id is re-derived from the form
+    // submit context because showForm pass-through data is opaque in 0.14.2.
+    context.ui.showForm(fixtureForm, { sourceId: event.targetId });
   },
 });
 
