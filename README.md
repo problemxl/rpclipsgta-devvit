@@ -152,33 +152,43 @@ auto-act. The setting is off by default.
 
 The trigger applies only high-confidence, deterministic checks:
 
-- Rule 5: non-whitelisted link domains, Twitch/Kick VOD URLs, and Streamable
-  titles without a non-empty `[streamer]` group.
+- Rule 5: HTTP(S) links must use one of the eight exact allowlisted domains
+  (one leading `www.` is ignored), Twitch/Kick VOD URLs are rejected, and
+  Twitch's only exception on `twitch.tv` is the legacy `/{channel}/clip/{slug}`
+  path; Streamable titles need a bracket tag at the title start containing
+  letters (a convention proxy — actual POV-streamer verification stays
+  manual).
 - Rule 6: a normalized whitelisted link URL already seen in the 14-day Redis
   window.
 - Rule 4: Twitch channel links, text posts with fewer than two sentences, and
   titles containing no letters.
-- Rule 12: a banned streamer name in the title or URL.
+- Rule 12: a banned streamer name in the title or decoded URL path segments
+  (query strings, hosts, and userinfo are not scanned).
 
 Everything else remains on the manual **Escalate** path; the app does not try
 to automate judgment-heavy rules such as toxicity, harassment, context,
-self-promotion, GTA RP relevance, or flairs. One violation is selected in the
-priority order R5 > R6 > R4 > R12. Every selected violation is removed. R5,
-R6, and R4 removals are sent to the escalation service with
-`mod_user: "devvit-auto"`; R12 is deliberately **remove-only** and never warns
-or bans the author, per the wiki.
+self-promotion, GTA RP relevance, or flairs. At most one violation is returned
+per rule, and one violation is selected in the priority order R5 > R6 > R4 >
+R12. Every selected violation is removed. R5, R6, and R4 removals are sent to
+the escalation service with `mod_user: "devvit-auto"`; R12 is deliberately
+**remove-only** and never warns or bans the author, per the wiki.
 
 Automatic processing is idempotent and installation-scoped in Redis:
 
 - `autoescalate:seen:{postId}` — 7-day claim, so a PostSubmit retry cannot
-  action the same post twice.
+  action the same post twice. If moderation fails before or during removal,
+  this claim is deleted so a replay can retry; after successful removal it is
+  kept, including when escalation fails.
 - `autoescalate:url:{normalizedUrl}` — 14-day first-seen URL claim used for
-  duplicate detection.
+  duplicate detection. It is claimed only by a clean, otherwise eligible post,
+  never by an R4/R5/R12-violating post.
 
-The service token and service URL must still be configured for an eligible
-removal to escalate. Removal and escalation failures are logged with an
-`[auto-escalate]` audit prefix; a removal failure never calls the service.
-`AUTO_MOD_USER` is the fixed service actor name `devvit-auto`.
+Detection and removal do not depend on service settings. If the service is
+missing, a punish-class post is still removed and logged as
+`actioned-unescalated`; a moderator can use the manual **Escalate** menu.
+Removal and escalation failures are logged with an `[auto-escalate]` audit
+prefix; a removal failure never calls the service. `AUTO_MOD_USER` is the
+fixed service actor name `devvit-auto`.
 
 ## What the app does on each press
 

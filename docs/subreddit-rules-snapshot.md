@@ -105,3 +105,15 @@ stays on the manual **Escalate** menu path:
 | R7 Self-promotion | Partial | 9:1 ratio needs history analysis — deferred (manual). |
 | R10 Flairs/tags | No | NSFW detection not deterministic — deferred (manual). |
 | R12 Banned Streamer | Yes | Name match in title/URL ⇒ **remove only, no warn/ban** per wiki. |
+
+### Implementation decisions
+
+The implementation uses exact HTTP(S) domains (ignoring one leading `www.`),
+with the documented legacy Twitch `/{channel}/clip/{slug}` exception. Rule 12
+scans the title and decoded URL path segments only. Streamable uses a
+letter-containing bracket tag at the start of the title as a convention proxy;
+actual POV-streamer verification remains manual. Removal is not gated by
+service configuration: missing service settings produce an unescalated removal
+with the manual Escalate menu as fallback. A seen claim is released before or
+during failed removal, but retained after removal; URL duplicate claims are
+made only by otherwise-clean posts.
