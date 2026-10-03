@@ -7,7 +7,7 @@ export interface Rule {
 /**
  * The canonical 12 rules of r/RPClipsGTA, in order.
  * Keep in sync with the subreddit's rule list — the select field in the mod
- * action form and the `rule` field of the service payload derive from this.
+ * action form and punishment record derive from this.
  */
 export const RULES: readonly Rule[] = [
   { number: 1, name: 'Reddit Rules' },
