@@ -23,6 +23,12 @@ class MemoryRedis implements RedisLike {
     if (options?.expiration) this.expirations.set(key, options.expiration);
     return 'OK';
   }
+
+  async del(key: string): Promise<void> {
+    if (this.fail) throw new Error('redis down');
+    this.values.delete(key);
+    this.expirations.delete(key);
+  }
 }
 
 function record(at: number): ModActionRecord {

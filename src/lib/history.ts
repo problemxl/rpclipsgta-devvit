@@ -14,15 +14,22 @@ export interface HistoryStore {
   append(username: string, record: ModActionRecord): Promise<boolean>;
 }
 
-/** The string Redis operations used by the history store. */
+/** Options for Redis SET, mirroring the installed @devvit/redis SetOptions. */
+export interface RedisSetOptions {
+  readonly nx?: boolean;
+  readonly xx?: boolean;
+  readonly expiration?: Date;
+}
+
+/**
+ * The small structural Redis subset shared by the history store, the punish
+ * lock, and the removal flow. It matches the installed @devvit/redis client:
+ * SET resolves to a string on success and to undefined when NX/XX fails.
+ */
 export interface RedisLike {
   get(key: string): Promise<string | undefined>;
-  set(
-    key: string,
-    value: string,
-    options?: { readonly expiration?: Date }
-  ): Promise<string | undefined>;
-  del?(key: string): Promise<unknown>;
+  set(key: string, value: string, options?: RedisSetOptions): Promise<string | undefined>;
+  del(key: string): Promise<unknown>;
 }
 
 export const HISTORY_TTL_DAYS = 400;

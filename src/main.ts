@@ -362,6 +362,9 @@ Devvit.addMenuItem({
 function createPunishDeps(context: Devvit.Context): PunishDeps {
   return {
     history: createHistoryStore(context.redis),
+    // The same Redis client serializes punishments per user via the lock in
+    // punish().
+    redis: context.redis,
     submitComment: async ({ text, replyTargetThingId }) => {
       const comment = await context.reddit.submitComment({
         id: replyTargetThingId as `t1_${string}` | `t3_${string}`,

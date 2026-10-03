@@ -9,6 +9,11 @@ import {
   type SubmissionInput,
   type Violation,
 } from '../lib/detection.js';
+import type { RedisLike, RedisSetOptions } from '../lib/history.js';
+
+// The removal flow shares the exact structural Redis client used by the
+// history store and the punish lock; re-exported for existing callers.
+export type { RedisLike, RedisSetOptions as AutoRedisSetOptions };
 /** Payload passed across the framework-free removal/escalation seam. */
 export interface EscalatePayload {
   readonly target_user: string;
@@ -27,24 +32,6 @@ export interface EscalateResult {
   readonly priors: number;
   readonly rule_name: string;
   readonly recorded: boolean;
-}
-
-/** The Redis options used by the installed Devvit Redis client. */
-export interface AutoRedisSetOptions {
-  readonly nx?: boolean;
-  readonly xx?: boolean;
-  readonly expiration?: Date;
-}
-
-/** The small structural Redis subset needed by this action. */
-export interface RedisLike {
-  get(key: string): Promise<string | undefined>;
-  set(
-    key: string,
-    value: string,
-    options?: AutoRedisSetOptions
-  ): Promise<string | undefined>;
-  readonly del: (key: string) => Promise<unknown>;
 }
 
 export type EscalateFn = (payload: EscalatePayload) => Promise<EscalateResult>;

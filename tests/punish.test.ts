@@ -20,6 +20,13 @@ function memoryHistory(initial: ModActionRecord[] = []): HistoryStore {
 function deps(overrides: Partial<PunishDeps> = {}, initial: ModActionRecord[] = []): PunishDeps {
   return {
     history: memoryHistory(initial),
+    // Minimal always-acquiring lock double; lock behavior is covered in the
+    // dedicated test commit.
+    redis: {
+      get: async () => undefined,
+      set: async () => 'OK',
+      del: async () => undefined,
+    },
     submitComment: vi.fn(async () => 't1_warning'),
     banUser: vi.fn(async () => undefined),
     now: () => NOW,
