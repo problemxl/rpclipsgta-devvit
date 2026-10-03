@@ -13,6 +13,7 @@
 
 import { Devvit, SettingScope } from '@devvit/public-api';
 
+import { runAutoEscalation } from './actions/autoescalate.js';
 import {
   buildFailureToast,
   buildSuccessToast,
@@ -83,7 +84,67 @@ Devvit.addSettings([
     scope: SettingScope.App,
     isSecret: true,
   },
+  {
+    type: 'boolean',
+    name: 'auto-escalate-enabled',
+    label: 'Enable automatic submission moderation',
+    helpText:
+      'Automatically remove deterministic rule violations in r/RPClipsGTA and escalate eligible removals. Off by default.',
+    scope: SettingScope.Installation,
+    defaultValue: false,
+  },
 ]);
+
+Devvit.addTrigger({
+  event: 'PostSubmit',
+  async onEvent(event, context) {
+    const enabled = await context.settings.get<boolean>('auto-escalate-enabled');
+    if (!enabled) return;
+
+    const post = event.post;
+    const subredditName = event.subreddit?.name ?? context.subredditName ?? '';
+    if (!post || subredditName.toLowerCase() !== 'rpclipsgta') return;
+    if (post.spam || post.deleted) return;
+
+    const [token, rawServiceUrl] = await Promise.all([
+      context.settings.get<string>('escalate-token'),
+      context.settings.get<string>('service-url'),
+    ]);
+    const serviceUrl = normalizeBaseUrl(rawServiceUrl);
+    if (!token || !serviceUrl) {
+      console.error('[auto-escalate] service settings are not configured; no action taken');
+      return;
+    }
+    if (!isAllowedServiceHost(serviceUrl)) {
+      console.error(
+        `[auto-escalate] service-url must use ${SERVICE_HOST}; no action taken`
+      );
+      return;
+    }
+
+    const outcome = await runAutoEscalation(
+      {
+        postId: post.id,
+        authorName: event.author?.name ?? '',
+        title: post.title,
+        url: post.url,
+        body: post.selftext,
+        isTextPost: post.isSelf,
+      },
+      {
+        // Installation-scoped Redis is intentionally per-subreddit; fixture
+        // metadata remains on global Redis and is unaffected by this state.
+        redis: context.redis,
+        removePost: (thingId) =>
+          context.reddit.remove(thingId as `t3_${string}`, false),
+        escalate: (payload) => callEscalate(fetch, serviceUrl, token, payload),
+        isModerator: (username) =>
+          isAuthorizedFixtureActor(context.reddit, subredditName, username),
+      }
+    );
+    console.log(`[auto-escalate] trigger outcome: ${JSON.stringify(outcome)}`);
+  },
+});
 
 const escalateForm = Devvit.createForm(
   {
