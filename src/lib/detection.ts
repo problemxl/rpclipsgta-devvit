@@ -74,6 +74,7 @@ function hasStreamableBracketTitle(title: string): boolean {
 function isTwitchChannelLink(url: URL): boolean {
   const host = normalizeHost(url.hostname);
   if (host === 'clips.twitch.tv' || !isTwitchHost(host)) return false;
+  if (/^\/videos(?:\/|$)/i.test(url.pathname)) return false;
   return /^\/[^/?#]+\/?$/.test(url.pathname);
 }
 
