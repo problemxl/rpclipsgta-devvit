@@ -1,6 +1,11 @@
 /** Redis-backed history for actions executed by this app. */
 
 export interface ModActionRecord {
+  /**
+   * Unique row identity, minted by append(). Uniqueness is what keeps
+   * identical records in the same millisecond from overwriting each other.
+   */
+  readonly id: string;
   readonly at: number;
   readonly rule: number;
   readonly action: 'warn' | 'ban';
@@ -9,11 +14,75 @@ export interface ModActionRecord {
   readonly targetThingId: string;
 }
 
+/** Row count plus the newest action time, without parsing any member payload. */
+export interface HistorySummary {
+  readonly total: number;
+  readonly latestAt: number | undefined;
+}
+
+/** The stored record (including its generated id) and whether the write landed. */
+export interface AppendOutcome {
+  readonly ok: boolean;
+  readonly record: ModActionRecord;
+}
+
+/**
+ * Failure policy: every operation degrades instead of throwing (summary ⇒
+ * fresh, load ⇒ [], append ⇒ ok:false, remove ⇒ false) but always logs the
+ * failure first, so a broken Redis is visible rather than silently swallowed.
+ */
 export interface HistoryStore {
+  /**
+   * Add one row to the sorted set. The id is assigned here, so the returned
+   * record is the identity to use for later compensation removals.
+   */
+  append(username: string, record: Omit<ModActionRecord, 'id'>): Promise<AppendOutcome>;
+  /**
+   * O(1)-ish ZCARD plus the newest row's score, clamped to now + 60s so a
+   * future-dated corrupt member can never freeze decay; rung selection needs
+   * no more.
+   */
+  summary(username: string): Promise<HistorySummary>;
+  /** All retained records, oldest first. Corrupt members are dropped silently. */
   load(username: string): Promise<ModActionRecord[]>;
-  append(username: string, record: ModActionRecord): Promise<boolean>;
-  /** Remove one matching record during execution-failure compensation. */
-  remove?(username: string, record: ModActionRecord): Promise<boolean>;
+  /** Remove one row by id during execution-failure compensation. */
+  remove(username: string, id: string): Promise<boolean>;
+}
+
+/** One sorted-set member, mirroring @devvit/redis ZMember. */
+export interface RedisZMember {
+  readonly member: string;
+  readonly score: number;
+}
+
+/**
+ * Options for ZRANGE, mirroring the installed @devvit/redis ZRangeOptions
+ * (rank/score/lex selection with optional reverse and limit). Note the real
+ * client requires `by` whenever options are supplied; this store only uses
+ * the plain rank form without options.
+ */
+export interface RedisZRangeOptions {
+  readonly reverse?: boolean;
+  readonly by: 'score' | 'lex' | 'rank';
+  readonly limit?: { readonly offset: number; readonly count: number };
+}
+
+/**
+ * The structural Redis subset the history store actually uses: sorted-set
+ * commands only, with signatures matching the installed @devvit/redis client.
+ * Appends are a single atomic ZADD — there is no read-modify-write and
+ * therefore no lost-update window between concurrent actions.
+ */
+export interface RedisLike {
+  zAdd(key: string, ...members: RedisZMember[]): Promise<number>;
+  zRange(
+    key: string,
+    start: number,
+    stop: number,
+    options?: RedisZRangeOptions
+  ): Promise<RedisZMember[]>;
+  zRem(key: string, members: string[]): Promise<number>;
+  zCard(key: string): Promise<number>;
 }
 
 /** Options for Redis SET, mirroring the installed @devvit/redis SetOptions. */
@@ -24,28 +93,36 @@ export interface RedisSetOptions {
 }
 
 /**
- * The small structural Redis subset shared by the history store, the punish
- * lock, and the removal flow. It matches the installed @devvit/redis client:
+ * The string-command subset shared by the punish lock and the removal flow.
  * SET resolves to a string on success and to undefined when NX/XX fails.
  */
-export interface RedisLike {
+export interface RedisStringLike {
   get(key: string): Promise<string | undefined>;
   set(key: string, value: string, options?: RedisSetOptions): Promise<string | undefined>;
   del(key: string): Promise<unknown>;
 }
 
-/** Five effective levels × 90 days, plus a 90-day retention buffer. */
-export const HISTORY_TTL_DAYS = 540;
-export const HISTORY_MAX_RECORDS = 50;
-
+/**
+ * The per-user sorted-set key. The `z:` segment versions the layout: the
+ * original implementation stored a JSON array STRING under
+ * `modactions:user:{username}`, and reusing that key with sorted-set commands
+ * would fail with WRONGTYPE. The old key is simply orphaned; no migration is
+ * attempted.
+ */
 export function historyKey(username: string): string {
-  return `modactions:user:${username.toLowerCase()}`;
+  return `modactions:z:user:${username.toLowerCase()}`;
+}
+
+/** Best-effort message extraction for degraded-mode error logging. */
+function failureDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isModActionRecord(value: unknown): value is ModActionRecord {
   if (typeof value !== 'object' || value === null) return false;
   const record = value as Partial<ModActionRecord>;
   return (
+    typeof record.id === 'string' &&
     typeof record.at === 'number' &&
     Number.isFinite(record.at) &&
     (record.action === 'warn' || record.action === 'ban') &&
@@ -59,78 +136,124 @@ function isModActionRecord(value: unknown): value is ModActionRecord {
   );
 }
 
-function parseHistory(value: string | undefined): ModActionRecord[] {
-  if (value === undefined) return [];
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed.filter(isModActionRecord) : [];
-  } catch {
-    return [];
-  }
+/**
+ * Row ids must be unique even for identical records in the same millisecond:
+ * ZADD overwrites an existing member (updating its score), so a shared id
+ * would silently collapse two distinct infractions into one row.
+ *
+ * `crypto.randomUUID()` (standard in Node 16.7+ and modern runtimes; a global
+ * here) is used purely for uniqueness, not security — unlike `Math.random()
+ * .toString(36)`, it can never yield an empty suffix (Math.random() === 0).
+ */
+function newRecordId(at: number): string {
+  return `${at}-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
 
 /**
- * Construct a Redis-backed action history. JSON strings are used deliberately:
- * the Devvit Redis client supports strings, hashes, lists, and sorted sets, but
- * a bounded JSON array keeps the record shape and ordering together.
+ * Construct a Redis-backed action history stored as one sorted set per user:
+ * every infraction is a member (the record JSON, including its unique id)
+ * scored by its epoch-ms timestamp.
+ *
+ * Owner decision: the ENTIRE history is retained — there is no record cap and
+ * no TTL, and none may be reintroduced. Lifetime retention never over-punishes
+ * because the ladder decays one effective prior per full 90-day quiet stretch
+ * since the latest action (src/lib/ladder.ts), so old rows preserve the audit
+ * trail without changing the rung a long-quiet user receives.
  */
 export function createHistoryStore(redis: RedisLike): HistoryStore {
   return {
-    async load(username: string): Promise<ModActionRecord[]> {
+    async append(username, record) {
+      // Mint the id here so the persisted member and the returned record are
+      // the same source of truth for compensation identity.
+      const stored: ModActionRecord = { ...record, id: newRecordId(record.at) };
       try {
-        return parseHistory(await redis.get(historyKey(username)));
-      } catch {
+        // One atomic ZADD; a 0 means the write did not land as a new row.
+        const added = await redis.zAdd(historyKey(username), {
+          member: JSON.stringify(stored),
+          score: stored.at,
+        });
+        return { ok: added > 0, record: stored };
+      } catch (error) {
+        // Degradation: the action still proceeds without a history row
+        // (ok:false), but the failed write must show up in the logs.
+        console.error(`[history] append ${historyKey(username)} failed: ${failureDetail(error)}`);
+        return { ok: false, record: stored };
+      }
+    },
+
+    async summary(username) {
+      const key = historyKey(username);
+      try {
+        // ZCARD counts raw members, corrupt payloads included.
+        const total = await redis.zCard(key);
+        // Rank -1 is the highest-score member. The score is structural, so no
+        // member payload is parsed and corrupt rows cannot break the summary.
+        const [latest] = await redis.zRange(key, -1, -1);
+        // Freeze guard: a corrupt member with a future epoch-ms score would
+        // otherwise pin latestAt in the future indefinitely, keeping the
+        // ladder's quiet time at zero and freezing decay for as long as the
+        // score lies ahead. Clamp to now + 60s — enough allowance for modest
+        // clock skew between the app host and Redis, while guaranteeing decay
+        // resumes accruing almost immediately (src/lib/ladder.ts).
+        const latestAt = latest ? Math.min(latest.score, Date.now() + 60_000) : undefined;
+        return { total, latestAt };
+      } catch (error) {
+        // Degradation: an unreadable summary is treated as a fresh user, but
+        // the failure must show up in the logs.
+        console.error(`[history] summary ${key} failed: ${failureDetail(error)}`);
+        return { total: 0, latestAt: undefined };
+      }
+    },
+
+    async load(username) {
+      try {
+        // ZRANGE over the whole set is score-ascending: oldest first, with no
+        // post-sorting needed and the full lifetime history returned.
+        const rows = await redis.zRange(historyKey(username), 0, -1);
+        const records: ModActionRecord[] = [];
+        for (const row of rows) {
+          try {
+            const parsed: unknown = JSON.parse(row.member);
+            if (isModActionRecord(parsed)) records.push(parsed);
+          } catch {
+            // A corrupt member is dropped silently, never thrown.
+          }
+        }
+        return records;
+      } catch (error) {
+        // Degradation: an unreadable history is treated as empty, but the
+        // failure must show up in the logs.
+        console.error(`[history] load ${historyKey(username)} failed: ${failureDetail(error)}`);
         return [];
       }
     },
 
-    async append(username: string, record: ModActionRecord): Promise<boolean> {
+    async remove(username, id) {
       try {
         const key = historyKey(username);
-        const records = parseHistory(await redis.get(key));
-        records.push(record);
-        const recent = records.slice(-HISTORY_MAX_RECORDS);
-        const result = await redis.set(key, JSON.stringify(recent), {
-          expiration: new Date(Date.now() + HISTORY_TTL_DAYS * 24 * 60 * 60 * 1000),
-        });
-        return typeof result === 'string';
-      } catch {
-        return false;
-      }
-    },
-
-    async remove(username: string, record: ModActionRecord): Promise<boolean> {
-      try {
-        const key = historyKey(username);
-        const records = parseHistory(await redis.get(key));
-        const index = records.findIndex((candidate) => candidate === record || isSameRecord(candidate, record));
-        if (index < 0) {
-          // Compensation anomalies (record already gone or never persisted)
-          // stay visible; a miss remains a documented no-op success.
-          console.debug(
-            `[history] remove miss for ${username}: no matching record (at=${record.at} rule=${record.rule} target=${record.targetThingId})`
-          );
-          return true;
+        const rows = await redis.zRange(key, 0, -1);
+        for (const row of rows) {
+          try {
+            const parsed: unknown = JSON.parse(row.member);
+            if (isModActionRecord(parsed) && parsed.id === id) {
+              // Remove the exact member string; nothing else is touched.
+              await redis.zRem(key, [row.member]);
+              return true;
+            }
+          } catch {
+            // Unparseable members can never match an id; skip them.
+          }
         }
-        records.splice(index, 1);
-        const result = await redis.set(key, JSON.stringify(records.slice(-HISTORY_MAX_RECORDS)), {
-          expiration: new Date(Date.now() + HISTORY_TTL_DAYS * 24 * 60 * 60 * 1000),
-        });
-        return typeof result === 'string';
-      } catch {
+        // Compensation anomalies (record already gone or never persisted)
+        // stay visible; a miss remains a documented no-op success.
+        console.debug(`[history] remove miss for ${username}: no record with id=${id}`);
+        return true;
+      } catch (error) {
+        // Degradation: the compensation caller treats false as "record may
+        // still exist", but the failure must show up in the logs.
+        console.error(`[history] remove ${historyKey(username)} failed: ${failureDetail(error)}`);
         return false;
       }
     },
   };
-}
-
-function isSameRecord(left: ModActionRecord, right: ModActionRecord): boolean {
-  return (
-    left.at === right.at &&
-    left.rule === right.rule &&
-    left.action === right.action &&
-    left.label === right.label &&
-    left.modUser === right.modUser &&
-    left.targetThingId === right.targetThingId
-  );
 }

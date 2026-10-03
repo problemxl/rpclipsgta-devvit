@@ -22,8 +22,11 @@ rules, and optionally supplies a reason. The app resolves the target and then:
 1. Acquires `punish:lock:{lowercased username}` in Redis with NX and a ~30s
    TTL, so overlapping actions for one user serialize; a second concurrent
    action fails fast with an "already in progress" error.
-2. Loads `modactions:user:{lowercased username}` from Redis. The value is a JSON
-   array containing the most recent 50 action records.
+2. Reads an O(1)-ish summary of `modactions:z:user:{lowercased username}`: a
+   Redis sorted set holding one row per infraction — the record JSON, which
+   includes a unique id — scored by its epoch-ms timestamp. The summary is the
+   `ZCARD` row count plus the newest row's score; the full history is never
+   loaded for rung selection.
 3. Applies the wiki ladder and decay policy:
 
    | Effective prior actions | Action |
@@ -36,22 +39,29 @@ rules, and optionally supplies a reason. The app resolves the target and then:
    | 5+ | Permanent ban |
 
    Every full three-month quiet stretch since the **latest** prior action lowers
-   the effective prior count by one, never below zero.
+   the effective prior count by one, never below zero. History is retained for
+   life — no record cap, no TTL — so decay alone governs the rung.
 4. Executes the selected action with Reddit. A warning is a Markdown reply to
    the target thing. A ban uses `reddit.banUser` with the ladder message, short
    rule reason, and `[devvit] by {modUser}` note. Permanent bans omit duration.
-5. Appends the action to Redis **before** execution (pending-record-first) and
-   refreshes the 540-day TTL. If the Reddit call then fails, the pending record
-   is compensated (removed) so the next action sees no phantom prior. Reddit
-   execution is still attempted even if recording fails; the success toast then
-   includes `(not recorded)`. Bans are refused outright when the resolved
-   subreddit name is empty.
+5. Appends the action to the sorted set **before** execution
+   (pending-record-first) as a new row with a freshly minted unique id, so
+   identical records can never overwrite each other. If the Reddit call then
+   fails, the pending row is compensated (removed by id) so the next action
+   sees no phantom prior. Reddit execution is still attempted even if recording
+   fails; the success toast then includes `(not recorded)`. Bans are refused
+   outright when the resolved subreddit name is empty.
 6. Releases the lock in a `finally` block — only when it was acquired.
 
 The warning comment links the rules wiki, explains the current violation and
 next ladder consequence, and points appeals to modmail. Reddit's comment API
 supports Markdown text and replies by passing the target post/comment ID as
 `id`; this app submits `{ id, text, runAs: 'APP' }`.
+
+Action history is deliberately kept forever: one sorted-set row per
+infraction, no record cap, no TTL. The 90-day decay against the latest action
+is what keeps rungs correct, so old rows never over-punish — they only
+preserve the audit trail.
 
 Two deliberate trade-offs remain:
 
@@ -128,7 +138,8 @@ Redis state is installation-scoped and idempotent:
   checks and retained after successful handling.
 - `autoescalate:url:{normalizedUrl}` — 14-day duplicate claim, made only by an
   otherwise-clean post.
-- `modactions:user:{username}` — 540-day rolling in-app action history.
+- `modactions:z:user:{username}` — lifetime in-app action history, one
+  sorted-set row per infraction.
 
 ## Publish checklist
 
@@ -156,7 +167,8 @@ npm test        # vitest run — unit tests, no network or Devvit runtime
 
 - `src/actions/punish.ts` — pure in-app ladder execution seam and warning text.
 - `src/lib/ladder.ts` — wiki ladder and three-month decay policy.
-- `src/lib/history.ts` — Redis-backed bounded per-user action history.
+- `src/lib/history.ts` — Redis-backed lifetime per-user action history
+  (sorted set, one row per infraction).
 - `src/actions/escalate.ts` — pure target resolution and toast builders.
 - `src/actions/fixture.ts` — fixture targets, URL/title validation, and dedupe.
 - `src/actions/autoescalate.ts` — framework-free moderator Remove post orchestration.

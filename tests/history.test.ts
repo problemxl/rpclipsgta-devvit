@@ -1,157 +1,372 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { effectivePriors } from '../src/lib/ladder.js';
 import {
   createHistoryStore,
   historyKey,
-  HISTORY_TTL_DAYS,
-  type RedisLike,
   type ModActionRecord,
+  type RedisLike,
 } from '../src/lib/history.js';
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-class MemoryRedis implements RedisLike {
-  readonly values = new Map<string, string>();
-  readonly expirations = new Map<string, Date>();
+/**
+ * Sorted-set redis double with real ZADD add-vs-update semantics: members are
+ * unique per key, kept score-ascending (ties lexicographic, like redis), and
+ * re-adding a member updates its score instead of duplicating it.
+ */
+class FakeZSetRedis implements RedisLike {
+  readonly sets = new Map<string, Map<string, number>>();
+  readonly calls: string[] = [];
   fail = false;
-  /** Overrides the SET resolution; undefined simulates a rejected write. */
-  setResult: string | undefined = 'OK';
+  /** When set, ZADD resolves with this value without mutating (simulates a rejected write). */
+  zAddResult: number | undefined;
 
-  async get(key: string): Promise<string | undefined> {
-    if (this.fail) throw new Error('redis down');
-    return this.values.get(key);
+  private zset(key: string): Map<string, number> {
+    let zset = this.sets.get(key);
+    if (!zset) {
+      zset = new Map<string, number>();
+      this.sets.set(key, zset);
+    }
+    return zset;
   }
 
-  async set(
+  /** Seed a raw member directly, valid or corrupt, for load/summary tests. */
+  seed(key: string, member: string, score: number): void {
+    this.zset(key).set(member, score);
+  }
+
+  rows(key: string): Map<string, number> {
+    return this.zset(key);
+  }
+
+  async zAdd(
     key: string,
-    value: string,
-    options?: { expiration?: Date }
-  ): Promise<string | undefined> {
+    ...members: { member: string; score: number }[]
+  ): Promise<number> {
+    this.calls.push('zAdd');
     if (this.fail) throw new Error('redis down');
-    if (this.setResult === undefined) return undefined;
-    this.values.set(key, value);
-    if (options?.expiration) this.expirations.set(key, options.expiration);
-    return this.setResult;
+    if (this.zAddResult !== undefined) return this.zAddResult;
+    const zset = this.zset(key);
+    let added = 0;
+    for (const { member, score } of members) {
+      if (!zset.has(member)) added += 1;
+      zset.set(member, score); // update-vs-add: existing members are overwritten
+    }
+    return added;
   }
 
-  async del(key: string): Promise<void> {
+  async zRange(
+    key: string,
+    start: number,
+    stop: number
+  ): Promise<{ member: string; score: number }[]> {
+    this.calls.push('zRange');
     if (this.fail) throw new Error('redis down');
-    this.values.delete(key);
-    this.expirations.delete(key);
+    const ordered = [...this.zset(key).entries()].sort(
+      ([aMember, aScore], [bMember, bScore]) => aScore - bScore || (aMember < bMember ? -1 : aMember > bMember ? 1 : 0)
+    );
+    const from = Math.max(0, start < 0 ? ordered.length + start : start);
+    const to = stop < 0 ? ordered.length + stop : stop;
+    return ordered.slice(from, to + 1).map(([member, score]) => ({ member, score }));
+  }
+
+  async zRem(key: string, members: string[]): Promise<number> {
+    this.calls.push('zRem');
+    if (this.fail) throw new Error('redis down');
+    const zset = this.zset(key);
+    let removed = 0;
+    for (const member of members) {
+      if (zset.delete(member)) removed += 1;
+    }
+    return removed;
+  }
+
+  async zCard(key: string): Promise<number> {
+    this.calls.push('zCard');
+    if (this.fail) throw new Error('redis down');
+    return this.zset(key).size;
   }
 }
 
-function record(at: number): ModActionRecord {
+function record(at: number): Omit<ModActionRecord, 'id'> {
   return { at, rule: 2, action: 'ban', label: '3 day ban', modUser: 'mod', targetThingId: 't3_x' };
 }
 
 describe('history store', () => {
-  it('uses a lowercased per-user key', async () => {
-    const redis = new MemoryRedis();
+  it('uses a lowercased per-user key and stores one row per infraction', async () => {
+    const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
-    await history.append('SomeUser', record(1));
-    expect(historyKey('someuser')).toBe('modactions:user:someuser');
-    await expect(history.load('SOMEUSER')).resolves.toEqual([record(1)]);
+    const appended = await history.append('SomeUser', record(1));
+    expect(appended.ok).toBe(true);
+    expect(historyKey('someuser')).toBe('modactions:z:user:someuser');
+
+    const rows = redis.rows('modactions:z:user:someuser');
+    expect(rows.size).toBe(1);
+    expect(appended.record.id).toMatch(/^1-[0-9a-f]{12}$/); // `${at}-${uuid hex slice}` shape
+    expect(rows.get(JSON.stringify({ ...record(1), id: appended.record.id }))).toBe(1); // score = at
+    await expect(history.load('SOMEUSER')).resolves.toEqual([
+      { ...record(1), id: appended.record.id },
+    ]);
   });
 
-  it('returns an empty history for missing and malformed values', async () => {
-    const redis = new MemoryRedis();
+  it('appends atomically with a single ZADD and no read-modify-write', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(1));
+    // Exactly one command was issued: no GET/ZRANGE read before the write, so
+    // concurrent appends can never lose each other's rows.
+    expect(redis.calls).toEqual(['zAdd']);
+  });
+
+  it('mints unique ids so identical same-ms records never overwrite each other', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(7));
+    await history.append('user', record(7)); // byte-identical record payload
+
+    const summary = await history.summary('user');
+    expect(summary.total).toBe(2);
+    const loaded = await history.load('user');
+    expect(loaded).toHaveLength(2);
+    expect(loaded.every((row) => row.at === 7)).toBe(true);
+    expect(new Set(loaded.map((row) => row.id)).size).toBe(2);
+  });
+
+  it('clamps a future-dated score so a corrupt member cannot freeze decay', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    // A score ~10 decay periods ahead would otherwise pin latestAt in the
+    // future, keeping quiet time at zero and freezing decay for years.
+    const farFuture = Date.now() + 10 * 90 * 24 * 60 * 60 * 1000;
+    redis.seed(historyKey('user'), 'corrupt-future-member', farFuture);
+
+    const summary = await history.summary('user');
+    expect(summary.total).toBe(1);
+    // Clamped to now + 60s (60s clock-skew allowance) instead of the corrupt
+    // far-future score.
+    expect(summary.latestAt).toBeLessThanOrEqual(Date.now() + 60_000);
+    expect(summary.latestAt).toBeGreaterThan(Date.now());
+    // With the clamp, decay engages normally: one full 90-day quiet stretch
+    // after the clamped latest action removes the row's whole contribution.
+    const afterNinetyDays = (summary.latestAt ?? 0) + 90 * 24 * 60 * 60 * 1000 + 1;
+    expect(effectivePriors(summary.total, summary.latestAt, afterNinetyDays)).toBe(0);
+  });
+
+  it('summarizes an empty history as zero rows without a latest action', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await expect(history.summary('missing')).resolves.toEqual({ total: 0, latestAt: undefined });
+  });
+
+  it('summarizes by counting rows and reading the newest score, parsing nothing', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(100));
+    await history.append('user', record(300));
+    await history.append('user', record(200));
+    await expect(history.summary('user')).resolves.toEqual({ total: 3, latestAt: 300 });
+    // The summary must stay O(1)-ish: ZCARD plus the single last row.
+    expect(redis.calls.filter((op) => op === 'zRange')).toHaveLength(1);
+  });
+
+  it('counts corrupt members in total while the summary never throws on them', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(100));
+    // ZCARD counts raw members, so a corrupt payload still counts toward the
+    // total; latestAt is the raw newest score and never involves parsing.
+    redis.seed(historyKey('user'), '{not json', 500);
+    await expect(history.summary('user')).resolves.toEqual({ total: 2, latestAt: 500 });
+  });
+
+  it('returns an empty history for missing keys and redis failures', async () => {
+    const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
     await expect(history.load('missing')).resolves.toEqual([]);
-    redis.values.set(historyKey('bad'), '{not json');
-    await expect(history.load('bad')).resolves.toEqual([]);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      redis.fail = true;
+      await expect(history.load('failure')).resolves.toEqual([]);
+      // The degraded [] is documented, but the redis failure must be logged.
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] load modactions:z:user:failure failed: redis down'
+      );
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('drops corrupt members on load and keeps the valid ones', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    const valid = { ...record(123), id: 'keep-1' };
+    const key = historyKey('user');
+    redis.seed(key, JSON.stringify(valid), 123);
+    redis.seed(key, '{not json', 200);
+    redis.seed(key, JSON.stringify({ ...record(300) }), 300); // no id → dropped
+    redis.seed(key, JSON.stringify(null), 400);
+    await expect(history.load('user')).resolves.toEqual([valid]);
+  });
+
+  it('requires a string id when validating members on load', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    const key = historyKey('user');
+    const valid = { ...record(5), id: 'seed-5' };
+    redis.seed(key, JSON.stringify(valid), 5);
+    redis.seed(key, JSON.stringify({ ...record(6) }), 6); // missing id
+    redis.seed(key, JSON.stringify({ ...record(7), id: 9 }), 7); // non-string id
+    await expect(history.load('user')).resolves.toEqual([valid]);
+  });
+
+  it('returns records oldest-first by score regardless of append order', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(30));
+    await history.append('user', record(10));
+    await history.append('user', record(20));
+    const loaded = await history.load('user');
+    expect(loaded.map((row) => row.at)).toEqual([10, 20, 30]);
+  });
+
+  it('reports ok:false and stores nothing when ZADD resolves 0', async () => {
+    const redis = new FakeZSetRedis();
+    redis.zAddResult = 0; // simulates a write that did not land as a new row
+    const history = createHistoryStore(redis);
+    const appended = await history.append('user', record(1));
+    expect(appended.ok).toBe(false);
+    expect(appended.record.id).toMatch(/^1-[0-9a-f]{12}$/); // identity returned regardless
+    expect(await history.load('user')).toEqual([]);
+  });
+
+  it('reports ok:false when ZADD throws', async () => {
+    const redis = new FakeZSetRedis();
     redis.fail = true;
-    await expect(history.load('failure')).resolves.toEqual([]);
-  });
-
-  it('keeps only the 50 most recent records and refreshes the 540-day TTL', async () => {
-    const redis = new MemoryRedis();
     const history = createHistoryStore(redis);
-    for (let at = 0; at < 55; at += 1) await history.append('user', record(at));
-    const records = await history.load('user');
-    expect(records).toHaveLength(50);
-    expect(records[0].at).toBe(5);
-    expect(records.at(-1)?.at).toBe(54);
-    const expiration = redis.expirations.get(historyKey('user'));
-    expect(expiration?.getTime()).toBeGreaterThan(Date.now() + (HISTORY_TTL_DAYS - 1) * DAY_MS);
-    expect(expiration?.getTime()).toBeLessThanOrEqual(Date.now() + HISTORY_TTL_DAYS * DAY_MS);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const appended = await history.append('user', record(1));
+      expect(appended.ok).toBe(false);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] append modactions:z:user:user failed: redis down'
+      );
+      await expect(history.load('user')).resolves.toEqual([]);
+    } finally {
+      error.mockRestore();
+    }
   });
 
-  it('reports false when Redis append fails', async () => {
-    const redis = new MemoryRedis();
-    redis.fail = true;
-    await expect(createHistoryStore(redis).append('user', record(1))).resolves.toBe(false);
-  });
-
-  it('reports false when SET resolves undefined', async () => {
-    const redis = new MemoryRedis();
-    redis.setResult = undefined;
+  it('removes exactly the row with the matching id and nothing else', async () => {
+    const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
-    await expect(history.append('user', record(1))).resolves.toBe(false);
-    await expect(history.load('user')).resolves.toEqual([]);
+    const first = (await history.append('user', record(1))).record;
+    const second = (await history.append('user', record(2))).record;
+    const third = (await history.append('user', record(3))).record;
+
+    await expect(history.remove('user', second.id)).resolves.toBe(true);
+    await expect(history.load('user')).resolves.toEqual([first, third]);
+    await expect(history.summary('user')).resolves.toEqual({ total: 2, latestAt: 3 });
   });
 
-  it('drops non-object and primitive array elements on load', async () => {
-    const redis = new MemoryRedis();
+  it('removes by id, not by fields, when an older row has identical fields', async () => {
+    const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
-    redis.values.set(historyKey('junk'), JSON.stringify([null, 1, 'nope', true]));
-    await expect(history.load('junk')).resolves.toEqual([]);
+    const stale: ModActionRecord = { ...record(7), id: 'stale' };
+    redis.seed(historyKey('user'), JSON.stringify(stale), 7);
+    const appended = (await history.append('user', record(7))).record; // same fields, new id
+
+    await expect(history.remove('user', appended.id)).resolves.toBe(true);
+    await expect(history.load('user')).resolves.toEqual([stale]);
   });
 
-  it('drops records with invalid fields on load', async () => {
-    const redis = new MemoryRedis();
+  it('skips unparseable members while searching for the id to remove', async () => {
+    const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
-    const invalid = [
-      {}, // missing everything
-      { at: 'yesterday', rule: 2, action: 'ban', label: 'b', modUser: 'm', targetThingId: 't3_x' }, // non-number at
-      { at: Number.NaN, rule: 2, action: 'ban', label: 'b', modUser: 'm', targetThingId: 't3_x' }, // non-finite at
-      { at: 1, rule: 13, action: 'ban', label: 'b', modUser: 'm', targetThingId: 't3_x' }, // rule out of range
-      { at: 1, rule: 2.5, action: 'ban', label: 'b', modUser: 'm', targetThingId: 't3_x' }, // non-integer rule
-      { at: 1, rule: 2, action: 'mute', label: 'b', modUser: 'm', targetThingId: 't3_x' }, // unknown action
-      { at: 1, rule: 2, action: 'ban', label: 7, modUser: 'm', targetThingId: 't3_x' }, // non-string label
-      { at: 1, rule: 2, action: 'ban', label: 'b', modUser: null, targetThingId: 't3_x' }, // non-string modUser
-      { at: 1, rule: 2, action: 'ban', label: 'b', modUser: 'm', targetThingId: 42 }, // non-string target
-    ];
-    redis.values.set(historyKey('invalid'), JSON.stringify(invalid));
-    await expect(history.load('invalid')).resolves.toEqual([]);
-  });
+    const appended = (await history.append('user', record(1))).record;
+    redis.seed(historyKey('user'), 'garbage', 99);
 
-  it('keeps only the valid records of a mixed array on load', async () => {
-    const redis = new MemoryRedis();
-    const history = createHistoryStore(redis);
-    const valid = record(123);
-    const mixed = [null, valid, { at: 1 }, { ...valid, rule: 0 }];
-    redis.values.set(historyKey('mixed'), JSON.stringify(mixed));
-    await expect(history.load('mixed')).resolves.toEqual([valid]);
-  });
-
-  it('removes one matching record and reports misses', async () => {
-    const redis = new MemoryRedis();
-    const history = createHistoryStore(redis);
-    const first = record(1);
-    const second = record(2);
-    await history.append('user', first);
-    await history.append('user', second);
-
-    await expect(history.remove!('user', record(999))).resolves.toBe(true); // miss is a no-op success
-    await expect(history.load('user')).resolves.toEqual([first, second]);
-
-    await expect(history.remove!('user', { ...first })).resolves.toBe(true);
-    await expect(history.load('user')).resolves.toEqual([second]);
+    await expect(history.remove('user', appended.id)).resolves.toBe(true);
+    const rows = [...redis.rows(historyKey('user')).keys()];
+    expect(rows).toEqual(['garbage']); // only the corrupt member remains
   });
 
   it('logs a debug line on a remove miss while still reporting success', async () => {
-    const redis = new MemoryRedis();
+    const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
+    const appended = (await history.append('user', record(1))).record;
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
     try {
       // A miss is a documented no-op success, but it must stay visible so
       // compensation anomalies can be diagnosed.
-      await expect(history.remove!('user', record(999))).resolves.toBe(true);
+      await expect(history.remove('user', 'no-such-id')).resolves.toBe(true);
       expect(debug).toHaveBeenCalledTimes(1);
       expect(String(debug.mock.calls[0]?.[0])).toContain('[history] remove miss for user');
+      await expect(history.load('user')).resolves.toEqual([
+        { ...record(1), id: appended.id },
+      ]);
     } finally {
       debug.mockRestore();
     }
+  });
+
+  it('reports remove failure only when redis itself fails', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(1));
+    redis.fail = true;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(history.remove('user', 'any')).resolves.toBe(false);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] remove modactions:z:user:user failed: redis down'
+      );
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('degrades a failing summary to a fresh user and logs the failure', async () => {
+    const redis = new FakeZSetRedis();
+    redis.fail = true;
+    const history = createHistoryStore(redis);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(history.summary('user')).resolves.toEqual({ total: 0, latestAt: undefined });
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] summary modactions:z:user:user failed: redis down'
+      );
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('keeps the entire lifetime history — no record cap', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    for (let at = 0; at < 200; at += 1) await history.append('user', record(at));
+
+    const summary = await history.summary('user');
+    expect(summary.total).toBe(200);
+    expect(summary.latestAt).toBe(199);
+    const loaded = await history.load('user');
+    expect(loaded).toHaveLength(200);
+    expect(loaded[0].at).toBe(0);
+    expect(loaded.at(-1)?.at).toBe(199);
+  });
+
+  it('never sets an expiry — retention is unlimited by design', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    const appended = (await history.append('user', record(1))).record;
+    await history.summary('user');
+    await history.load('user');
+    await history.remove('user', appended.id);
+    // The structural client subset exposes no expire/TTL command at all, and
+    // the store only ever issues sorted-set commands.
+    expect('expire' in redis).toBe(false);
+    expect(new Set(redis.calls)).toEqual(new Set(['zAdd', 'zCard', 'zRange', 'zRem']));
   });
 });

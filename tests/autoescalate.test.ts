@@ -8,7 +8,7 @@ import {
   type AutoRedisSetOptions,
   type ModRemovalDeps,
   type ModRemovalInput,
-  type RedisLike,
+  type RedisStringLike,
 } from '../src/actions/autoescalate.js';
 import type { EscalatePayload, EscalateResult } from '../src/actions/autoescalate.js';
 
@@ -36,7 +36,7 @@ function input(overrides: Partial<ModRemovalInput> = {}): ModRemovalInput {
   };
 }
 
-class FakeRedis implements RedisLike {
+class FakeRedis implements RedisStringLike {
   readonly values = new Map<string, string>();
   readonly expirations = new Map<string, Date>();
   readonly calls: Array<{

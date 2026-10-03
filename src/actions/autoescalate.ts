@@ -9,11 +9,12 @@ import {
   type SubmissionInput,
   type Violation,
 } from '../lib/detection.js';
-import type { RedisLike, RedisSetOptions } from '../lib/history.js';
+import type { RedisSetOptions, RedisStringLike } from '../lib/history.js';
 
 // The removal flow shares the exact structural Redis client used by the
-// history store and the punish lock; re-exported for existing callers.
-export type { RedisLike, RedisSetOptions as AutoRedisSetOptions };
+// punish lock (string commands); the history store consumes the sorted-set
+// subset of the same client. Re-exported for existing callers.
+export type { RedisStringLike, RedisSetOptions as AutoRedisSetOptions };
 /** Payload passed across the framework-free removal/escalation seam. */
 export interface EscalatePayload {
   readonly target_user: string;
@@ -40,7 +41,7 @@ export type EscalateFn = (payload: EscalatePayload) => Promise<EscalateResult>;
 
 /** Dependencies supplied by the moderator menu or by unit tests. */
 export interface ModRemovalDeps {
-  readonly redis: RedisLike;
+  readonly redis: RedisStringLike;
   readonly removePost: (thingId: string) => Promise<void>;
   /** The always-available in-app punishment function. */
   readonly escalate: EscalateFn;
@@ -115,7 +116,7 @@ function seenKey(postId: string): string {
 }
 
 async function releaseSeenClaim(
-  redis: RedisLike,
+  redis: RedisStringLike,
   key: string,
   postId: string
 ): Promise<void> {
