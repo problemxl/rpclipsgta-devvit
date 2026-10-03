@@ -1,7 +1,1 @@
-# Devvit app manifest.
-# `name` is the only required field (see
-# node_modules/@devvit/shared-types/schemas/config-file.v1.json -> "required": ["name"]).
-# The Devvit CLI derives permissions (redditAPI, http fetch domains, ...) from
-# Devvit.configure() in src/main.ts at upload time and writes them back here,
-# so they are intentionally not duplicated in this file.
-name: rpclipsgta-modactions
+name: esclation-bot
