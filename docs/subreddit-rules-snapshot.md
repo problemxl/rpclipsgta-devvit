@@ -117,6 +117,10 @@ moderator-initiated through the **Remove post** menu action; there is no
 R5 > R6 > R4 > R12, and the locked action policy is remove + escalate for
 R1, R2, R3, R4, R7, R8, and R9, versus remove-only for R5, R6, R10, R11, and
 R12. Escalations carry the pressing moderator's username in `mod_user`.
+Separately, the **Remove & escalate** menu action exists for explicit mod
+discretion: one press removes any post or comment and escalates its author
+through the ladder for any of the 12 rules, independent of the automatic
+policy classes above.
 Escalation is always available in-app through the Reddit API and Redis; there
 are no service settings or manual service fallback. Implementation notes: the
 policy's "three months" decay interval is represented deterministically as 90

@@ -1,6 +1,6 @@
 {
-  "name": "rpclipsgta-modactions",
-  "version": "0.1.0",
+  "name": "esclation-bot",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,11 +8,13 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@devvit/public-api": "*"
+    "@devvit/public-api": "0.14.6"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
+    "devvit": "0.14.6",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0",
-    "@types/node": "^22.0.0"
-  }
+    "vitest": "^2.1.0"
+  },
+  "license": "BSD-3-Clause"
 }

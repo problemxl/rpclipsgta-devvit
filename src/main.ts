@@ -15,10 +15,16 @@ import { Devvit } from '@devvit/public-api';
 
 import {
   applyManualRuleRemovalSafely,
+  buildRemoveEscalateAlreadyProcessedToast,
+  buildRemoveEscalateFailureToast,
+  buildRemoveEscalateSuccessToast,
   buildRemovalFailureToast,
   buildRemovalSuccessToast,
   runModRemovalSafely,
+  runRemoveAndEscalateSafely,
   type ModRemovalSafeOutcome,
+  type RemoveEscalateDeps,
+  type RemoveEscalateSafeOutcome,
 } from './actions/autoescalate.js';
 import {
   buildFailureToast,
@@ -37,9 +43,14 @@ import {
   type FixturePost,
 } from './actions/fixture.js';
 import { actionForRule } from './lib/detection.js';
-import { ruleByNumber, RULES } from './lib/rules.js';
+import { ruleByNumber, RULES, type Rule } from './lib/rules.js';
 import { createHistoryStore } from './lib/history.js';
-import { punish, type PunishDeps, type PunishResult } from './actions/punish.js';
+import {
+  punish,
+  type PunishDeps,
+  type PunishInput,
+  type PunishResult,
+} from './actions/punish.js';
 import type { EscalateFn, EscalatePayload, EscalateResult } from './actions/autoescalate.js';
 
 Devvit.configure({
@@ -351,6 +362,96 @@ Devvit.addMenuItem({
   },
 });
 
+const removeEscalateForm = Devvit.createForm(
+  {
+    title: 'Remove & escalate',
+    description:
+      'Removes this post or comment and escalates the author per the ladder — moderator discretion, any rule.',
+    acceptLabel: 'Remove & escalate',
+    fields: [
+      {
+        type: 'select',
+        name: 'rule',
+        label: 'Rule broken',
+        required: true,
+        options: RULES.map((rule) => ({
+          label: `R${rule.number} — ${rule.name}`,
+          value: String(rule.number),
+        })),
+      },
+      {
+        type: 'string',
+        name: 'reason',
+        label: 'Reason (optional)',
+        helpText: 'Included in the warning / ban message.'
+      },
+    ],
+  },
+  async (event, context) => {
+    // -- Form input -----------------------------------------------------------
+    const rule = ruleByNumber(Number(event.values.rule?.[0])); // select values are string[]
+    if (!rule) {
+      safeToast(context, 'No rule selected — action aborted.');
+      return;
+    }
+    const reason = typeof event.values.reason === 'string' ? event.values.reason.trim() : '';
+
+    // -- Target & actor -------------------------------------------------------
+    // showForm pass-through data is not delivered on the submit event in
+    // 0.14.2, so re-derive the target from the context ids (comment wins over
+    // post — on a comment menu press both may be set).
+    const targetId = resolveTargetIdFromContext(context.commentId, context.postId);
+    const modUsername = context.username;
+    if (!targetId || !modUsername) {
+      safeToast(
+        context,
+        !targetId
+          ? 'Could not determine the target post/comment — action aborted.'
+          : 'Could not determine the acting moderator — action aborted.'
+      );
+      return;
+    }
+
+    try {
+      // -- Resolve the target thing (comment vs post) -------------------------
+      const target = targetId.startsWith('t1_')
+        ? targetFromComment(await context.reddit.getCommentById(targetId))
+        : targetFromPost(await context.reddit.getPostById(targetId));
+
+      const outcome = await runRemoveAndEscalateSafely(
+        {
+          thingId: target.thingId,
+          authorName: target.authorName,
+          // The resolved target's subreddit; never a context fallback that
+          // could diverge from where the removal and ban are applied.
+          subredditName: target.subredditName || context.subredditName || '',
+          rule: rule.number,
+          reason,
+          modUser: modUsername,
+        },
+        createRemoveEscalateDeps(context)
+      );
+      showRemoveEscalateOutcome(context, outcome, target.authorName, rule);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error(`[remove-escalate] form failed: ${detail}`);
+      safeToast(context, buildRemoveEscalateFailureToast({ status: 'trigger-failed', detail }));
+    }
+  }
+);
+
+Devvit.addMenuItem({
+  label: 'Remove & escalate',
+  description: 'Remove this post/comment and warn or ban the author per the escalation ladder',
+  location: ['post', 'comment'],
+  forUserType: 'moderator',
+  onPress: (event, context) => {
+    // The menu is moderator-only; the target id is re-derived from the form
+    // submit context because showForm pass-through data is opaque in 0.14.2.
+    context.ui.showForm(removeEscalateForm, { targetId: event.targetId });
+  },
+});
+
 Devvit.addMenuItem({
   label: 'Create clip fixture',
   description: 'Copy this clip URL to the development or QA subreddit for testing',
@@ -390,10 +491,19 @@ function createPunishDeps(context: Devvit.Context): PunishDeps {
   };
 }
 
-function createEscalateFn(context: Devvit.Context): EscalateFn {
+/**
+ * One punish call bound to this context's Reddit/Redis wiring, shared by the
+ * Escalate path and the Remove & escalate action.
+ */
+function createPunishFn(context: Devvit.Context): (input: PunishInput) => Promise<PunishResult> {
   const punishDeps = createPunishDeps(context);
+  return (input: PunishInput) => punish(punishDeps, input);
+}
+
+function createEscalateFn(context: Devvit.Context): EscalateFn {
+  const punishFn = createPunishFn(context);
   return async (payload: EscalatePayload): Promise<EscalateResult> => {
-    const result: PunishResult = await punish(punishDeps, {
+    const result: PunishResult = await punishFn({
       targetUser: payload.target_user,
       targetThingId: payload.target_id,
       // The RESOLVED post's subreddit threaded through the removal seam; an
@@ -424,6 +534,16 @@ function createModRemovalDeps(context: Devvit.Context) {
   };
 }
 
+function createRemoveEscalateDeps(context: Devvit.Context): RemoveEscalateDeps {
+  return {
+    redis: context.redis,
+    // reddit.remove accepts both t1_ comments and t3_ posts.
+    removeThing: (thingId: string) =>
+      context.reddit.remove(thingId as `t1_${string}` | `t3_${string}`, false),
+    punish: createPunishFn(context),
+  };
+}
+
 function showRemovalOutcome(context: Devvit.Context, outcome: ModRemovalSafeOutcome): void {
   switch (outcome.status) {
     case 'actioned':
@@ -446,6 +566,44 @@ function showRemovalOutcome(context: Devvit.Context, outcome: ModRemovalSafeOutc
       return;
     case 'clean':
       return;
+    default: {
+      // Exhaustiveness guard: a new outcome status must be handled above.
+      const _exhaustive: never = outcome;
+      void _exhaustive;
+      return;
+    }
+  }
+}
+
+function showRemoveEscalateOutcome(
+  context: Devvit.Context,
+  outcome: RemoveEscalateSafeOutcome,
+  targetUser: string,
+  rule: Rule
+): void {
+  switch (outcome.status) {
+    case 'actioned':
+      safeToast(
+        context,
+        buildRemoveEscalateSuccessToast({ result: outcome.punishResult, targetUser, rule })
+      );
+      return;
+    case 'already-processed':
+      safeToast(context, buildRemoveEscalateAlreadyProcessedToast());
+      return;
+    case 'invalid':
+    case 'remove-failed':
+    case 'escalate-failed':
+    case 'failed':
+    case 'trigger-failed':
+      safeToast(context, buildRemoveEscalateFailureToast(outcome));
+      return;
+    default: {
+      // Exhaustiveness guard: a new outcome status must be handled above.
+      const _exhaustive: never = outcome;
+      void _exhaustive;
+      return;
+    }
   }
 }
 

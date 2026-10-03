@@ -7,6 +7,9 @@ A self-contained moderator-actions Devvit app for r/RPClipsGTA. It provides:
   action history in installation Redis.
 - **Remove post**: moderator-initiated deterministic R4/R5/R6/R12 detection,
   followed by removal and policy-controlled escalation.
+- **Remove & escalate**: one press on a post or comment that removes the
+  target and escalates its author through the ladder for any of the 12 rules,
+  by explicit moderator discretion.
 - **Create clip fixture**: moderator-only creation of an ordinary link post in
   the development or QA subreddit.
 
@@ -141,6 +144,27 @@ Redis state is installation-scoped and idempotent:
 - `modactions:z:user:{username}` — lifetime in-app action history, one
   sorted-set row per infraction.
 
+## Remove & escalate action
+
+**Remove & escalate** is a combined moderator action available on posts and
+comments. One press removes the target thing and runs its author through the
+same in-app ladder as **Escalate**. Unlike **Remove post**, there is no policy
+class: the form offers all 12 rules with plain `R# — name` labels and no class
+suffixes, because the wiki makes mod discretion the final word on all actions.
+
+Ordering is remove-first: the thing is removed before any punishment is
+applied, so a moderator never warns or bans over content that is still live.
+A failed removal releases the idempotency claim and no punishment happens, so
+the action can simply be retried. A failed escalation keeps the claim — the
+thing is already gone — and the toast points to the plain **Escalate** menu
+as the fallback for the ladder step.
+
+Redis state is installation-scoped and idempotent:
+
+- `removeescalate:seen:{thingId}` — seven-day claim (SET NX) acquired before
+  any removal or punishment; a second press on the same post or comment reports
+  "Already processed by this action."
+
 ## Publish checklist
 
 1. Run `npm run build && npm test` — both must be green.
@@ -171,7 +195,8 @@ npm test        # vitest run — unit tests, no network or Devvit runtime
   (sorted set, one row per infraction).
 - `src/actions/escalate.ts` — pure target resolution and toast builders.
 - `src/actions/fixture.ts` — fixture targets, URL/title validation, and dedupe.
-- `src/actions/autoescalate.ts` — framework-free moderator Remove post orchestration.
+- `src/actions/autoescalate.ts` — framework-free moderator Remove post and
+  Remove & escalate orchestration.
 - `src/lib/detection.ts` — pure R4/R5/R12 detectors and URL normalization.
 - `src/lib/rules.ts` — canonical 12 subreddit rules.
 - `src/main.ts` — Devvit wiring for menus, forms, Reddit APIs, and Redis.
