@@ -1,50 +1,30 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { punish, punishLockKey, buildWarningComment, type PunishDeps } from '../src/actions/punish.js';
-import type {
-  HistoryStore,
-  ModActionRecord,
-  RedisLike,
-  RedisSetOptions,
+import {
+  createHistoryStore,
+  historyKey,
+  type ModActionRecord,
+  type RedisLike,
+  type RedisSetOptions,
+  type RedisStringLike,
 } from '../src/lib/history.js';
 
 const NOW = 1_000_000_000;
 const DAY = 24 * 60 * 60 * 1000;
 const MONTH = 30 * DAY;
 
-/** In-memory HistoryStore with compensation support and inspectable records. */
-function memoryHistory(initial: ModActionRecord[] = []): HistoryStore & {
-  records: ModActionRecord[];
-} {
-  const records = [...initial];
-  const sameRecord = (left: ModActionRecord, right: ModActionRecord): boolean =>
-    left.at === right.at &&
-    left.rule === right.rule &&
-    left.action === right.action &&
-    left.label === right.label &&
-    left.modUser === right.modUser &&
-    left.targetThingId === right.targetThingId;
-  return {
-    records,
-    load: async () => [...records],
-    append: async (_username, record) => {
-      records.push(record);
-      return true;
-    },
-    remove: async (_username, record) => {
-      const index = records.findIndex((candidate) => sameRecord(candidate, record));
-      if (index < 0) return false;
-      records.splice(index, 1);
-      return true;
-    },
-  };
-}
+/** String commands for the lock plus sorted sets for history, like context.redis. */
+type FakeRedisShape = RedisStringLike & RedisLike;
 
-/** Structural Redis double with real NX/XX semantics and call recording. */
-class FakeRedis implements RedisLike {
+/** Structural Redis double: real NX/XX strings, a real sorted set, call recording. */
+class FakeRedis implements FakeRedisShape {
   readonly values = new Map<string, string>();
+  readonly zsets = new Map<string, Map<string, number>>();
   readonly setCalls: Array<{ key: string; value: string; options?: RedisSetOptions }> = [];
   readonly delCalls: string[] = [];
+  /** Overrides the ZADD resolution; 0 simulates a write that did not land. */
+  zAddResult: number | undefined;
 
   async get(key: string): Promise<string | undefined> {
     return this.values.get(key);
@@ -67,15 +47,78 @@ class FakeRedis implements RedisLike {
     this.values.delete(key);
   }
 
+  async zAdd(
+    key: string,
+    ...members: { member: string; score: number }[]
+  ): Promise<number> {
+    if (this.zAddResult !== undefined) return this.zAddResult;
+    let zset = this.zsets.get(key);
+    if (!zset) {
+      zset = new Map<string, number>();
+      this.zsets.set(key, zset);
+    }
+    let added = 0;
+    for (const { member, score } of members) {
+      if (!zset.has(member)) added += 1;
+      zset.set(member, score);
+    }
+    return added;
+  }
+
+  async zRange(
+    key: string,
+    start: number,
+    stop: number
+  ): Promise<{ member: string; score: number }[]> {
+    const zset = this.zsets.get(key) ?? new Map<string, number>();
+    // Score-ascending, ties lexicographic — like redis.
+    const ordered = [...zset.entries()].sort(
+      ([aMember, aScore], [bMember, bScore]) =>
+        aScore - bScore || (aMember < bMember ? -1 : aMember > bMember ? 1 : 0)
+    );
+    const from = Math.max(0, start < 0 ? ordered.length + start : start);
+    const to = stop < 0 ? ordered.length + stop : stop;
+    return ordered.slice(from, to + 1).map(([member, score]) => ({ member, score }));
+  }
+
+  async zRem(key: string, members: string[]): Promise<number> {
+    const zset = this.zsets.get(key);
+    if (!zset) return 0;
+    let removed = 0;
+    for (const member of members) {
+      if (zset.delete(member)) removed += 1;
+    }
+    return removed;
+  }
+
+  async zCard(key: string): Promise<number> {
+    return this.zsets.get(key)?.size ?? 0;
+  }
+
+  /** Seed one prior infraction row at a chosen timestamp; returns the record. */
+  seedPrior(username: string, at: number, index = 0): ModActionRecord {
+    const row: ModActionRecord = {
+      id: `seed-${at}-${index}`,
+      at,
+      rule: 1,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'old',
+      targetThingId: 't3_old',
+    };
+    this.zAdd(historyKey(username), { member: JSON.stringify(row), score: at });
+    return row;
+  }
+
   lockCalls(): Array<{ key: string; value: string; options?: RedisSetOptions }> {
     return this.setCalls.filter((call) => call.key.startsWith('punish:lock:'));
   }
 }
 
-function deps(overrides: Partial<PunishDeps> = {}, initial: ModActionRecord[] = []): PunishDeps {
+function deps(overrides: Partial<PunishDeps> = {}, redis = new FakeRedis()): PunishDeps {
   return {
-    history: memoryHistory(initial),
-    redis: new FakeRedis(),
+    history: createHistoryStore(redis),
+    redis,
     submitComment: vi.fn(async () => 't1_warning'),
     banUser: vi.fn(async () => undefined),
     now: () => NOW,
@@ -87,10 +130,6 @@ const input = {
   targetUser: 'Target', targetThingId: 't3_post', subredditName: 'RPClipsGTA',
   rule: 2, reason: 'toxic chat', modUser: 'Mod',
 };
-
-function inputRecord(at: number): ModActionRecord {
-  return { at, rule: 1, action: 'warn', label: 'Warning', modUser: 'old', targetThingId: 't3_old' };
-}
 
 describe('punish', () => {
   it('warns a fresh user, submits expected text, and records the action', async () => {
@@ -105,7 +144,9 @@ describe('punish', () => {
   });
 
   it('bans after one recent prior with a three-day duration', async () => {
-    const current = deps({}, [{ ...inputRecord(1), at: NOW - 1 }]);
+    const redis = new FakeRedis();
+    redis.seedPrior('Target', NOW - 1);
+    const current = deps({}, redis);
     await punish(current, input);
     expect(current.banUser).toHaveBeenCalledWith(expect.objectContaining({
       durationDays: 3,
@@ -118,14 +159,18 @@ describe('punish', () => {
   });
 
   it('omits duration for a permanent ban', async () => {
-    const current = deps({}, Array.from({ length: 5 }, (_, index) => inputRecord(NOW - index - 1)));
+    const redis = new FakeRedis();
+    for (let index = 0; index < 5; index += 1) redis.seedPrior('Target', NOW - index - 1, index);
+    const current = deps({}, redis);
     await punish(current, input);
     expect(current.banUser).toHaveBeenCalledWith(expect.not.objectContaining({ durationDays: expect.anything() }));
   });
 
   it('escalates two, three, and four priors to 7, 14, and 30 day bans', async () => {
     for (const [priors, durationDays] of [[2, 7], [3, 14], [4, 30]] as const) {
-      const current = deps({}, Array.from({ length: priors }, (_, index) => inputRecord(NOW - index - 1)));
+      const redis = new FakeRedis();
+      for (let index = 0; index < priors; index += 1) redis.seedPrior('Target', NOW - index - 1, index);
+      const current = deps({}, redis);
       await expect(punish(current, input)).resolves.toMatchObject({
         action: 'ban',
         durationDays,
@@ -145,11 +190,28 @@ describe('punish', () => {
     );
   });
 
-  it('still sees a ~400-day-old prior inside the 540-day retention window', async () => {
-    // Five priors whose newest is 400 days old: 4 decayed levels leave one
+  it('keeps full lifetime history but warns again when every prior has decayed', async () => {
+    // Three priors whose newest is five years old: all rows are retained
+    // forever, but ~20 decayed levels floor the effective count at zero.
+    const redis = new FakeRedis();
+    for (let index = 0; index < 3; index += 1) redis.seedPrior('Target', NOW - 5 * 365 * DAY - index, index);
+    const current = deps({}, redis);
+    await expect(punish(current, input)).resolves.toMatchObject({
+      action: 'warn',
+      label: 'Warning',
+      priors: 0,
+    });
+    expect(current.submitComment).toHaveBeenCalled();
+    expect(current.banUser).not.toHaveBeenCalled();
+    expect(await current.history.load('Target')).toHaveLength(4); // 3 kept + this one
+  });
+
+  it('still sees a 400-day-old prior through full retention', async () => {
+    // Five priors whose newest is 400 days old: four decayed levels leave one
     // effective prior, so the user receives a 3 day ban — not a warning.
-    const priors = Array.from({ length: 5 }, (_, index) => inputRecord(NOW - 400 * DAY - index));
-    const current = deps({}, priors);
+    const redis = new FakeRedis();
+    for (let index = 0; index < 5; index += 1) redis.seedPrior('Target', NOW - 400 * DAY - index, index);
+    const current = deps({}, redis);
     await expect(punish(current, input)).resolves.toMatchObject({
       action: 'ban',
       durationDays: 3,
@@ -160,13 +222,32 @@ describe('punish', () => {
   });
 
   it('decays a seven-month-old prior back to a warning', async () => {
-    const current = deps({}, [{ ...inputRecord(NOW - 7 * MONTH) }]);
+    const redis = new FakeRedis();
+    redis.seedPrior('Target', NOW - 7 * MONTH);
+    const current = deps({}, redis);
     await expect(punish(current, input)).resolves.toMatchObject({ action: 'warn', priors: 0 });
     expect(current.submitComment).toHaveBeenCalled();
   });
 
-  it('continues after a history append failure', async () => {
-    const current = deps({ history: { load: async () => [], append: async () => false } });
+  it('continues without a record when ZADD resolves 0', async () => {
+    const redis = new FakeRedis();
+    redis.zAddResult = 0;
+    const current = deps({}, redis);
+    await expect(punish(current, input)).resolves.toMatchObject({ recorded: false, action: 'warn' });
+    expect(current.submitComment).toHaveBeenCalled();
+    expect(await current.history.load('Target')).toEqual([]);
+  });
+
+  it('continues without a record when the history append throws', async () => {
+    const failingHistory = {
+      summary: async () => ({ total: 0, latestAt: undefined as number | undefined }),
+      append: async () => {
+        throw new Error('append failed');
+      },
+      load: async () => [] as ModActionRecord[],
+      remove: async () => false,
+    };
+    const current = deps({ history: failingHistory });
     await expect(punish(current, input)).resolves.toMatchObject({ recorded: false, action: 'warn' });
     expect(current.submitComment).toHaveBeenCalled();
   });
@@ -177,14 +258,15 @@ describe('punish', () => {
   });
 
   it('refuses a ban before banUser when the subreddit name is empty', async () => {
-    const history = memoryHistory([{ ...inputRecord(NOW - 1) }]);
-    const current = deps({ history });
+    const redis = new FakeRedis();
+    redis.seedPrior('Target', NOW - 1);
+    const current = deps({}, redis);
     await expect(punish(current, { ...input, subredditName: '' })).rejects.toThrow(
       'cannot apply a ban without a subreddit name'
     );
     expect(current.banUser).not.toHaveBeenCalled();
     expect(current.submitComment).not.toHaveBeenCalled();
-    expect(history.records).toEqual([{ ...inputRecord(NOW - 1) }]); // nothing appended
+    expect(await current.history.load('Target')).toHaveLength(1); // nothing appended
   });
 });
 
@@ -193,7 +275,7 @@ describe('punish lock', () => {
     const redis = new FakeRedis();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    const history = memoryHistory();
+    const history = createHistoryStore(redis);
     const current = deps({
       redis,
       history,
@@ -219,13 +301,13 @@ describe('punish lock', () => {
       durationDays: 3,
       priors: 1,
     });
-    expect(history.records).toHaveLength(2);
+    expect(await history.load('Target')).toHaveLength(2);
   });
 
   it('throws in progress without any writes when the lock is already held', async () => {
     const redis = new FakeRedis();
     redis.values.set(punishLockKey('Target'), '1');
-    const history = memoryHistory();
+    const history = createHistoryStore(redis);
     const append = vi.spyOn(history, 'append');
     const current = deps({ redis, history });
 
@@ -233,7 +315,7 @@ describe('punish lock', () => {
     expect(current.submitComment).not.toHaveBeenCalled();
     expect(current.banUser).not.toHaveBeenCalled();
     expect(append).not.toHaveBeenCalled();
-    expect(history.records).toEqual([]);
+    expect(await history.load('Target')).toEqual([]);
     expect(redis.delCalls).toEqual([]); // never releases a lock it did not acquire
   });
 
@@ -345,22 +427,24 @@ describe('punish lock', () => {
 });
 
 describe('punish compensation', () => {
-  it('removes the pending record on execution failure so the next punish sees no prior', async () => {
-    const prior = inputRecord(NOW - DAY);
-    const history = memoryHistory([prior]);
+  it('removes the pending row by id on execution failure so the retry sees no phantom prior', async () => {
+    const redis = new FakeRedis();
+    const prior = redis.seedPrior('Target', NOW - DAY);
+    const history = createHistoryStore(redis);
     const failing = deps({
+      redis,
       history,
       banUser: vi.fn(async () => {
         throw new Error('ban failed');
       }),
     });
 
-    // One prior ⇒ 3 day ban rung; the pending record is written first, then
+    // One prior ⇒ 3 day ban rung; the pending row is written first, then
     // compensated when the ban fails.
     await expect(punish(failing, input)).rejects.toThrow('ban failed');
-    expect(history.records).toEqual([prior]);
+    expect(await history.load('Target')).toEqual([prior]);
 
-    const retry = deps({ history });
+    const retry = deps({ redis, history });
     await expect(punish(retry, input)).resolves.toMatchObject({
       action: 'ban',
       durationDays: 3,
@@ -368,10 +452,35 @@ describe('punish compensation', () => {
     });
   });
 
-  it('persists no record when banUser fails', async () => {
-    const priors = [inputRecord(NOW - 1), inputRecord(NOW - 2)];
-    const history = memoryHistory(priors);
+  it('compensates only its own row when an older row has identical fields', async () => {
+    const redis = new FakeRedis();
+    // Same at/rule/action/label/modUser/target as the pending row will get;
+    // only the id differs. Field-matching compensation would remove it.
+    const stale: ModActionRecord = {
+      id: 'stale', at: NOW, rule: 2, action: 'warn', label: 'Warning',
+      modUser: 'Mod', targetThingId: 't3_post',
+    };
+    redis.zAdd(historyKey('Target'), { member: JSON.stringify(stale), score: NOW });
+    const history = createHistoryStore(redis);
     const current = deps({
+      redis,
+      history,
+      banUser: vi.fn(async () => {
+        throw new Error('ban failed');
+      }),
+    });
+
+    await expect(punish(current, input)).rejects.toThrow('ban failed');
+    const rows = await current.history.load('Target');
+    expect(rows.map((row) => row.id)).toEqual(['stale']);
+  });
+
+  it('persists no record when banUser fails', async () => {
+    const redis = new FakeRedis();
+    const priors = [redis.seedPrior('Target', NOW - 1, 0), redis.seedPrior('Target', NOW - 2, 1)];
+    const history = createHistoryStore(redis);
+    const current = deps({
+      redis,
       history,
       banUser: vi.fn(async () => {
         throw new Error('ban refused');
@@ -379,7 +488,9 @@ describe('punish compensation', () => {
     });
 
     await expect(punish(current, input)).rejects.toThrow('ban refused');
-    expect(history.records).toEqual(priors);
+    const rows = await history.load('Target');
+    // The same two rows remain (order is score-ascending, not seed order).
+    expect([...rows.map((row) => row.id)].sort()).toEqual(priors.map((prior) => prior.id).sort());
   });
 });
 

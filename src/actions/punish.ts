@@ -1,6 +1,6 @@
 import { effectivePriors, LADDER, pickRung, type LadderRung } from '../lib/ladder.js';
 import { ruleByNumber } from '../lib/rules.js';
-import type { HistoryStore, ModActionRecord, RedisLike } from '../lib/history.js';
+import type { HistoryStore, ModActionRecord, RedisSetOptions, RedisStringLike } from '../lib/history.js';
 
 const RULES_WIKI = 'https://www.reddit.com/r/RPClipsGTA/wiki/subreddit/rules/';
 const MODMAIL_APPEAL =
@@ -10,8 +10,8 @@ const LOCK_TTL_MS = 30 * 1000;
 
 export interface PunishDeps {
   readonly history: HistoryStore;
-  /** Shared Redis used to serialize the complete per-user punishment flow. */
-  readonly redis: RedisLike;
+  /** Shared Redis (string commands) used to serialize the punishment flow. */
+  readonly redis: RedisStringLike;
   readonly submitComment: (options: {
     text: string;
     replyTargetThingId: string;
@@ -105,7 +105,8 @@ export function punishLockKey(username: string): string {
   return `punish:lock:${username.toLowerCase()}`;
 }
 
-function recordFor(input: PunishInput, at: number, rung: LadderRung): ModActionRecord {
+/** The pending row shape handed to append(), which mints the unique id. */
+function pendingRecordFor(input: PunishInput, at: number, rung: LadderRung): Omit<ModActionRecord, 'id'> {
   return {
     at,
     rule: input.rule,
@@ -121,12 +122,9 @@ async function compensateRecord(
   username: string,
   record: ModActionRecord
 ): Promise<void> {
-  if (!history.remove) {
-    console.error('[punish] execution failed; history store cannot compensate the pending record');
-    return;
-  }
   try {
-    const removed = await history.remove(username, record);
+    // Compensation is by the row's unique id, never by field comparison.
+    const removed = await history.remove(username, record.id);
     if (!removed) {
       console.error('[punish] execution failed; compensation could not remove the pending record');
     }
@@ -160,24 +158,30 @@ export async function punish(
 
   try {
     const at = now();
-    // history.load() intentionally degrades redis read failures to an empty
-    // array: an unreadable history presents as fresh, so this action degrades
-    // to a warning rung rather than failing.
-    const priorRecords = await deps.history.load(input.targetUser);
-    const priorTimestamps = priorRecords
-      .map((record) => record.at)
-      .filter((timestamp) => Number.isFinite(timestamp));
-    const rung = pickRung(priorTimestamps, at);
-    const effective = effectivePriors(priorTimestamps, at);
+    // history.summary() intentionally degrades redis read failures to a fresh
+    // history (total 0): an unreadable summary presents as no priors, so the
+    // action degrades to a warning rung — contained, rather than failing. Rung
+    // selection needs only that O(1)-ish summary (ZCARD + newest score); the
+    // full history is never loaded here.
+    const summary = await deps.history.summary(input.targetUser);
+    const rung = pickRung(summary.total, summary.latestAt, at);
+    const effective = effectivePriors(summary.total, summary.latestAt, at);
 
     if (rung.action === 'ban' && !input.subredditName.trim()) {
       throw new Error('cannot apply a ban without a subreddit name');
     }
 
-    const pendingRecord = recordFor(input, at, rung);
     let recorded = false;
+    let pendingRecord: ModActionRecord | undefined;
     try {
-      recorded = await deps.history.append(input.targetUser, pendingRecord);
+      // Append is a single atomic ZADD that mints the unique row id and
+      // returns the stored record — that record is the compensation identity.
+      const appended = await deps.history.append(
+        input.targetUser,
+        pendingRecordFor(input, at, rung)
+      );
+      pendingRecord = appended.record;
+      recorded = appended.ok;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error(`[punish] failed to pre-record ${input.targetUser}: ${detail}`);
@@ -211,7 +215,7 @@ export async function punish(
         });
       }
     } catch (error) {
-      if (recorded) {
+      if (recorded && pendingRecord) {
         // There is a tiny crash window between the Reddit action and this
         // compensation; pending-first makes a failed action visible otherwise.
         await compensateRecord(deps.history, input.targetUser, pendingRecord);

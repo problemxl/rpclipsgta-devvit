@@ -27,17 +27,20 @@ const THREE_MONTHS_MS = 90 * 24 * 60 * 60 * 1000;
 /**
  * Count prior actions after one level of decay for every full three-month
  * (90-day) quiet stretch since the latest prior action.
+ *
+ * History is retained for life, so `total` keeps growing forever; the decay
+ * anchored at the latest action is what keeps the ladder correct for
+ * long-quiet users (see src/lib/history.ts for the retention decision).
  */
-export function effectivePriors(priorTimestamps: readonly number[], now: number): number {
-  if (priorTimestamps.length === 0) return 0;
+export function effectivePriors(total: number, latestAt: number | undefined, now: number): number {
+  if (latestAt === undefined) return 0;
 
-  const latest = Math.max(...priorTimestamps);
-  const quietMs = Math.max(0, now - latest);
+  const quietMs = Math.max(0, now - latestAt);
   const decay = Math.floor(quietMs / THREE_MONTHS_MS);
-  return Math.max(0, priorTimestamps.length - decay);
+  return Math.max(0, total - decay);
 }
 
-/** Select the ladder rung for a user's prior action timestamps. */
-export function pickRung(priorTimestamps: readonly number[], now: number): LadderRung {
-  return LADDER[Math.min(effectivePriors(priorTimestamps, now), LADDER.length - 1)];
+/** Select the ladder rung for a user's retained infraction total and latest action. */
+export function pickRung(total: number, latestAt: number | undefined, now: number): LadderRung {
+  return LADDER[Math.min(effectivePriors(total, latestAt, now), LADDER.length - 1)];
 }
