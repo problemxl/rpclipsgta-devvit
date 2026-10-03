@@ -4,7 +4,7 @@
  * A mod can press "Escalate" on a post or comment, or explicitly create a
  * clip fixture from a source post for the development/QA subreddits. Fixture
  * creation makes a normal link post with the original Twitch/Kick URL; it is
- * never automatic and never creates a comment or crosspost.
+ * moderator-initiated and never creates a comment or crosspost.
  *
  * Failure handling is deliberately minimal: failures surface as a short
  * error toast only. No PM fallbacks — the service handles user notification
@@ -13,7 +13,13 @@
 
 import { Devvit, SettingScope } from '@devvit/public-api';
 
-import { runAutoEscalationSafely } from './actions/autoescalate.js';
+import {
+  applyManualRuleRemovalSafely,
+  buildRemovalFailureToast,
+  buildRemovalSuccessToast,
+  runModRemovalSafely,
+  type ModRemovalSafeOutcome,
+} from './actions/autoescalate.js';
 import {
   buildFailureToast,
   buildSuccessToast,
@@ -30,6 +36,7 @@ import {
   isAuthorizedFixtureActor,
   type FixturePost,
 } from './actions/fixture.js';
+import { actionForRule } from './lib/detection.js';
 import { ruleByNumber, RULES } from './lib/rules.js';
 import { callEscalate, type EscalatePayload } from './lib/service.js';
 
@@ -84,72 +91,7 @@ Devvit.addSettings([
     scope: SettingScope.App,
     isSecret: true,
   },
-  {
-    type: 'boolean',
-    name: 'auto-escalate-enabled',
-    label: 'Enable automatic submission moderation',
-    helpText:
-      'Automatically remove deterministic rule violations in r/RPClipsGTA and escalate eligible removals. Off by default.',
-    scope: SettingScope.Installation,
-    defaultValue: false,
-  },
 ]);
-
-Devvit.addTrigger({
-  event: 'PostSubmit',
-  async onEvent(event, context) {
-    // This is a belt-and-braces boundary around the entire framework callback.
-    // The framework must never receive an exception from event/settings glue.
-    try {
-      const enabled = await context.settings.get<boolean>('auto-escalate-enabled');
-      if (!enabled) return;
-
-      const post = event.post;
-      const subredditName = event.subreddit?.name ?? context.subredditName ?? '';
-      const targetSubreddit = 'RPClipsGTA';
-      if (!post || subredditName.toLowerCase() !== targetSubreddit.toLowerCase()) return;
-      if (post.spam || post.deleted) return;
-
-      const outcome = await runAutoEscalationSafely(
-        {
-          postId: post.id,
-          authorName: event.author?.name ?? '',
-          title: post.title,
-          url: post.url,
-          body: post.selftext,
-          isTextPost: post.isSelf,
-        },
-        {
-          // Installation-scoped Redis is intentionally per-subreddit; fixture
-          // metadata remains on global Redis and is unaffected by this state.
-          redis: context.redis,
-          removePost: (thingId) =>
-            context.reddit.remove(thingId as `t3_${string}`, false),
-          // Settings are read only after a punish-class violation has been
-          // detected and removed. Missing settings therefore never gate removal.
-          getEscalate: async () => {
-            const [token, rawServiceUrl] = await Promise.all([
-              context.settings.get<string>('escalate-token'),
-              context.settings.get<string>('service-url'),
-            ]);
-            const serviceUrl = normalizeBaseUrl(rawServiceUrl);
-            if (!token || !serviceUrl || !isAllowedServiceHost(serviceUrl)) {
-              return undefined;
-            }
-            return (payload: EscalatePayload) =>
-              callEscalate(fetch, serviceUrl, token, payload);
-          },
-          isModerator: (username) =>
-            isAuthorizedFixtureActor(context.reddit, subredditName, username),
-        }
-      );
-      console.log(`[auto-escalate] trigger outcome: ${JSON.stringify(outcome)}`);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      console.error(`[auto-escalate] trigger failed: ${detail}`);
-    }
-  },
-});
 
 const escalateForm = Devvit.createForm(
   {
@@ -367,6 +309,116 @@ const fixtureForm = Devvit.createForm(
   }
 );
 
+const removePostForm = Devvit.createForm(
+  {
+    title: 'Remove post',
+    description:
+      'Choose a rule when automatic detection found nothing. The selected rule is removed and escalated according to policy.',
+    acceptLabel: 'Remove post',
+    fields: [
+      {
+        type: 'select',
+        name: 'rule',
+        label: 'Rule broken',
+        required: true,
+        options: RULES.map((rule) => ({
+          label: `R${rule.number} — ${rule.name} (${actionForRule(rule.number) === 'remove-and-escalate' ? 'remove + escalate' : 'remove only'})`,
+          value: String(rule.number),
+        })),
+      },
+      {
+        type: 'string',
+        name: 'reason',
+        label: 'Reason (optional)',
+        helpText: 'Forwarded to the escalation service when this rule escalates.',
+      },
+    ],
+  },
+  async (event, context) => {
+    const rule = Number(event.values.rule?.[0]);
+    if (!Number.isInteger(rule) || !ruleByNumber(rule)) {
+      safeToast(context, 'No valid rule selected — action aborted.');
+      return;
+    }
+    const postId = context.postId;
+    const modUser = context.username?.trim();
+    if (!postId || !modUser) {
+      safeToast(
+        context,
+        !postId
+          ? 'Could not determine the target post — action aborted.'
+          : 'Could not determine the acting moderator — action aborted.'
+      );
+      return;
+    }
+
+    try {
+      const post = await context.reddit.getPostById(postId);
+      const outcome = await applyManualRuleRemovalSafely(
+        {
+          postId: post.id,
+          authorName: post.authorName,
+          modUser,
+        },
+        rule,
+        typeof event.values.reason === 'string' ? event.values.reason : '',
+        createModRemovalDeps(context)
+      );
+      showRemovalOutcome(context, outcome);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[mod-remove] form failed: ${detail}`);
+      safeToast(context, `Remove post failed: ${detail}`);
+    }
+  }
+);
+
+Devvit.addMenuItem({
+  label: 'Remove post',
+  description: 'Auto-detect R4/R5/R6/R12 or pick a rule; removes and escalates per policy',
+  location: 'post',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    // No subreddit guard: this moderator action intentionally matches Escalate.
+    const postId = context.postId;
+    const modUser = context.username?.trim();
+    if (!postId || !modUser) {
+      safeToast(
+        context,
+        !postId
+          ? 'Could not determine the target post — action aborted.'
+          : 'Could not determine the acting moderator — action aborted.'
+      );
+      return;
+    }
+
+    try {
+      const post = await context.reddit.getPostById(postId);
+      const outcome = await runModRemovalSafely(
+        {
+          postId: post.id,
+          authorName: post.authorName,
+          title: post.title,
+          url: post.url,
+          body: post.body ?? '',
+          isTextPost: post.body !== undefined,
+          modUser,
+        },
+        createModRemovalDeps(context)
+      );
+      if (outcome.status === 'clean') {
+        context.ui.showForm(removePostForm, { targetId: post.id });
+        return;
+      }
+      showRemovalOutcome(context, outcome);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[mod-remove] menu failed: ${detail}`);
+      safeToast(context, `Remove post failed: ${detail}`);
+    }
+  },
+});
+
 Devvit.addMenuItem({
   label: 'Create clip fixture',
   description: 'Copy this clip URL to the development or QA subreddit for testing',
@@ -378,6 +430,49 @@ Devvit.addMenuItem({
     context.ui.showForm(fixtureForm, { sourceId: event.targetId });
   },
 });
+
+function createModRemovalDeps(context: Devvit.Context) {
+  return {
+    redis: context.redis,
+    removePost: (thingId: string) =>
+      context.reddit.remove(thingId as `t3_${string}`, false),
+    getEscalate: async () => {
+      const [token, rawServiceUrl] = await Promise.all([
+        context.settings.get<string>('escalate-token'),
+        context.settings.get<string>('service-url'),
+      ]);
+      const serviceUrl = normalizeBaseUrl(rawServiceUrl);
+      if (!token || !serviceUrl || !isAllowedServiceHost(serviceUrl)) return undefined;
+      return (payload: EscalatePayload) => callEscalate(fetch, serviceUrl, token, payload);
+    },
+  };
+}
+
+function showRemovalOutcome(context: Devvit.Context, outcome: ModRemovalSafeOutcome): void {
+  switch (outcome.status) {
+    case 'actioned':
+    case 'actioned-unescalated':
+      safeToast(
+        context,
+        buildRemovalSuccessToast(outcome, ruleByNumber(outcome.violation.rule)?.name)
+      );
+      return;
+    case 'already-processed':
+      safeToast(context, 'Already processed by this action.');
+      return;
+    case 'escalate-failed':
+    case 'remove-failed':
+    case 'failed':
+    case 'trigger-failed':
+      safeToast(context, buildRemovalFailureToast(outcome));
+      return;
+    case 'skipped-author':
+      safeToast(context, 'Post author is empty or AutoModerator — action skipped.');
+      return;
+    case 'clean':
+      return;
+  }
+}
 
 /**
  * Best-effort toast: UI hiccups must never mask the real outcome.
