@@ -318,8 +318,12 @@ export async function applyManualRuleRemoval(
       if ((await deps.redis.get(key)) !== 'clean') {
         return audit({ status: 'already-processed' }, input.postId);
       }
+      await deps.redis.del(key);
+      // DEL and SET are intentionally separate: if the process crashes after
+      // DEL, before this SET NX, the claim is lost and the post may be retried.
+      // That narrow retry-allowed window is accepted for this form workflow.
       const consumed = await deps.redis.set(key, '1', {
-        xx: true,
+        nx: true,
         expiration: new Date(now() + SEEN_TTL_DAYS * DAY_MS),
       });
       if (!consumed) return audit({ status: 'already-processed' }, input.postId);

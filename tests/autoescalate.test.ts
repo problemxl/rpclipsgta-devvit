@@ -284,6 +284,20 @@ describe('runModRemoval', () => {
     expect(current.escalated).toEqual([]);
   });
 
+  it('releases the seen claim when a dependency fails before removal', async () => {
+    const redis = new FakeRedis();
+    vi.spyOn(redis, 'get').mockRejectedValue(new Error('redis unavailable'));
+    const current = state({}, redis);
+
+    await expect(runModRemoval(input(), current.deps)).resolves.toEqual({
+      status: 'failed',
+      detail: 'redis unavailable',
+    });
+    expect(current.redis.values.has('autoescalate:seen:abc123')).toBe(false);
+    expect(current.removed).toEqual([]);
+    expect(current.escalated).toEqual([]);
+  });
+
   it('keeps the seen claim and reports a manual fallback when escalation fails', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     try {
@@ -392,6 +406,39 @@ describe('applyManualRuleRemoval', () => {
     ).resolves.toMatchObject({ status: 'actioned', violation: { rule: 5 } });
     expect(current.removed).toEqual(['t3_clean-then-manual']);
     expect(current.redis.values.get('autoescalate:seen:clean-then-manual')).toBe('1');
+  });
+
+  it('atomically consumes a clean automatic claim only once', async () => {
+    const redis = new FakeRedis();
+    redis.values.set('autoescalate:seen:form-once', 'clean');
+    const current = state({ escalate: undefined }, redis);
+    const post = { postId: 'form-once', authorName: 'poster', modUser: 'mod-user' };
+
+    await expect(applyManualRuleRemoval(post, 5, 'First action', current.deps)).resolves.toMatchObject({
+      status: 'actioned',
+    });
+    await expect(applyManualRuleRemoval(post, 5, 'Second action', current.deps)).resolves.toEqual({
+      status: 'already-processed',
+    });
+    expect(current.removed).toEqual(['t3_form-once']);
+    expect(current.redis.values.get('autoescalate:seen:form-once')).toBe('1');
+  });
+
+  it('rejects a form submission whose seen claim is already consumed', async () => {
+    const redis = new FakeRedis();
+    redis.values.set('autoescalate:seen:already-consumed', '1');
+    const current = state({ escalate: undefined }, redis);
+
+    await expect(
+      applyManualRuleRemoval(
+        { postId: 'already-consumed', authorName: 'poster', modUser: 'mod-user' },
+        5,
+        'Second action',
+        current.deps
+      )
+    ).resolves.toEqual({ status: 'already-processed' });
+    expect(current.removed).toEqual([]);
+    expect(current.escalated).toEqual([]);
   });
 
   it('is idempotent after a manual removal', async () => {
