@@ -31,23 +31,37 @@ export interface Violation {
   readonly action: AutoAction;
 }
 
+/** The parsed URL fields used by the detector and duplicate claim logic. */
+export type ParsedSubmissionUrl =
+  | { readonly ok: true; readonly host: string; readonly path: string }
+  | { readonly ok: false };
+
 function normalizeHost(host: string): string {
   return host.toLowerCase().replace(/^www\./, '');
 }
 
-function parseUrl(value: string): URL | undefined {
+/**
+ * Parse a submission URL accepted by the detector. Link submissions are
+ * intentionally limited to HTTP(S); malformed links are simply not
+ * whitelisted rather than being allowed to throw from a trigger.
+ */
+export function parseSubmissionUrl(value: string): ParsedSubmissionUrl {
   try {
-    return new URL(value);
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return { ok: false };
+    }
+    const host = normalizeHost(parsed.hostname);
+    if (!host) return { ok: false };
+    return { ok: true, host, path: parsed.pathname };
   } catch {
-    return undefined;
+    return { ok: false };
   }
 }
 
-function isWhitelistedHost(host: string): boolean {
-  const normalized = normalizeHost(host);
-  return WHITELISTED_DOMAINS.some(
-    (root) => normalized === root || normalized.endsWith(`.${root}`)
-  );
+/** Return true only for one of the eight exact allowlisted hosts. */
+export function isWhitelistedHost(host: string): boolean {
+  return WHITELISTED_DOMAINS.includes(normalizeHost(host));
 }
 
 function isTwitchHost(host: string): boolean {
@@ -58,152 +72,194 @@ function isKickHost(host: string): boolean {
   return normalizeHost(host) === 'kick.com';
 }
 
-function isVodPath(url: URL): boolean {
-  const path = url.pathname;
-  return (
-    ((isTwitchHost(url.hostname) &&
-      (/^\/videos(?:\/|$)/i.test(path) || /^\/[^/]+\/video(?:\/|$)/i.test(path))) ||
-      (isKickHost(url.hostname) && /^\/videos(?:\/|$)/i.test(path)))
-  );
+/** Split a URL path into non-empty segments, allowing one trailing slash. */
+function pathSegments(path: string): string[] {
+  const segments = path.split('/');
+  if (segments[0] === '') segments.shift();
+  if (segments.at(-1) === '') segments.pop();
+  if (segments.some((segment) => !segment)) return [];
+  return segments;
+}
+
+function isVodPath(host: string, path: string): boolean {
+  const segments = pathSegments(path).map((segment) => segment.toLowerCase());
+  if (isTwitchHost(host)) {
+    return (
+      (segments.length === 2 && segments[0] === 'videos') ||
+      (segments.length === 3 &&
+        segments[1] === 'video' ||
+        segments.length === 3 && segments[1] === 'videos')
+    );
+  }
+  if (isKickHost(host)) {
+    return (
+      (segments.length === 2 && segments[0] === 'videos') ||
+      (segments.length === 3 && segments[1] === 'videos')
+    );
+  }
+  return false;
+}
+
+function isTwitchLegacyClipPath(host: string, path: string): boolean {
+  if (!isTwitchHost(host)) return false;
+  const segments = pathSegments(path);
+  return segments.length === 3 && segments[1].toLowerCase() === 'clip';
+}
+
+function isTwitchChannelLink(host: string, path: string): boolean {
+  return isTwitchHost(host) && pathSegments(path).length === 1;
 }
 
 function hasStreamableBracketTitle(title: string): boolean {
-  return /\[[^\]]*\S[^\]]*\]/.test(title);
+  const firstGroup = title.trim().match(/^\[([^\]]*)\]/u);
+  return Boolean(firstGroup && /\p{L}/u.test(firstGroup[1]));
 }
 
-function isTwitchChannelLink(url: URL): boolean {
-  const host = normalizeHost(url.hostname);
-  if (host === 'clips.twitch.tv' || !isTwitchHost(host)) return false;
-  if (/^\/videos(?:\/|$)/i.test(url.pathname)) return false;
-  return /^\/[^/?#]+\/?$/.test(url.pathname);
-}
+const SENTENCE_PLACEHOLDER = '\uE000';
 
 function hasAtLeastTwoSentences(body: string): boolean {
-  return body
-    .split(/[.!?—]/)
-    .map((segment) => segment.trim())
-    .filter(Boolean).length >= 2;
+  const cleaned = body
+    // Markdown links contribute their visible text, not their URL.
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    // URLs do not contribute their path punctuation as sentence boundaries.
+    .replace(/https?:\/\/[^\s<>()]+/gi, ' ')
+    // Decimal points and common honorifics are not sentence boundaries.
+    .replace(/(\d)\.(?=\d)/g, `$1${SENTENCE_PLACEHOLDER}`)
+    .replace(/\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr)\.(?=\s+\p{Lu})/gu, SENTENCE_PLACEHOLDER);
+
+  const sentenceCount = cleaned
+    .split(/[.!?]+/)
+    .filter((segment) => /\p{L}/u.test(segment));
+  return sentenceCount.length >= 2;
 }
 
 function containsLetters(value: string): boolean {
   return /\p{L}/u.test(value.trim());
 }
 
-function escapedRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function decodedPathSegments(url: string): string[] {
+  const parsed = parseSubmissionUrl(url);
+  if (!parsed.ok) return [];
+
+  return parsed.path
+    .split('/')
+    .filter(Boolean)
+    .flatMap((segment) => {
+      try {
+        return [decodeURIComponent(segment)];
+      } catch {
+        // A malformed segment must not prevent later path segments being read.
+        return [];
+      }
+    });
 }
 
 function containsBannedStreamer(value: string, streamer: string): boolean {
-  if (streamer === 'zombie_barricades') {
-    return new RegExp('\\bzombie(?:[\\s_-]+)barricades\\b', 'i').test(value);
-  }
-  return new RegExp(`\\b${escapedRegExp(streamer)}\\b`, 'i').test(value);
+  const normalized = streamer === 'zombie_barricades' ? 'zombie barricades' : streamer;
+  const words = normalized.split(' ');
+  const phrase = words
+    .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('[^\\p{L}\\p{N}]+');
+  return new RegExp(`(?:^|[^\\p{L}\\p{N}])${phrase}(?=$|[^\\p{L}\\p{N}])`, 'iu').test(
+    value
+  );
 }
 
-function matchesBannedStreamer(value: string): boolean {
-  let decoded = value;
-  try {
-    decoded = `${value} ${decodeURIComponent(value)}`;
-  } catch {
-    // The raw URL/title is still checked when a URL contains malformed escapes.
-  }
-  return BANNED_STREAMERS.some((streamer) => containsBannedStreamer(decoded, streamer));
+function matchesBannedStreamer(title: string, url: string, isTextPost: boolean): boolean {
+  const scannedText = [title, ...(isTextPost ? [] : decodedPathSegments(url))].join(' ');
+  return BANNED_STREAMERS.some((streamer) => containsBannedStreamer(scannedText, streamer));
+}
+
+function makeViolation(
+  rule: number,
+  reason: string,
+  action: AutoAction
+): Violation {
+  return { rule, reason, action };
 }
 
 /**
- * Detect all high-confidence automated violations in canonical priority-group
- * order. Rule 6 is intentionally omitted because it requires Redis state.
+ * Detect deterministic violations. There is at most one result per rule:
+ * R5 precedence is non-whitelisted/malformed host, then VOD, then an invalid
+ * Twitch path, then the Streamable title convention; R4 precedence is a
+ * Twitch channel, then a short text post, then an emote-only title. R12 has
+ * one combined title/path name check.
+ *
+ * Rule 6 is intentionally omitted because it requires Redis state.
  */
 export function detectContentViolations(submission: SubmissionInput): Violation[] {
   const violations: Violation[] = [];
-  const parsedUrl = submission.isTextPost ? undefined : parseUrl(submission.url);
+  const parsedUrl = submission.isTextPost ? undefined : parseSubmissionUrl(submission.url);
 
   // Rule 5: only link posts are checked against the exact domain allowlist.
   if (!submission.isTextPost) {
-    if (!parsedUrl || !isWhitelistedHost(parsedUrl.hostname)) {
-      violations.push({
-        rule: 5,
-        reason: 'link domain is not whitelisted',
-        action: 'remove-and-escalate',
-      });
-    } else if (isVodPath(parsedUrl)) {
-      // Rule 5: whole Twitch/Kick VOD links are prohibited as submissions.
-      violations.push({
-        rule: 5,
-        reason: 'VOD links are prohibited as submissions',
-        action: 'remove-and-escalate',
-      });
-    }
-
-    if (
-      parsedUrl &&
-      normalizeHost(parsedUrl.hostname) === 'streamable.com' &&
+    let reason: string | undefined;
+    if (!parsedUrl?.ok || !isWhitelistedHost(parsedUrl.host)) {
+      reason = 'link domain is not whitelisted';
+    } else if (isVodPath(parsedUrl.host, parsedUrl.path)) {
+      reason = 'VOD links are prohibited as submissions';
+    } else if (
+      isTwitchHost(parsedUrl.host) &&
+      !isTwitchLegacyClipPath(parsedUrl.host, parsedUrl.path)
+    ) {
+      reason = 'Twitch clips must be posted via clips.twitch.tv';
+    } else if (
+      parsedUrl.host === 'streamable.com' &&
       !hasStreamableBracketTitle(submission.title)
     ) {
-      // Rule 5: Streamable submissions must identify the streamer in brackets.
-      violations.push({
-        rule: 5,
-        reason: 'streamable title must include streamer name in brackets',
-        action: 'remove-and-escalate',
-      });
+      reason = 'streamable title must start with a bracket tag containing letters';
     }
+    if (reason) violations.push(makeViolation(5, reason, 'remove-and-escalate'));
   }
 
-  // Rule 4: these are the three deterministic low-effort checks only.
-  if (parsedUrl && isTwitchChannelLink(parsedUrl)) {
-    violations.push({
-      rule: 4,
-      reason: 'link is a twitch channel, not a clip',
-      action: 'remove-and-escalate',
-    });
-  }
-  if (submission.isTextPost && !hasAtLeastTwoSentences(submission.body)) {
-    violations.push({
-      rule: 4,
-      reason: 'text post under two sentences',
-      action: 'remove-and-escalate',
-    });
-  }
-  if (!containsLetters(submission.title)) {
-    violations.push({
-      rule: 4,
-      reason: 'emote-only title',
-      action: 'remove-and-escalate',
-    });
+  // Rule 4: only the highest-precedence deterministic reason is returned.
+  if (
+    parsedUrl?.ok &&
+    isTwitchChannelLink(parsedUrl.host, parsedUrl.path)
+  ) {
+    violations.push(
+      makeViolation(4, 'link is a twitch channel, not a clip', 'remove-and-escalate')
+    );
+  } else if (submission.isTextPost && !hasAtLeastTwoSentences(submission.body)) {
+    violations.push(makeViolation(4, 'text post under two sentences', 'remove-and-escalate'));
+  } else if (!containsLetters(submission.title)) {
+    violations.push(makeViolation(4, 'emote-only title', 'remove-and-escalate'));
   }
 
-  // Rule 12: mentions remove the submission but never warn or ban the author.
-  if (matchesBannedStreamer(`${submission.title} ${submission.url}`)) {
-    violations.push({
-      rule: 12,
-      reason: 'submission mentions a banned streamer',
-      action: 'remove',
-    });
+  // Rule 12 scans only the title and decoded URL path segments.
+  if (matchesBannedStreamer(submission.title, submission.url, submission.isTextPost)) {
+    violations.push(
+      makeViolation(12, 'submission mentions a banned streamer', 'remove')
+    );
   }
 
   return violations;
 }
 
 /**
- * Normalize a link URL for rule 6 duplicate detection. Invalid URLs return an
- * empty string; callers should only use this helper for parseable link posts.
+ * Normalize a link URL for rule 6 duplicate detection. Invalid or non-HTTP(S)
+ * URLs return an empty string; callers should only use this for link posts.
  */
 export function normalizeUrlForDuplication(url: string): string {
-  const parsed = parseUrl(url);
-  if (!parsed) return '';
+  const parsed = parseSubmissionUrl(url);
+  if (!parsed.ok) return '';
 
-  const hostname = normalizeHost(parsed.hostname);
-  const port = parsed.port ? `:${parsed.port}` : '';
-  const pathname = parsed.pathname.replace(/\/+$/, '');
-  const search = new URLSearchParams();
-  for (const [key, value] of parsed.searchParams) {
-    if (/^(?:utm_.+|fbclid|gclid|igshid)$/i.test(key)) continue;
-    search.append(key, value);
+  try {
+    const original = new URL(url);
+    const port = original.port ? `:${original.port}` : '';
+    const pathname = original.pathname.replace(/\/+$/, '');
+    const search = new URLSearchParams();
+    for (const [key, value] of original.searchParams) {
+      if (/^(?:utm_.+|fbclid|gclid|igshid)$/i.test(key)) continue;
+      search.append(key, value);
+    }
+    const query = search.toString();
+    return `${original.protocol.toLowerCase()}//${parsed.host}${port}${pathname}${
+      query ? `?${query}` : ''
+    }`;
+  } catch {
+    return '';
   }
-  const query = search.toString();
-  return `${parsed.protocol.toLowerCase()}//${hostname}${port}${pathname}${
-    query ? `?${query}` : ''
-  }`;
 }
 
 /** Compare two link URLs after applying the rule 6 duplicate normalization. */
