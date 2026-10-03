@@ -143,6 +143,43 @@ Errors are shown in a toast for an unauthorized source/moderator,
 missing/non-clip URLs, invalid target selection, duplicate requests, or Reddit
 submission failures. The source and target receive no comments.
 
+## Auto-escalation
+
+When the `auto-escalate-enabled` installation setting is enabled, the app
+listens for `PostSubmit` events only in `r/rpclipsgta` (case-insensitive).
+Installations on development or QA subreddits are guarded and never
+auto-act. The setting is off by default.
+
+The trigger applies only high-confidence, deterministic checks:
+
+- Rule 5: non-whitelisted link domains, Twitch/Kick VOD URLs, and Streamable
+  titles without a non-empty `[streamer]` group.
+- Rule 6: a normalized whitelisted link URL already seen in the 14-day Redis
+  window.
+- Rule 4: Twitch channel links, text posts with fewer than two sentences, and
+  titles containing no letters.
+- Rule 12: a banned streamer name in the title or URL.
+
+Everything else remains on the manual **Escalate** path; the app does not try
+to automate judgment-heavy rules such as toxicity, harassment, context,
+self-promotion, GTA RP relevance, or flairs. One violation is selected in the
+priority order R5 > R6 > R4 > R12. Every selected violation is removed. R5,
+R6, and R4 removals are sent to the escalation service with
+`mod_user: "devvit-auto"`; R12 is deliberately **remove-only** and never warns
+or bans the author, per the wiki.
+
+Automatic processing is idempotent and installation-scoped in Redis:
+
+- `autoescalate:seen:{postId}` — 7-day claim, so a PostSubmit retry cannot
+  action the same post twice.
+- `autoescalate:url:{normalizedUrl}` — 14-day first-seen URL claim used for
+  duplicate detection.
+
+The service token and service URL must still be configured for an eligible
+removal to escalate. Removal and escalation failures are logged with an
+`[auto-escalate]` audit prefix; a removal failure never calls the service.
+`AUTO_MOD_USER` is the fixed service actor name `devvit-auto`.
+
 ## What the app does on each press
 
 ### Escalate
@@ -249,5 +286,9 @@ npm test        # vitest run — unit tests (no network, no Devvit runtime)
 - `src/lib/service.ts` — typed client for `POST /devvit/escalate` (injectable fetch).
 - `src/actions/escalate.ts` — pure helpers: target resolution + toast text builders.
 - `src/actions/fixture.ts` — fixture targets, URL/title validation, and dedupe orchestration.
+- `src/actions/autoescalate.ts` — framework-free idempotent moderation and escalation orchestration.
+- `src/lib/detection.ts` — pure rule 4/5/12 detectors and duplicate URL normalization.
 - `src/lib/rules.ts` — the canonical 12 subreddit rules.
 - `src/main.ts` — deliberately thin Devvit wiring (menus, forms, settings, Reddit API, toast).
+- `tests/detection.test.ts` — deterministic detection and URL-normalization tests.
+- `tests/autoescalate.test.ts` — in-memory Redis orchestration tests.
