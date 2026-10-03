@@ -86,9 +86,8 @@ function isVodPath(host: string, path: string): boolean {
   if (isTwitchHost(host)) {
     return (
       (segments.length === 2 && segments[0] === 'videos') ||
-      (segments.length === 3 &&
-        segments[1] === 'video' ||
-        segments.length === 3 && segments[1] === 'videos')
+      (segments.length === 3 && segments[1] === 'video') ||
+      (segments.length === 3 && segments[1] === 'videos')
     );
   }
   if (isKickHost(host)) {
