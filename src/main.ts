@@ -13,6 +13,7 @@
 
 import { Devvit, SettingScope } from '@devvit/public-api';
 
+import { runAutoEscalationSafely } from './actions/autoescalate.js';
 import {
   buildFailureToast,
   buildSuccessToast,
@@ -83,7 +84,72 @@ Devvit.addSettings([
     scope: SettingScope.App,
     isSecret: true,
   },
+  {
+    type: 'boolean',
+    name: 'auto-escalate-enabled',
+    label: 'Enable automatic submission moderation',
+    helpText:
+      'Automatically remove deterministic rule violations in r/RPClipsGTA and escalate eligible removals. Off by default.',
+    scope: SettingScope.Installation,
+    defaultValue: false,
+  },
 ]);
+
+Devvit.addTrigger({
+  event: 'PostSubmit',
+  async onEvent(event, context) {
+    // This is a belt-and-braces boundary around the entire framework callback.
+    // The framework must never receive an exception from event/settings glue.
+    try {
+      const enabled = await context.settings.get<boolean>('auto-escalate-enabled');
+      if (!enabled) return;
+
+      const post = event.post;
+      const subredditName = event.subreddit?.name ?? context.subredditName ?? '';
+      const targetSubreddit = 'RPClipsGTA';
+      if (!post || subredditName.toLowerCase() !== targetSubreddit.toLowerCase()) return;
+      if (post.spam || post.deleted) return;
+
+      const outcome = await runAutoEscalationSafely(
+        {
+          postId: post.id,
+          authorName: event.author?.name ?? '',
+          title: post.title,
+          url: post.url,
+          body: post.selftext,
+          isTextPost: post.isSelf,
+        },
+        {
+          // Installation-scoped Redis is intentionally per-subreddit; fixture
+          // metadata remains on global Redis and is unaffected by this state.
+          redis: context.redis,
+          removePost: (thingId) =>
+            context.reddit.remove(thingId as `t3_${string}`, false),
+          // Settings are read only after a punish-class violation has been
+          // detected and removed. Missing settings therefore never gate removal.
+          getEscalate: async () => {
+            const [token, rawServiceUrl] = await Promise.all([
+              context.settings.get<string>('escalate-token'),
+              context.settings.get<string>('service-url'),
+            ]);
+            const serviceUrl = normalizeBaseUrl(rawServiceUrl);
+            if (!token || !serviceUrl || !isAllowedServiceHost(serviceUrl)) {
+              return undefined;
+            }
+            return (payload: EscalatePayload) =>
+              callEscalate(fetch, serviceUrl, token, payload);
+          },
+          isModerator: (username) =>
+            isAuthorizedFixtureActor(context.reddit, subredditName, username),
+        }
+      );
+      console.log(`[auto-escalate] trigger outcome: ${JSON.stringify(outcome)}`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[auto-escalate] trigger failed: ${detail}`);
+    }
+  },
+});
 
 const escalateForm = Devvit.createForm(
   {
