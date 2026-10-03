@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
-  runAutoEscalation,
-  runAutoEscalationSafely,
-  type AutoEscalateInput,
+  applyManualRuleRemoval,
+  buildRemovalFailureToast,
+  buildRemovalSuccessToast,
+  runModRemoval,
   type AutoRedisSetOptions,
+  type ModRemovalDeps,
+  type ModRemovalInput,
   type RedisLike,
 } from '../src/actions/autoescalate.js';
-import type { EscalateResult } from '../src/lib/service.js';
+import type { EscalatePayload, EscalateResult } from '../src/lib/service.js';
 
 const RESULT: EscalateResult = {
   action: 'warn',
@@ -15,14 +18,15 @@ const RESULT: EscalateResult = {
   label: 'Warning',
   comment_id: 't1_warning',
   priors: 0,
-  rule_name: 'Whitelisted domains',
+  rule_name: 'Toxicity',
   recorded: true,
 };
 
-function input(overrides: Partial<AutoEscalateInput> = {}): AutoEscalateInput {
+function input(overrides: Partial<ModRemovalInput> = {}): ModRemovalInput {
   return {
     postId: 'abc123',
     authorName: 'poster',
+    modUser: 'acting-mod',
     title: 'A good clip',
     url: 'https://clips.twitch.tv/ClipOne',
     body: '',
@@ -34,13 +38,20 @@ function input(overrides: Partial<AutoEscalateInput> = {}): AutoEscalateInput {
 class FakeRedis implements RedisLike {
   readonly values = new Map<string, string>();
   readonly expirations = new Map<string, Date>();
-  readonly calls: Array<{ key: string; value: string; options?: AutoRedisSetOptions }> = [];
+  readonly calls: Array<{
+    operation: 'get' | 'set' | 'del';
+    key: string;
+    value?: string;
+    options?: AutoRedisSetOptions;
+  }> = [];
 
   async get(key: string): Promise<string | undefined> {
+    this.calls.push({ operation: 'get', key });
     return this.values.get(key);
   }
 
   async del(key: string): Promise<void> {
+    this.calls.push({ operation: 'del', key });
     this.values.delete(key);
   }
 
@@ -49,7 +60,7 @@ class FakeRedis implements RedisLike {
     value: string,
     options?: AutoRedisSetOptions
   ): Promise<string | undefined> {
-    this.calls.push({ key, value, options });
+    this.calls.push({ operation: 'set', key, value, options });
     if (options?.nx && this.values.has(key)) return undefined;
     if (options?.xx && !this.values.has(key)) return undefined;
     this.values.set(key, value);
@@ -58,240 +69,299 @@ class FakeRedis implements RedisLike {
   }
 }
 
-function deps(redis = new FakeRedis(), overrides: Partial<Parameters<typeof runAutoEscalation>[1]> = {}) {
+function state(
+  overrides: Partial<ModRemovalDeps> = {},
+  redis = new FakeRedis()
+): {
+  redis: FakeRedis;
+  removed: string[];
+  escalated: EscalatePayload[];
+  deps: ModRemovalDeps;
+} {
   const removed: string[] = [];
-  const escalated: unknown[] = [];
-  return {
+  const escalated: EscalatePayload[] = [];
+  const deps: ModRemovalDeps = {
     redis,
-    removed,
-    escalated,
-    deps: {
-      redis,
-      removePost: async (id: string) => void removed.push(id),
-      escalate: async (payload: unknown) => {
-        escalated.push(payload);
-        return RESULT;
-      },
-      isModerator: async () => false,
-      now: () => 1_000_000,
-      ...overrides,
+    removePost: async (thingId) => {
+      removed.push(thingId);
     },
+    escalate: async (payload) => {
+      escalated.push(payload);
+      return RESULT;
+    },
+    now: () => 1_000_000,
+    ...overrides,
   };
+  return { redis, removed, escalated, deps };
 }
 
-describe('runAutoEscalation', () => {
-  it('safe wrapper converts a rejecting settings getter into trigger-failed', async () => {
-    const state = deps(undefined, {
-      escalate: undefined,
-      getEscalate: async () => {
-        throw new Error('settings unavailable');
-      },
-    });
-    await expect(
-      runAutoEscalationSafely(input({ url: 'https://bad.example/clip' }), state.deps)
-    ).resolves.toEqual({ status: 'trigger-failed', detail: 'settings unavailable' });
-    expect(state.removed).toEqual(['t3_abc123']);
-  });
-  it('leaves a clean whitelisted link alone and claims its URL for 14 days', async () => {
-    const state = deps();
-    const outcome = await runAutoEscalation(input(), state.deps);
-
-    expect(outcome).toEqual({ status: 'clean' });
-    expect(state.removed).toEqual([]);
-    expect(state.escalated).toEqual([]);
-    expect(state.redis.values.get('autoescalate:url:https://clips.twitch.tv/ClipOne')).toBe(
-      'abc123'
-    );
-    expect(state.redis.expirations.get('autoescalate:url:https://clips.twitch.tv/ClipOne')).toEqual(
-      new Date(1_000_000 + 14 * 24 * 60 * 60 * 1000)
-    );
+describe('removal toast builders', () => {
+  it('describes a removal that was escalated', () => {
+    expect(
+      buildRemovalSuccessToast(
+        { status: 'actioned', violation: { rule: 2, reason: 'toxicity', action: 'remove-and-escalate' }, escalateResult: RESULT },
+        'Toxicity'
+      )
+    ).toBe('Removed post (R2 — Toxicity) and escalated.');
   });
 
-  it('removes and escalates a second submission of the same normalized URL', async () => {
-    const state = deps();
-    await runAutoEscalation(input(), state.deps);
-    const second = await runAutoEscalation(
-      input({ postId: 'second', url: 'https://WWW.CLIPS.TWITCH.TV/ClipOne/?utm_source=x#t' }),
-      state.deps
-    );
-
-    expect(second.status).toBe('actioned');
-    if (second.status === 'actioned') expect(second.violation.rule).toBe(6);
-    expect(state.removed).toEqual(['t3_second']);
-    expect(state.escalated).toHaveLength(1);
-    expect(state.escalated[0]).toMatchObject({
-      target_id: 't3_second',
-      rule: 6,
-      reason: 'Auto: duplicate of an earlier submission of this URL',
-    });
-  });
-
-  it('skips empty authors, AutoModerator, and moderators', async () => {
-    for (const authorName of ['', 'automOdErator']) {
-      const state = deps();
-      await expect(runAutoEscalation(input({ authorName }), state.deps)).resolves.toEqual({
-        status: 'skipped-author',
-      });
-      expect(state.redis.values.size).toBe(1);
-    }
-
-    const state = deps(undefined, { isModerator: async () => true });
-    await expect(runAutoEscalation(input(), state.deps)).resolves.toEqual({
-      status: 'skipped-moderator',
-    });
-  });
-
-  it('is idempotent before checking the author or content', async () => {
-    const state = deps();
-    const first = await runAutoEscalation(input(), state.deps);
-    const second = await runAutoEscalation(
-      input({ url: 'https://bad.example/another', authorName: '' }),
-      state.deps
-    );
-
-    expect(first.status).toBe('clean');
-    expect(second).toEqual({ status: 'already-processed' });
-  });
-
-  it('removes banned streamer submissions without calling escalation', async () => {
-    const state = deps();
-    const outcome = await runAutoEscalation(
-      input({ title: 'Koil clip' }),
-      state.deps
-    );
-
-    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 12 } });
-    expect(state.removed).toEqual(['t3_abc123']);
-    expect(state.escalated).toEqual([]);
-  });
-
-  it('removes R12 with no service configured', async () => {
-    const state = deps(undefined, { escalate: undefined });
-    const outcome = await runAutoEscalation(input({ title: 'Koil clip' }), state.deps);
-    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 12 } });
-    expect(state.removed).toEqual(['t3_abc123']);
-  });
-
-  it('removes punish-class violations without service configuration and logs the manual fallback', async () => {
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    try {
-      const state = deps(undefined, { escalate: undefined });
-      const outcome = await runAutoEscalation(
-        input({ url: 'https://bad.example/clip' }),
-        state.deps
-      );
-      expect(outcome).toMatchObject({
+  it('describes a removal without configured escalation', () => {
+    expect(
+      buildRemovalSuccessToast({
         status: 'actioned-unescalated',
         reason: 'service-not-configured',
-      });
-      expect(state.removed).toEqual(['t3_abc123']);
-      expect(state.escalated).toEqual([]);
-      expect([...logSpy.mock.calls.flat(), ...errorSpy.mock.calls.flat()].join('\n')).toContain(
-        'manual Escalate'
-      );
-    } finally {
-      logSpy.mockRestore();
-      errorSpy.mockRestore();
-    }
+        violation: { rule: 4, reason: 'low effort', action: 'remove-and-escalate' },
+      })
+    ).toContain('not escalated');
   });
 
-  it('releases the seen claim when a pre-removal dependency fails', async () => {
-    const state = deps(undefined, {
-      isModerator: async () => {
-        throw new Error('moderator lookup failed');
-      },
+  it('mentions the manual Escalate option after an escalation failure', () => {
+    expect(
+      buildRemovalFailureToast({ status: 'escalate-failed', detail: 'service unavailable' })
+    ).toBe('Escalation failed after removal: service unavailable. Use the manual Escalate option.');
+  });
+});
+
+describe('runModRemoval', () => {
+  it.each([
+    ['R5', { url: 'https://bad.example/clip' }, 5],
+    ['R12', { title: 'Koil clip' }, 12],
+  ] as const)('removes %s without escalating', async (_label, overrides, rule) => {
+    const getEscalate = vi.fn(async () => {
+      throw new Error('remove-only rules must not configure escalation');
     });
-    await expect(
-      runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps)
-    ).resolves.toEqual({ status: 'failed', detail: 'moderator lookup failed' });
-    expect(state.redis.values.has('autoescalate:seen:abc123')).toBe(false);
-    expect(state.removed).toEqual([]);
-    expect(state.escalated).toEqual([]);
+    const current = state({ escalate: undefined, getEscalate }, new FakeRedis());
+
+    const outcome = await runModRemoval(input(overrides), current.deps);
+
+    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule } });
+    expect(current.removed).toEqual(['t3_abc123']);
+    expect(current.escalated).toEqual([]);
+    expect(getEscalate).not.toHaveBeenCalled();
   });
 
-  it('does not claim URLs for removed content, so a later clean post stays clean', async () => {
-    const state = deps();
-    const removed = await runAutoEscalation(input({ title: 'Koil clip' }), state.deps);
-    const clean = await runAutoEscalation(
-      input({ postId: 'clean', title: 'A good clip' }),
-      state.deps
-    );
-    expect(removed).toMatchObject({ status: 'actioned' });
-    expect(clean).toEqual({ status: 'clean' });
-  });
-
-  it('does not claim VOD URLs for a later clean post', async () => {
-    const state = deps();
-    await runAutoEscalation(input({ url: 'https://twitch.tv/channel/videos/123' }), state.deps);
-    const clean = await runAutoEscalation(
-      input({ postId: 'clean', url: 'https://twitch.tv/x/clip/y' }),
-      state.deps
-    );
-    expect(clean).toEqual({ status: 'clean' });
-  });
-
-  it('chooses rule 5 over a duplicate rule 6 violation', async () => {
-    const state = deps();
-    await runAutoEscalation(
-      input({ url: 'https://streamable.com/abc', title: '[Name] valid' }),
-      state.deps
-    );
-    const outcome = await runAutoEscalation(
-      input({ postId: 'vod', url: 'https://streamable.com/abc', title: '😂' }),
-      state.deps
+  it('removes an R6 duplicate without escalating', async () => {
+    const current = state();
+    const first = await runModRemoval(input(), current.deps);
+    const duplicate = await runModRemoval(
+      input({ postId: 'second', url: 'https://WWW.CLIPS.TWITCH.TV/ClipOne/?utm_source=x#time' }),
+      current.deps
     );
 
-    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 5 } });
-    expect(state.escalated[0]).toMatchObject({ rule: 5 });
+    expect(first).toEqual({ status: 'clean' });
+    expect(duplicate).toMatchObject({ status: 'actioned', violation: { rule: 6 } });
+    expect(current.removed).toEqual(['t3_second']);
+    expect(current.escalated).toEqual([]);
   });
 
-  it('converts escalation errors to outcomes after successful removal and logs the manual fallback', async () => {
-    let escalateCalls = 0;
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    try {
-      const state = deps(undefined, {
-        escalate: async () => {
-          escalateCalls += 1;
-          throw new Error('service unavailable');
-        },
-      });
-      await expect(
-        runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps)
-      ).resolves.toEqual({ status: 'escalate-failed', detail: 'service unavailable' });
-      expect(state.removed).toEqual(['t3_abc123']);
-      expect(state.redis.values.has('autoescalate:seen:abc123')).toBe(true);
-      expect(escalateCalls).toBe(1);
-      expect([...logSpy.mock.calls.flat(), ...errorSpy.mock.calls.flat()].join('\n')).toContain(
-        'manual Escalate'
-      );
-    } finally {
-      logSpy.mockRestore();
-      errorSpy.mockRestore();
-    }
+  it('escalates an R4 violation with the acting moderator in the payload', async () => {
+    const current = state();
+
+    const outcome = await runModRemoval(
+      input({ title: '😂 !!!', modUser: 'moderator42' }),
+      current.deps
+    );
+
+    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 4 } });
+    expect(current.removed).toEqual(['t3_abc123']);
+    expect(current.escalated).toEqual([
+      {
+        target_user: 'poster',
+        target_id: 't3_abc123',
+        rule: 4,
+        reason: 'Auto: emote-only title',
+        mod_user: 'moderator42',
+      },
+    ]);
   });
 
-  it('does not escalate when removal fails and releases the seen claim', async () => {
-    const state = deps(undefined, {
+  it('checks a clean URL before claiming it and then stores the post id', async () => {
+    const current = state();
+
+    await expect(runModRemoval(input(), current.deps)).resolves.toEqual({ status: 'clean' });
+
+    const urlKey = 'autoescalate:url:https://clips.twitch.tv/ClipOne';
+    const urlOperations = current.redis.calls.filter((call) => call.key === urlKey);
+    expect(urlOperations.map((call) => call.operation)).toEqual(['get', 'set']);
+    expect(urlOperations[1]).toMatchObject({ operation: 'set', value: 'abc123' });
+    expect(current.redis.values.get(urlKey)).toBe('abc123');
+    expect(current.redis.expirations.get(urlKey)).toEqual(
+      new Date(1_000_000 + 14 * 24 * 60 * 60 * 1000)
+    );
+    expect(current.redis.values.get('autoescalate:seen:abc123')).toBe('clean');
+    expect(current.redis.expirations.get('autoescalate:seen:abc123')).toEqual(
+      new Date(1_000_000 + 7 * 24 * 60 * 60 * 1000)
+    );
+  });
+
+  it('does not claim a URL when content already violates a rule', async () => {
+    const current = state();
+
+    await runModRemoval(
+      input({ postId: 'bad-domain', url: 'https://bad.example/clip' }),
+      current.deps
+    );
+    await runModRemoval(
+      input({ postId: 'banned-name', title: 'Koil highlight' }),
+      current.deps
+    );
+
+    expect([...current.redis.values.keys()].filter((key) => key.startsWith('autoescalate:url:')))
+      .toEqual([]);
+    expect(current.redis.calls.some((call) => call.key.startsWith('autoescalate:url:'))).toBe(false);
+  });
+
+  it('is idempotent for the same post', async () => {
+    const current = state();
+    const first = await runModRemoval(
+      input({ url: 'https://bad.example/clip' }),
+      current.deps
+    );
+    const second = await runModRemoval(
+      input({ url: 'https://bad.example/different' }),
+      current.deps
+    );
+
+    expect(first).toMatchObject({ status: 'actioned', violation: { rule: 5 } });
+    expect(second).toEqual({ status: 'already-processed' });
+    expect(current.removed).toEqual(['t3_abc123']);
+  });
+
+  it('releases the seen claim when removal fails and does not escalate', async () => {
+    const current = state({
       removePost: async () => {
         throw new Error('permission denied');
       },
     });
+
     await expect(
-      runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps)
+      runModRemoval(input({ title: '😂 !!!' }), current.deps)
     ).resolves.toEqual({ status: 'remove-failed', detail: 'permission denied' });
-    expect(state.escalated).toEqual([]);
-    expect(state.redis.values.has('autoescalate:seen:abc123')).toBe(false);
+    expect(current.redis.values.has('autoescalate:seen:abc123')).toBe(false);
+    expect(current.removed).toEqual([]);
+    expect(current.escalated).toEqual([]);
   });
 
-  it('keeps the seen claim when escalation fails after removal', async () => {
-    const state = deps(undefined, {
-      escalate: async () => {
-        throw new Error('service unavailable');
-      },
+  it('keeps the seen claim and reports a manual fallback when escalation fails', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const current = state({
+        escalate: async () => {
+          throw new Error('service unavailable');
+        },
+      });
+
+      await expect(
+        runModRemoval(input({ title: '😂 !!!' }), current.deps)
+      ).resolves.toEqual({ status: 'escalate-failed', detail: 'service unavailable' });
+      expect(current.removed).toEqual(['t3_abc123']);
+      expect(current.redis.values.get('autoescalate:seen:abc123')).toBe('1');
+      expect(errorSpy.mock.calls.flat().join('\n')).toContain('manual Escalate');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('uses a lazy escalation service for an R4 violation', async () => {
+    const escalate = vi.fn(async (payload: EscalatePayload) => {
+      return RESULT;
     });
-    await runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps);
-    expect(state.redis.values.has('autoescalate:seen:abc123')).toBe(true);
+    const getEscalate = vi.fn(async () => escalate);
+    const current = state({ escalate: undefined, getEscalate });
+
+    const outcome = await runModRemoval(input({ title: '😂 !!!' }), current.deps);
+
+    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 4 } });
+    expect(getEscalate).toHaveBeenCalledOnce();
+    expect(escalate).toHaveBeenCalledOnce();
+  });
+
+  it('removes an R4 violation without escalation when the service is missing', async () => {
+    const current = state({ escalate: undefined });
+
+    await expect(
+      runModRemoval(input({ title: '😂 !!!' }), current.deps)
+    ).resolves.toMatchObject({
+      status: 'actioned-unescalated',
+      reason: 'service-not-configured',
+      violation: { rule: 4 },
+    });
+    expect(current.removed).toEqual(['t3_abc123']);
+    expect(current.redis.values.get('autoescalate:seen:abc123')).toBe('1');
+  });
+});
+
+describe('applyManualRuleRemoval', () => {
+  it('applies manual rule 2 with the supplied reason and mod_user', async () => {
+    const current = state();
+
+    const outcome = await applyManualRuleRemoval(
+      input({ postId: 'manual-two', authorName: 'target-user', modUser: 'mod-user' }),
+      2,
+      'Repeated abusive comments',
+      current.deps
+    );
+
+    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 2 } });
+    expect(current.removed).toEqual(['t3_manual-two']);
+    expect(current.escalated).toEqual([
+      {
+        target_user: 'target-user',
+        target_id: 't3_manual-two',
+        rule: 2,
+        reason: 'Repeated abusive comments',
+        mod_user: 'mod-user',
+      },
+    ]);
+  });
+
+  it('applies manual rule 5 as remove-only and does not claim a URL', async () => {
+    const current = state({ escalate: undefined });
+
+    const outcome = await applyManualRuleRemoval(
+      input({ postId: 'manual-five' }),
+      5,
+      'Unapproved external domain',
+      current.deps
+    );
+
+    expect(outcome).toMatchObject({
+      status: 'actioned',
+      violation: { rule: 5, reason: 'Unapproved external domain', action: 'remove' },
+    });
+    expect(current.removed).toEqual(['t3_manual-five']);
+    expect(current.escalated).toEqual([]);
+    expect([...current.redis.values.keys()].some((key) => key.startsWith('autoescalate:url:')))
+      .toBe(false);
+  });
+
+  it('consumes the clean automatic claim when the moderator selects a manual rule', async () => {
+    const current = state();
+    const post = input({ postId: 'clean-then-manual' });
+
+    await expect(runModRemoval(post, current.deps)).resolves.toEqual({ status: 'clean' });
+    await expect(
+      applyManualRuleRemoval(
+        { postId: post.postId, authorName: post.authorName, modUser: post.modUser },
+        5,
+        'Moderator review found a domain issue',
+        current.deps
+      )
+    ).resolves.toMatchObject({ status: 'actioned', violation: { rule: 5 } });
+    expect(current.removed).toEqual(['t3_clean-then-manual']);
+    expect(current.redis.values.get('autoescalate:seen:clean-then-manual')).toBe('1');
+  });
+
+  it('is idempotent after a manual removal', async () => {
+    const current = state({ escalate: undefined });
+    const post = { postId: 'manual-once', authorName: 'poster', modUser: 'mod-user' };
+
+    await expect(applyManualRuleRemoval(post, 5, 'First action', current.deps)).resolves.toMatchObject({
+      status: 'actioned',
+    });
+    await expect(applyManualRuleRemoval(post, 5, 'Second action', current.deps)).resolves.toEqual({
+      status: 'already-processed',
+    });
+    expect(current.removed).toEqual(['t3_manual-once']);
   });
 });
