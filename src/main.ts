@@ -566,6 +566,12 @@ function showRemovalOutcome(context: Devvit.Context, outcome: ModRemovalSafeOutc
       return;
     case 'clean':
       return;
+    default: {
+      // Exhaustiveness guard: a new outcome status must be handled above.
+      const _exhaustive: never = outcome;
+      void _exhaustive;
+      return;
+    }
   }
 }
 
@@ -592,6 +598,12 @@ function showRemoveEscalateOutcome(
     case 'trigger-failed':
       safeToast(context, buildRemoveEscalateFailureToast(outcome));
       return;
+    default: {
+      // Exhaustiveness guard: a new outcome status must be handled above.
+      const _exhaustive: never = outcome;
+      void _exhaustive;
+      return;
+    }
   }
 }
 

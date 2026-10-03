@@ -162,7 +162,7 @@ as the fallback for the ladder step.
 Redis state is installation-scoped and idempotent:
 
 - `removeescalate:seen:{thingId}` — seven-day claim (SET NX) acquired before
-  any work; a second press on the same post or comment reports
+  any removal or punishment; a second press on the same post or comment reports
   "Already processed by this action."
 
 ## Publish checklist

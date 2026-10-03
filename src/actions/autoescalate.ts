@@ -430,6 +430,7 @@ export type RemoveEscalateFailureOutcome = Exclude<
   RemoveEscalateActionedOutcome | { readonly status: 'already-processed' }
 >;
 
+// Deliberately independent of SEEN_TTL_DAYS: separate namespace, conscious choice.
 const REMOVE_ESCALATE_TTL_DAYS = 7;
 
 function removeEscalateSeenKey(thingId: string): string {
@@ -474,6 +475,10 @@ export async function runRemoveAndEscalate(
 ): Promise<RemoveEscalateOutcome> {
   const now = deps.now ?? Date.now;
   const thingId = input.thingId;
+  // Trim once up front: validation and the punish payload must agree, so a
+  // whitespace-padded form field never reaches punish untrimmed.
+  const authorName = input.authorName.trim();
+  const modUser = input.modUser.trim();
   try {
     // -- Validation ---------------------------------------------------------
     if (!ruleByNumber(input.rule)) {
@@ -488,10 +493,10 @@ export async function runRemoveAndEscalate(
         thingId
       );
     }
-    if (!input.authorName.trim()) {
+    if (!authorName) {
       return removeEscalateAudit({ status: 'invalid', detail: 'empty author name' }, thingId);
     }
-    if (!input.modUser.trim()) {
+    if (!modUser) {
       return removeEscalateAudit({ status: 'invalid', detail: 'empty mod user' }, thingId);
     }
     if (!input.subredditName.trim()) {
@@ -519,12 +524,12 @@ export async function runRemoveAndEscalate(
     // -- Escalation: failures keep the claim (the thing is already removed) --
     try {
       const punishResult = await deps.punish({
-        targetUser: input.authorName,
+        targetUser: authorName,
         targetThingId: thingId,
         subredditName: input.subredditName,
         rule: input.rule,
         reason: input.reason,
-        modUser: input.modUser,
+        modUser,
       });
       return removeEscalateAudit({ status: 'actioned', punishResult }, thingId);
     } catch (error) {

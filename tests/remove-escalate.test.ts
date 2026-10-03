@@ -5,6 +5,7 @@ import {
   buildRemoveEscalateFailureToast,
   buildRemoveEscalateSuccessToast,
   runRemoveAndEscalate,
+  runRemoveAndEscalateSafely,
   type AutoRedisSetOptions,
   type RemoveEscalateDeps,
   type RemoveEscalateInput,
@@ -76,6 +77,17 @@ class FakeRedis implements RedisStringLike {
     this.values.set(key, value);
     if (options?.expiration) this.expirations.set(key, options.expiration);
     return 'OK';
+  }
+}
+
+class RejectingSetRedis extends FakeRedis {
+  override async set(
+    key: string,
+    value: string,
+    options?: AutoRedisSetOptions
+  ): Promise<string | undefined> {
+    this.calls.push({ operation: 'set', key, value, options });
+    throw new Error('redis unavailable');
   }
 }
 
@@ -264,5 +276,51 @@ describe('runRemoveAndEscalate', () => {
     expect(current.removed).toEqual([]);
     expect(current.punished).toEqual([]);
     expect(current.redis.calls).toEqual([]);
+  });
+
+  it('returns failed — and never throws — when the seen claim SET rejects', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const current = state({}, new RejectingSetRedis());
+
+      await expect(runRemoveAndEscalate(input(), current.deps)).resolves.toEqual({
+        status: 'failed',
+        detail: 'redis unavailable',
+      });
+      expect(current.redis.calls.map((call) => call.operation)).toEqual(['set']);
+      expect(current.removed).toEqual([]);
+      expect(current.punished).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe('runRemoveAndEscalateSafely', () => {
+  it('pins trigger-failed when deps explode before the orchestrator try block', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const current = state();
+      // A hostile getter makes the `deps.now` access itself throw — outside
+      // runRemoveAndEscalate's own try — exactly the boundary the safe
+      // wrapper exists to cover.
+      const hostileDeps: RemoveEscalateDeps = {
+        redis: current.redis,
+        removeThing: current.deps.removeThing,
+        punish: current.deps.punish,
+        get now(): () => number {
+          throw new Error('clock exploded');
+        },
+      };
+
+      await expect(runRemoveAndEscalateSafely(input(), hostileDeps)).resolves.toEqual({
+        status: 'trigger-failed',
+        detail: 'clock exploded',
+      });
+      expect(current.removed).toEqual([]);
+      expect(current.punished).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
