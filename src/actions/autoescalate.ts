@@ -3,7 +3,9 @@
 import {
   actionForRule,
   detectContentViolations,
+  isWhitelistedHost,
   normalizeUrlForDuplication,
+  parseSubmissionUrl,
   type SubmissionInput,
   type Violation,
 } from '../lib/detection.js';
@@ -82,12 +84,6 @@ export type ModRemovalOutcome =
 export type ModRemovalSafeOutcome =
   | ModRemovalOutcome
   | { readonly status: 'trigger-failed'; readonly detail: string };
-
-/** Backwards-compatible exported names for the action outcome contracts. */
-export type AutoEscalateActionedOutcome = ModRemovalActionedOutcome;
-export type AutoEscalateUnescalatedOutcome = ModRemovalUnescalatedOutcome;
-export type AutoEscalateOutcome = ModRemovalOutcome;
-export type AutoEscalateSafeOutcome = ModRemovalSafeOutcome;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SEEN_TTL_DAYS = 7;
@@ -243,12 +239,17 @@ export async function runModRemoval(
     }
 
     const violations = detectContentViolations(input);
+    const parsedUrl = input.isTextPost ? undefined : parseSubmissionUrl(input.url);
     const normalizedUrl = input.isTextPost ? '' : normalizeUrlForDuplication(input.url);
+    const eligibleForDuplicateLookup = Boolean(
+      parsedUrl?.ok && isWhitelistedHost(parsedUrl.host) && normalizedUrl
+    );
 
-    // A deterministic content violation never reserves a URL. The moderator
-    // action is intentionally low-concurrency, so duplicate detection uses a
-    // straightforward GET followed by SET rather than a race-prone claim read.
-    if (violations.length === 0 && normalizedUrl) {
+    // Duplicate detection must run even when another content violation exists:
+    // R6 is a real candidate in the R5 > R6 > R4 > R12 priority order. The
+    // URL claim remains deliberately limited to otherwise-clean posts, so a
+    // violating post can never poison the duplicate cache.
+    if (eligibleForDuplicateLookup) {
       const duplicateKey = `autoescalate:url:${normalizedUrl}`;
       const earlierPost = await deps.redis.get(duplicateKey);
       if (earlierPost !== undefined && earlierPost !== input.postId) {
@@ -257,7 +258,7 @@ export async function runModRemoval(
           reason: 'duplicate of an earlier submission of this URL',
           action: actionForRule(6),
         });
-      } else if (earlierPost === undefined) {
+      } else if (violations.length === 0 && earlierPost === undefined) {
         await deps.redis.set(duplicateKey, input.postId, {
           expiration: new Date(now() + URL_TTL_DAYS * DAY_MS),
         });

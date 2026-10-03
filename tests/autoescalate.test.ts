@@ -154,6 +154,44 @@ describe('runModRemoval', () => {
     expect(current.escalated).toEqual([]);
   });
 
+  it('lets an R6 duplicate outrank R4 without configuring escalation', async () => {
+    const getEscalate = vi.fn(async () => {
+      throw new Error('R6 must not configure escalation');
+    });
+    const current = state({ escalate: undefined, getEscalate });
+    const urlKey = 'autoescalate:url:https://clips.twitch.tv/ClipOne';
+    current.redis.values.set(urlKey, 'earlier-post');
+
+    const outcome = await runModRemoval(
+      input({ postId: 'duplicate-emote-title', title: '😂 !!!' }),
+      current.deps
+    );
+
+    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 6 } });
+    expect(current.removed).toEqual(['t3_duplicate-emote-title']);
+    expect(current.escalated).toEqual([]);
+    expect(getEscalate).not.toHaveBeenCalled();
+    expect(current.redis.calls.filter((call) => call.key === urlKey).map((call) => call.operation))
+      .toEqual(['get']);
+  });
+
+  it('lets R5 win for an eligible unclaimed URL without claiming it', async () => {
+    const current = state();
+    const url = 'https://streamable.com/clip';
+    const urlKey = `autoescalate:url:${url}`;
+
+    const outcome = await runModRemoval(
+      input({ postId: 'r5-post', url }),
+      current.deps
+    );
+
+    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 5 } });
+    expect(current.removed).toEqual(['t3_r5-post']);
+    expect(current.redis.values.has(urlKey)).toBe(false);
+    expect(current.redis.calls.filter((call) => call.key === urlKey).map((call) => call.operation))
+      .toEqual(['get']);
+  });
+
   it('escalates an R4 violation with the acting moderator in the payload', async () => {
     const current = state();
 
@@ -208,7 +246,11 @@ describe('runModRemoval', () => {
 
     expect([...current.redis.values.keys()].filter((key) => key.startsWith('autoescalate:url:')))
       .toEqual([]);
-    expect(current.redis.calls.some((call) => call.key.startsWith('autoescalate:url:'))).toBe(false);
+    expect(
+      current.redis.calls
+        .filter((call) => call.key.startsWith('autoescalate:url:'))
+        .map((call) => call.operation)
+    ).toEqual(['get']);
   });
 
   it('is idempotent for the same post', async () => {
