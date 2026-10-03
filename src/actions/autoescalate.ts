@@ -10,6 +10,9 @@ import {
   type Violation,
 } from '../lib/detection.js';
 import type { RedisSetOptions, RedisStringLike } from '../lib/history.js';
+import { ruleByNumber, type Rule } from '../lib/rules.js';
+import { ruleLabel } from './escalate.js';
+import type { PunishInput, PunishResult } from './punish.js';
 
 // The removal flow shares the exact structural Redis client used by the
 // punish lock (string commands); the history store consumes the sorted-set
@@ -370,4 +373,213 @@ export function buildRemovalFailureToast(
   return outcome.status === 'escalate-failed'
     ? `Escalation failed after removal: ${outcome.detail}. Use the manual Escalate option.`
     : `Remove post failed: ${outcome.detail}`;
+}
+
+// ---------------------------------------------------------------------------
+// Remove & escalate — one combined moderator action (any rule, mod discretion)
+// ---------------------------------------------------------------------------
+
+/** Input for the combined remove-and-escalate moderator action. */
+export interface RemoveEscalateInput {
+  /** Thing id including prefix: `t3_...` for posts, `t1_...` for comments. */
+  readonly thingId: string;
+  /** Username of the target author, without the leading `u/`. */
+  readonly authorName: string;
+  /** The resolved target's subreddit; punish refuses bans without one. */
+  readonly subredditName: string;
+  /** The rule the acting moderator selected — any of the 12, by discretion. */
+  readonly rule: number;
+  readonly reason: string;
+  /** Username of the pressing moderator. */
+  readonly modUser: string;
+}
+
+/** Structural dependencies of the combined action, supplied by main or tests. */
+export interface RemoveEscalateDeps {
+  readonly redis: RedisStringLike;
+  /** Removes one post or comment; reddit.remove accepts t1_ and t3_ ids. */
+  readonly removeThing: (thingId: string) => Promise<void>;
+  /** The in-app punishment function, wired exactly like the Escalate path. */
+  readonly punish: (input: PunishInput) => Promise<PunishResult>;
+  readonly now?: () => number;
+}
+
+/** Result when the removal and the ladder escalation both succeeded. */
+export interface RemoveEscalateActionedOutcome {
+  readonly status: 'actioned';
+  readonly punishResult: PunishResult;
+}
+
+/** Every terminal result returned by the combined action. */
+export type RemoveEscalateOutcome =
+  | { readonly status: 'invalid'; readonly detail: string }
+  | { readonly status: 'already-processed' }
+  | { readonly status: 'remove-failed'; readonly detail: string }
+  | { readonly status: 'escalate-failed'; readonly detail: string }
+  | { readonly status: 'failed'; readonly detail: string }
+  | RemoveEscalateActionedOutcome;
+
+/** A framework callback failure kept separate from an action outcome. */
+export type RemoveEscalateSafeOutcome =
+  | RemoveEscalateOutcome
+  | { readonly status: 'trigger-failed'; readonly detail: string };
+
+/** Failure-shaped outcomes consumed by the failure toast builder. */
+export type RemoveEscalateFailureOutcome = Exclude<
+  RemoveEscalateSafeOutcome,
+  RemoveEscalateActionedOutcome | { readonly status: 'already-processed' }
+>;
+
+const REMOVE_ESCALATE_TTL_DAYS = 7;
+
+function removeEscalateSeenKey(thingId: string): string {
+  return `removeescalate:seen:${thingId}`;
+}
+
+function removeEscalateAudit<T extends RemoveEscalateOutcome>(
+  outcome: T,
+  thingId: string
+): T {
+  const detail = 'detail' in outcome ? `: ${outcome.detail}` : '';
+  const label = outcome.status === 'actioned' ? ` (${outcome.punishResult.label})` : '';
+  console.log(`[remove-escalate] ${outcome.status} ${thingId}${label}${detail}`);
+  return outcome;
+}
+
+async function releaseRemoveEscalateClaim(
+  redis: RedisStringLike,
+  thingId: string
+): Promise<void> {
+  try {
+    await redis.del(removeEscalateSeenKey(thingId));
+    console.log(`[remove-escalate] released seen claim ${thingId}`);
+  } catch (error) {
+    console.error(
+      `[remove-escalate] failed to release seen claim ${thingId}: ${detailOf(error)}`
+    );
+  }
+}
+
+/**
+ * Remove one post or comment and escalate its author through the ladder in a
+ * single press, for ANY of the 12 rules — explicit moderator discretion, no
+ * policy-class filtering. Ordering is remove-first: no punishment is applied
+ * unless the removal succeeded, so a removal failure releases the seen claim
+ * (the action can be retried), while an escalation failure keeps it — the
+ * thing is already gone and the plain Escalate menu is the ladder fallback.
+ */
+export async function runRemoveAndEscalate(
+  input: RemoveEscalateInput,
+  deps: RemoveEscalateDeps
+): Promise<RemoveEscalateOutcome> {
+  const now = deps.now ?? Date.now;
+  const thingId = input.thingId;
+  try {
+    // -- Validation ---------------------------------------------------------
+    if (!ruleByNumber(input.rule)) {
+      return removeEscalateAudit(
+        { status: 'invalid', detail: `unknown rule: ${input.rule}` },
+        thingId
+      );
+    }
+    if (!/^t[13]_/.test(thingId)) {
+      return removeEscalateAudit(
+        { status: 'invalid', detail: 'thing id must be t3_/t1_ prefixed' },
+        thingId
+      );
+    }
+    if (!input.authorName.trim()) {
+      return removeEscalateAudit({ status: 'invalid', detail: 'empty author name' }, thingId);
+    }
+    if (!input.modUser.trim()) {
+      return removeEscalateAudit({ status: 'invalid', detail: 'empty mod user' }, thingId);
+    }
+    if (!input.subredditName.trim()) {
+      return removeEscalateAudit({ status: 'invalid', detail: 'empty subreddit name' }, thingId);
+    }
+
+    // -- Idempotency: one claim per thing, kept unless removal failed --------
+    const key = removeEscalateSeenKey(thingId);
+    const claim = await deps.redis.set(key, '1', {
+      nx: true,
+      expiration: new Date(now() + REMOVE_ESCALATE_TTL_DAYS * DAY_MS),
+    });
+    if (!claim) return removeEscalateAudit({ status: 'already-processed' }, thingId);
+
+    // -- Removal first: no punishment without a successful removal -----------
+    try {
+      await deps.removeThing(thingId);
+    } catch (error) {
+      const detail = detailOf(error);
+      await releaseRemoveEscalateClaim(deps.redis, thingId);
+      console.error(`[remove-escalate] removal failed ${thingId}: ${detail}`);
+      return removeEscalateAudit({ status: 'remove-failed', detail }, thingId);
+    }
+
+    // -- Escalation: failures keep the claim (the thing is already removed) --
+    try {
+      const punishResult = await deps.punish({
+        targetUser: input.authorName,
+        targetThingId: thingId,
+        subredditName: input.subredditName,
+        rule: input.rule,
+        reason: input.reason,
+        modUser: input.modUser,
+      });
+      return removeEscalateAudit({ status: 'actioned', punishResult }, thingId);
+    } catch (error) {
+      const detail = detailOf(error);
+      console.error(
+        `[remove-escalate] escalation failed ${thingId}: ${detail}; ` +
+          'thing removed; use the plain Escalate menu'
+      );
+      return removeEscalateAudit({ status: 'escalate-failed', detail }, thingId);
+    }
+  } catch (error) {
+    const detail = detailOf(error);
+    console.error(`[remove-escalate] processing failed ${thingId}: ${detail}`);
+    return removeEscalateAudit({ status: 'failed', detail }, thingId);
+  }
+}
+
+/** Never-throw boundary for the combined moderator menu action. */
+export async function runRemoveAndEscalateSafely(
+  input: RemoveEscalateInput,
+  deps: RemoveEscalateDeps
+): Promise<RemoveEscalateSafeOutcome> {
+  try {
+    return await runRemoveAndEscalate(input, deps);
+  } catch (error) {
+    const detail = detailOf(error);
+    console.error(`[remove-escalate] action failed: ${detail}`);
+    return { status: 'trigger-failed', detail };
+  }
+}
+
+/** Pure success text used by the Devvit menu and unit tests. */
+export function buildRemoveEscalateSuccessToast(params: {
+  result: PunishResult;
+  /** Username of the target user, without the leading `u/`. */
+  targetUser: string;
+  /** The rule the acting mod selected in the form. */
+  rule: Rule;
+}): string {
+  const { result, targetUser, rule } = params;
+  const summary =
+    result.action === 'warn'
+      ? `Removed & warned u/${targetUser} (${ruleLabel(rule)})`
+      : `Removed & banned u/${targetUser} — ${result.label}`;
+  return result.recorded ? summary : `${summary} (not recorded)`;
+}
+
+/** Pure already-processed text used by the Devvit menu and unit tests. */
+export function buildRemoveEscalateAlreadyProcessedToast(): string {
+  return 'Already processed by this action.';
+}
+
+/** Pure failure text used by the Devvit menu and unit tests. */
+export function buildRemoveEscalateFailureToast(outcome: RemoveEscalateFailureOutcome): string {
+  return outcome.status === 'escalate-failed'
+    ? `Removed, but escalation failed: ${outcome.detail}. Use the Escalate menu to warn or ban the author.`
+    : `Remove & escalate failed: ${outcome.detail}`;
 }
