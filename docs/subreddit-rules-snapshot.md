@@ -3,7 +3,7 @@
 Verbatim snapshot of the subreddit wiki
 (<https://www.reddit.com/r/RPClipsGTA/wiki/subreddit/rules/>, revision
 `0ad077b6-db76-11ef-b638-d631ccee00dc`, reason "remove ref to x and twitter",
-2025-01-25). This is the source of truth the auto-escalation detectors in
+2025-01-25). This is the source of truth the deterministic detectors in
 `src/lib/detection.ts` are derived from — keep this file in sync when the wiki
 changes.
 
@@ -91,10 +91,11 @@ changes.
 - New accounts that break rules may be permanently banned at mod discretion.
 - Mod discretion is the final word on all actions.
 
-## Automation mapping (what this Devvit app auto-detects)
+## Automation mapping (what the Mod remove action auto-detects)
 
-Only deterministic, high-precision checks are automated; everything else
-stays on the manual **Escalate** menu path:
+Only deterministic, high-precision checks are run automatically after a
+moderator presses **Remove post**; everything else stays on the manual rule
+form or the **Escalate** menu path:
 
 | Rule | Automatable? | Approach |
 | ---- | ------------ | -------- |
@@ -112,8 +113,13 @@ The implementation uses exact HTTP(S) domains (ignoring one leading `www.`),
 with the documented legacy Twitch `/{channel}/clip/{slug}` exception. Rule 12
 scans the title and decoded URL path segments only. Streamable uses a
 letter-containing bracket tag at the start of the title as a convention proxy;
-actual POV-streamer verification remains manual. Removal is not gated by
-service configuration: missing service settings produce an unescalated removal
-with the manual Escalate menu as fallback. A seen claim is released before or
-during failed removal, but retained after removal; URL duplicate claims are
-made only by otherwise-clean posts.
+actual POV-streamer verification remains manual. Moderation is now
+moderator-initiated through the **Remove post** menu action; there is no
+`PostSubmit` trigger and no enable/disable setting. Detection chooses among
+R5 > R6 > R4 > R12, and the locked action policy is remove + escalate for
+R1, R2, R3, R4, R7, R8, and R9, versus remove-only for R5, R6, R10, R11, and
+R12. Escalations carry the pressing moderator's username in `mod_user`.
+Missing service settings produce an unescalated removal with the manual
+Escalate menu as fallback. A seen claim is released before or during failed
+removal, but retained after removal; URL duplicate claims are made only by
+otherwise-clean posts and use GET-then-SET in the low-concurrency mod path.

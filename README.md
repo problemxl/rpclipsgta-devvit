@@ -2,7 +2,9 @@
 
 A moderator-actions Devvit app for r/RPClipsGTA. It provides:
 
-- **Escalate** on posts/comments, a thin trigger in front of the Python
+- **Remove post** on posts, a moderator-initiated detector/removal action
+  governed by the rule action policy.
+- **Escalate** on posts/comments, a thin action adapter in front of the Python
   escalation service.
 - **Create clip fixture** on a source post, an explicit moderator-only action
   that creates an ordinary link post in the development or QA subreddit.
@@ -143,14 +145,16 @@ Errors are shown in a toast for an unauthorized source/moderator,
 missing/non-clip URLs, invalid target selection, duplicate requests, or Reddit
 submission failures. The source and target receive no comments.
 
-## Auto-escalation
+## Mod remove action
 
-When the `auto-escalate-enabled` installation setting is enabled, the app
-listens for `PostSubmit` events only in `r/rpclipsgta` (case-insensitive).
-Installations on development or QA subreddits are guarded and never
-auto-act. The setting is off by default.
+There is no autonomous moderation trigger and no auto-escalation toggle. A
+moderator presses **Remove post** from a post menu. The action resolves the
+real post fields, performs deterministic checks, removes the post, and
+escalates only when the policy class says to do so. If detection is clean, a
+form offers all 12 rules and an optional free-text reason; the form path uses
+the same policy but never claims a duplicate URL.
 
-The trigger applies only high-confidence, deterministic checks:
+The Remove post action applies only high-confidence, deterministic checks:
 
 - Rule 5: HTTP(S) links must use one of the eight exact allowlisted domains
   (one leading `www.` is ignored), Twitch/Kick VOD URLs are rejected, and
@@ -165,32 +169,46 @@ The trigger applies only high-confidence, deterministic checks:
 - Rule 12: a banned streamer name in the title or decoded URL path segments
   (query strings, hosts, and userinfo are not scanned).
 
-Everything else remains on the manual **Escalate** path; the app does not try
-to automate judgment-heavy rules such as toxicity, harassment, context,
-self-promotion, GTA RP relevance, or flairs. At most one violation is returned
-per rule, and one violation is selected in the priority order R5 > R6 > R4 >
-R12. Every selected violation is removed. R5, R6, and R4 removals are sent to
-the escalation service with `mod_user: "devvit-auto"`; R12 is deliberately
-**remove-only** and never warns or bans the author, per the wiki.
+### Policy classes
 
-Automatic processing is idempotent and installation-scoped in Redis:
+| Rules | Class |
+| --- | --- |
+| R1, R2, R3, R4, R7, R8, R9 | remove + escalate |
+| R5, R6, R10, R11, R12 | remove only |
 
-- `autoescalate:seen:{postId}` — 7-day claim, so a PostSubmit retry cannot
-  action the same post twice. If moderation fails before or during removal,
-  this claim is deleted so a replay can retry; after successful removal it is
-  kept, including when escalation fails.
-- `autoescalate:url:{normalizedUrl}` — 14-day first-seen URL claim used for
-  duplicate detection. It is claimed only by a clean, otherwise eligible post,
-  never by an R4/R5/R12-violating post.
+The automatic checks remain deliberately high-confidence. R5 validates the
+exact HTTP(S) domain allowlist, VOD/path rules, and Streamable title
+convention; R4 checks Twitch channel links, short text posts, and emote-only
+titles; R6 finds a normalized duplicate URL; and R12 checks banned streamer
+names in titles and decoded URL path segments. Detection priority is R5 > R6
+> R4 > R12. R12 is remove-only per the wiki. The form allows manual judgment
+for every rule, including R10/R11; its selected class controls service use.
 
-Detection and removal do not depend on service settings. If the service is
-missing, a punish-class post is still removed and logged as
-`actioned-unescalated`; a moderator can use the manual **Escalate** menu.
-Removal and escalation failures are logged with an `[auto-escalate]` audit
-prefix; a removal failure never calls the service. `AUTO_MOD_USER` is the
-fixed service actor name `devvit-auto`.
+Escalation payloads use the pressing moderator's actual `mod_user`, never a
+synthetic automation username. Automatic reasons use the `Auto:` prefix;
+manual reasons are forwarded verbatim, with `Rule N removal` as the default
+when blank. Missing service settings still remove the post and return
+`actioned-unescalated`; a rejected service call returns `escalate-failed` and
+logs the manual **Escalate** fallback. Removal failures release the seen claim
+so the action can be retried.
+
+Redis state is installation-scoped and idempotent:
+
+- `autoescalate:seen:{postId}` — 7-day claim, acquired before author/content
+  checks. It is kept after successful removal or a clean pass and released
+  after removal/pre-removal failure. The clean pass's claim is consumed by the
+  immediately presented rule form if the moderator chooses a manual rule.
+- `autoescalate:url:{normalizedUrl}` — 14-day claim. A clean first post gets
+  the claim using GET-then-SET; a later post with the same normalized URL gets
+  R6. A content-violating post never touches this cache.
 
 ## What the app does on each press
+
+### Remove post
+
+1. Resolves the post from the menu context and runs the deterministic R4/R5/R6/R12 checks.
+2. Removes the post and escalates only for rules in the remove + escalate class, using the pressing moderator as `mod_user`.
+3. If detection is clean, opens the all-rules form. The submit handler resolves the post again and applies the selected rule with the optional reason.
 
 ### Escalate
 
@@ -252,7 +270,7 @@ The fixture action does not need another secret or service endpoint. Its
 subreddit allowlist is compiled into `src/actions/fixture.ts`; changing either
 target requires a code change and a new upload. The app must retain the
 `redditAPI` and `redis` permissions: Reddit is used to resolve/submit posts,
-and global Redis provides the duplicate claim.
+and Redis provides the idempotency and duplicate URL claims.
 
 ## Publish checklist
 
@@ -296,7 +314,7 @@ npm test        # vitest run — unit tests (no network, no Devvit runtime)
 - `src/lib/service.ts` — typed client for `POST /devvit/escalate` (injectable fetch).
 - `src/actions/escalate.ts` — pure helpers: target resolution + toast text builders.
 - `src/actions/fixture.ts` — fixture targets, URL/title validation, and dedupe orchestration.
-- `src/actions/autoescalate.ts` — framework-free idempotent moderation and escalation orchestration.
+- `src/actions/autoescalate.ts` — framework-free idempotent moderator Remove post orchestration.
 - `src/lib/detection.ts` — pure rule 4/5/12 detectors and duplicate URL normalization.
 - `src/lib/rules.ts` — the canonical 12 subreddit rules.
 - `src/main.ts` — deliberately thin Devvit wiring (menus, forms, settings, Reddit API, toast).
