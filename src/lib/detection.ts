@@ -24,6 +24,17 @@ export interface SubmissionInput {
 /** The automatic action associated with a detected violation. */
 export type AutoAction = 'remove' | 'remove-and-escalate';
 
+/** Rules the owner approved for moderator-initiated removal escalation. */
+export const ESCALATE_RULES: readonly number[] = [1, 2, 3, 4, 7, 8, 9];
+
+/**
+ * Classify a rule according to the owner's policy decision: only rules 1, 2,
+ * 3, 4, 7, 8, and 9 escalate; rules 5, 6, 10, 11, and 12 remove only.
+ */
+export function actionForRule(rule: number): AutoAction {
+  return ESCALATE_RULES.includes(rule) ? 'remove-and-escalate' : 'remove';
+}
+
 /** A single deterministic subreddit-rule violation. */
 export interface Violation {
   readonly rule: number;
@@ -169,12 +180,8 @@ function matchesBannedStreamer(title: string, url: string, isTextPost: boolean):
   return BANNED_STREAMERS.some((streamer) => containsBannedStreamer(scannedText, streamer));
 }
 
-function makeViolation(
-  rule: number,
-  reason: string,
-  action: AutoAction
-): Violation {
-  return { rule, reason, action };
+function makeViolation(rule: number, reason: string): Violation {
+  return { rule, reason, action: actionForRule(rule) };
 }
 
 /**
@@ -208,7 +215,7 @@ export function detectContentViolations(submission: SubmissionInput): Violation[
     ) {
       reason = 'streamable title must start with a bracket tag containing letters';
     }
-    if (reason) violations.push(makeViolation(5, reason, 'remove-and-escalate'));
+    if (reason) violations.push(makeViolation(5, reason));
   }
 
   // Rule 4: only the highest-precedence deterministic reason is returned.
@@ -217,18 +224,18 @@ export function detectContentViolations(submission: SubmissionInput): Violation[
     isTwitchChannelLink(parsedUrl.host, parsedUrl.path)
   ) {
     violations.push(
-      makeViolation(4, 'link is a twitch channel, not a clip', 'remove-and-escalate')
+      makeViolation(4, 'link is a twitch channel, not a clip')
     );
   } else if (submission.isTextPost && !hasAtLeastTwoSentences(submission.body)) {
-    violations.push(makeViolation(4, 'text post under two sentences', 'remove-and-escalate'));
+    violations.push(makeViolation(4, 'text post under two sentences'));
   } else if (!containsLetters(submission.title)) {
-    violations.push(makeViolation(4, 'emote-only title', 'remove-and-escalate'));
+    violations.push(makeViolation(4, 'emote-only title'));
   }
 
   // Rule 12 scans only the title and decoded URL path segments.
   if (matchesBannedStreamer(submission.title, submission.url, submission.isTextPost)) {
     violations.push(
-      makeViolation(12, 'submission mentions a banned streamer', 'remove')
+      makeViolation(12, 'submission mentions a banned streamer')
     );
   }
 
