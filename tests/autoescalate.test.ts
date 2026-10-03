@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   runAutoEscalation,
+  runAutoEscalationSafely,
   type AutoEscalateInput,
   type AutoRedisSetOptions,
   type RedisLike,
@@ -37,6 +38,10 @@ class FakeRedis implements RedisLike {
 
   async get(key: string): Promise<string | undefined> {
     return this.values.get(key);
+  }
+
+  async del(key: string): Promise<void> {
+    this.values.delete(key);
   }
 
   async set(
@@ -75,6 +80,18 @@ function deps(redis = new FakeRedis(), overrides: Partial<Parameters<typeof runA
 }
 
 describe('runAutoEscalation', () => {
+  it('safe wrapper converts a rejecting settings getter into trigger-failed', async () => {
+    const state = deps(undefined, {
+      escalate: undefined,
+      getEscalate: async () => {
+        throw new Error('settings unavailable');
+      },
+    });
+    await expect(
+      runAutoEscalationSafely(input({ url: 'https://bad.example/clip' }), state.deps)
+    ).resolves.toEqual({ status: 'trigger-failed', detail: 'settings unavailable' });
+    expect(state.removed).toEqual(['t3_abc123']);
+  });
   it('leaves a clean whitelisted link alone and claims its URL for 14 days', async () => {
     const state = deps();
     const outcome = await runAutoEscalation(input(), state.deps);
@@ -148,6 +165,48 @@ describe('runAutoEscalation', () => {
     expect(state.escalated).toEqual([]);
   });
 
+  it('removes R12 with no service configured', async () => {
+    const state = deps(undefined, { escalate: undefined });
+    const outcome = await runAutoEscalation(input({ title: 'Koil clip' }), state.deps);
+    expect(outcome).toMatchObject({ status: 'actioned', violation: { rule: 12 } });
+    expect(state.removed).toEqual(['t3_abc123']);
+  });
+
+  it('removes punish-class violations without service configuration', async () => {
+    const state = deps(undefined, { escalate: undefined });
+    const outcome = await runAutoEscalation(
+      input({ url: 'https://bad.example/clip' }),
+      state.deps
+    );
+    expect(outcome).toMatchObject({
+      status: 'actioned-unescalated',
+      reason: 'service-not-configured',
+    });
+    expect(state.removed).toEqual(['t3_abc123']);
+    expect(state.escalated).toEqual([]);
+  });
+
+  it('does not claim URLs for removed content, so a later clean post stays clean', async () => {
+    const state = deps();
+    const removed = await runAutoEscalation(input({ title: 'Koil clip' }), state.deps);
+    const clean = await runAutoEscalation(
+      input({ postId: 'clean', title: 'A good clip' }),
+      state.deps
+    );
+    expect(removed).toMatchObject({ status: 'actioned' });
+    expect(clean).toEqual({ status: 'clean' });
+  });
+
+  it('does not claim VOD URLs for a later clean post', async () => {
+    const state = deps();
+    await runAutoEscalation(input({ url: 'https://twitch.tv/channel/videos/123' }), state.deps);
+    const clean = await runAutoEscalation(
+      input({ postId: 'clean', url: 'https://twitch.tv/x/clip/y' }),
+      state.deps
+    );
+    expect(clean).toEqual({ status: 'clean' });
+  });
+
   it('chooses rule 5 over a duplicate rule 6 violation', async () => {
     const state = deps();
     await runAutoEscalation(
@@ -175,7 +234,7 @@ describe('runAutoEscalation', () => {
     expect(state.removed).toEqual(['t3_abc123']);
   });
 
-  it('does not escalate when removal fails and prefixes bare post IDs with t3_', async () => {
+  it('does not escalate when removal fails and releases the seen claim', async () => {
     const state = deps(undefined, {
       removePost: async () => {
         throw new Error('permission denied');
@@ -185,5 +244,16 @@ describe('runAutoEscalation', () => {
       runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps)
     ).resolves.toEqual({ status: 'remove-failed', detail: 'permission denied' });
     expect(state.escalated).toEqual([]);
+    expect(state.redis.values.has('autoescalate:seen:abc123')).toBe(false);
+  });
+
+  it('keeps the seen claim when escalation fails after removal', async () => {
+    const state = deps(undefined, {
+      escalate: async () => {
+        throw new Error('service unavailable');
+      },
+    });
+    await runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps);
+    expect(state.redis.values.has('autoescalate:seen:abc123')).toBe(true);
   });
 });
