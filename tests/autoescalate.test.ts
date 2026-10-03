@@ -27,6 +27,7 @@ function input(overrides: Partial<ModRemovalInput> = {}): ModRemovalInput {
     postId: 'abc123',
     authorName: 'poster',
     modUser: 'acting-mod',
+    subredditName: 'RPClipsGTA',
     title: 'A good clip',
     url: 'https://clips.twitch.tv/ClipOne',
     body: '',
@@ -188,6 +189,7 @@ describe('runModRemoval', () => {
       {
         target_user: 'poster',
         target_id: 't3_abc123',
+        subreddit_name: 'RPClipsGTA',
         rule: 4,
         reason: 'Auto: emote-only title',
         mod_user: 'moderator42',
@@ -319,6 +321,7 @@ describe('applyManualRuleRemoval', () => {
       {
         target_user: 'target-user',
         target_id: 't3_manual-two',
+        subreddit_name: 'RPClipsGTA',
         rule: 2,
         reason: 'Repeated abusive comments',
         mod_user: 'mod-user',
@@ -353,7 +356,7 @@ describe('applyManualRuleRemoval', () => {
     await expect(runModRemoval(post, current.deps)).resolves.toEqual({ status: 'clean' });
     await expect(
       applyManualRuleRemoval(
-        { postId: post.postId, authorName: post.authorName, modUser: post.modUser },
+        { postId: post.postId, authorName: post.authorName, modUser: post.modUser, subredditName: 'RPClipsGTA' },
         5,
         'Moderator review found a domain issue',
         current.deps
@@ -367,7 +370,7 @@ describe('applyManualRuleRemoval', () => {
     const redis = new FakeRedis();
     redis.values.set('autoescalate:seen:form-once', 'clean');
     const current = state({}, redis);
-    const post = { postId: 'form-once', authorName: 'poster', modUser: 'mod-user' };
+    const post = { postId: 'form-once', authorName: 'poster', modUser: 'mod-user', subredditName: 'RPClipsGTA' };
 
     await expect(applyManualRuleRemoval(post, 5, 'First action', current.deps)).resolves.toMatchObject({
       status: 'actioned',
@@ -386,7 +389,7 @@ describe('applyManualRuleRemoval', () => {
 
     await expect(
       applyManualRuleRemoval(
-        { postId: 'already-consumed', authorName: 'poster', modUser: 'mod-user' },
+        { postId: 'already-consumed', authorName: 'poster', modUser: 'mod-user', subredditName: 'RPClipsGTA' },
         5,
         'Second action',
         current.deps
@@ -398,7 +401,7 @@ describe('applyManualRuleRemoval', () => {
 
   it('is idempotent after a manual removal', async () => {
     const current = state();
-    const post = { postId: 'manual-once', authorName: 'poster', modUser: 'mod-user' };
+    const post = { postId: 'manual-once', authorName: 'poster', modUser: 'mod-user', subredditName: 'RPClipsGTA' };
 
     await expect(applyManualRuleRemoval(post, 5, 'First action', current.deps)).resolves.toMatchObject({
       status: 'actioned',

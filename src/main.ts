@@ -109,6 +109,8 @@ const escalateForm = Devvit.createForm(
         {
           targetUser: target.authorName,
           targetThingId: target.thingId,
+          // The resolved target's subreddit; never a context fallback that
+          // could diverge from where the comment/ban is applied.
           subredditName: target.subredditName || context.subredditName || '',
           rule: rule.number,
           reason,
@@ -287,6 +289,7 @@ const removePostForm = Devvit.createForm(
           postId: post.id,
           authorName: post.authorName,
           modUser,
+          subredditName: post.subredditName,
         },
         rule,
         typeof event.values.reason === 'string' ? event.values.reason : '',
@@ -331,6 +334,7 @@ Devvit.addMenuItem({
           body: post.body ?? '',
           isTextPost: post.body !== undefined,
           modUser,
+          subredditName: post.subredditName,
         },
         createModRemovalDeps(context)
       );
@@ -392,9 +396,9 @@ function createEscalateFn(context: Devvit.Context): EscalateFn {
     const result: PunishResult = await punish(punishDeps, {
       targetUser: payload.target_user,
       targetThingId: payload.target_id,
-      // Removal targets are posts in this action; the form path resolves the
-      // precise subreddit before calling punish directly.
-      subredditName: context.subredditName ?? '',
+      // The RESOLVED post's subreddit threaded through the removal seam; an
+      // empty name makes punish refuse any ban before banUser is called.
+      subredditName: payload.subreddit_name,
       rule: payload.rule,
       reason: payload.reason,
       modUser: payload.mod_user,

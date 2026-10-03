@@ -164,6 +164,10 @@ export async function punish(
     const rung = pickRung(priorTimestamps, at);
     const effective = effectivePriors(priorTimestamps, at);
 
+    if (rung.action === 'ban' && !input.subredditName.trim()) {
+      throw new Error('cannot apply a ban without a subreddit name');
+    }
+
     const pendingRecord = recordFor(input, at, rung);
     let recorded = false;
     try {

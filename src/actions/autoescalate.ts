@@ -18,6 +18,8 @@ export type { RedisLike, RedisSetOptions as AutoRedisSetOptions };
 export interface EscalatePayload {
   readonly target_user: string;
   readonly target_id: string;
+  /** The resolved target post's subreddit; punish refuses bans without one. */
+  readonly subreddit_name: string;
   readonly rule: number;
   readonly reason: string;
   readonly mod_user: string;
@@ -50,12 +52,14 @@ export interface ModRemovalInput extends SubmissionInput {
   readonly postId: string;
   readonly authorName: string;
   readonly modUser: string;
+  /** The resolved post's subreddit, threaded to punish for ban safety. */
+  readonly subredditName: string;
 }
 
 /** The smaller input needed when a moderator picks a rule in the form. */
 export type ManualRuleRemovalInput = Pick<
   ModRemovalInput,
-  'postId' | 'authorName' | 'modUser'
+  'postId' | 'authorName' | 'modUser' | 'subredditName'
 >;
 
 /** Result when removal and any policy-required escalation succeeded. */
@@ -141,7 +145,12 @@ async function claimSeen(
 }
 
 async function applyViolation(
-  input: { postId: string; authorName: string; modUser: string },
+  input: {
+    postId: string;
+    authorName: string;
+    modUser: string;
+    subredditName: string;
+  },
   violation: Violation,
   reason: string,
   deps: ModRemovalDeps,
@@ -165,6 +174,7 @@ async function applyViolation(
   const payload: EscalatePayload = {
     target_user: input.authorName,
     target_id: thingId,
+    subreddit_name: input.subredditName,
     rule: violation.rule,
     reason,
     mod_user: input.modUser,
