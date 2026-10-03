@@ -80,7 +80,7 @@ changes.
 
 > The six-level ladder, including the **Level 4 — 14 day ban** rung and
 > three-month decay, is enforced by the app in `src/lib/ladder.ts`. Action
-> history is kept in the app's per-user Redis JSON arrays.
+> history is kept in per-user Redis sorted sets, one row per infraction.
 
 ## Policy — AutoModerator / accounts
 
@@ -120,8 +120,10 @@ R12. Escalations carry the pressing moderator's username in `mod_user`.
 Escalation is always available in-app through the Reddit API and Redis; there
 are no service settings or manual service fallback. Implementation notes: the
 policy's "three months" decay interval is represented deterministically as 90
-days, and history is retained for 540 days (five effective levels × 90 days,
-plus a 90-day buffer). A seen claim is released
+days, and action history is retained for the lifetime of the installation by
+design — one sorted-set row per infraction, with no record cap and no TTL —
+because the 90-day decay against the latest action alone governs the ladder
+(the former 540-day retention window is gone). A seen claim is released
 before or during failed removal, but retained after removal; URL duplicate
 claims are made only by otherwise-clean posts and use GET-then-SET in the
 low-concurrency mod path.
