@@ -22,7 +22,7 @@ rules, and optionally supplies a reason. The app resolves the target and then:
 1. Acquires `punish:lock:{lowercased username}` in Redis with NX and a ~30s
    TTL, so overlapping actions for one user serialize; a second concurrent
    action fails fast with an "already in progress" error.
-2. Reads an O(1)-ish summary of `modactions:user:{lowercased username}`: a
+2. Reads an O(1)-ish summary of `modactions:z:user:{lowercased username}`: a
    Redis sorted set holding one row per infraction — the record JSON, which
    includes a unique id — scored by its epoch-ms timestamp. The summary is the
    `ZCARD` row count plus the newest row's score; the full history is never
@@ -138,7 +138,7 @@ Redis state is installation-scoped and idempotent:
   checks and retained after successful handling.
 - `autoescalate:url:{normalizedUrl}` — 14-day duplicate claim, made only by an
   otherwise-clean post.
-- `modactions:user:{username}` — lifetime in-app action history, one
+- `modactions:z:user:{username}` — lifetime in-app action history, one
   sorted-set row per infraction.
 
 ## Publish checklist

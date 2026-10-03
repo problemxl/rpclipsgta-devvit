@@ -122,8 +122,7 @@ are no service settings or manual service fallback. Implementation notes: the
 policy's "three months" decay interval is represented deterministically as 90
 days, and action history is retained for the lifetime of the installation by
 design — one sorted-set row per infraction, with no record cap and no TTL —
-because the 90-day decay against the latest action alone governs the ladder
-(the former 540-day retention window is gone). A seen claim is released
+because the 90-day decay against the latest action alone governs the ladder. A seen claim is released
 before or during failed removal, but retained after removal; URL duplicate
 claims are made only by otherwise-clean posts and use GET-then-SET in the
 low-concurrency mod path.

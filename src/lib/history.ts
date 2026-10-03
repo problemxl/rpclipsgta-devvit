@@ -26,13 +26,22 @@ export interface AppendOutcome {
   readonly record: ModActionRecord;
 }
 
+/**
+ * Failure policy: every operation degrades instead of throwing (summary ⇒
+ * fresh, load ⇒ [], append ⇒ ok:false, remove ⇒ false) but always logs the
+ * failure first, so a broken Redis is visible rather than silently swallowed.
+ */
 export interface HistoryStore {
   /**
    * Add one row to the sorted set. The id is assigned here, so the returned
    * record is the identity to use for later compensation removals.
    */
   append(username: string, record: Omit<ModActionRecord, 'id'>): Promise<AppendOutcome>;
-  /** O(1)-ish ZCARD plus the newest row's score; rung selection needs no more. */
+  /**
+   * O(1)-ish ZCARD plus the newest row's score, clamped to now + 60s so a
+   * future-dated corrupt member can never freeze decay; rung selection needs
+   * no more.
+   */
   summary(username: string): Promise<HistorySummary>;
   /** All retained records, oldest first. Corrupt members are dropped silently. */
   load(username: string): Promise<ModActionRecord[]>;
@@ -93,8 +102,20 @@ export interface RedisStringLike {
   del(key: string): Promise<unknown>;
 }
 
+/**
+ * The per-user sorted-set key. The `z:` segment versions the layout: the
+ * original implementation stored a JSON array STRING under
+ * `modactions:user:{username}`, and reusing that key with sorted-set commands
+ * would fail with WRONGTYPE. The old key is simply orphaned; no migration is
+ * attempted.
+ */
 export function historyKey(username: string): string {
-  return `modactions:user:${username.toLowerCase()}`;
+  return `modactions:z:user:${username.toLowerCase()}`;
+}
+
+/** Best-effort message extraction for degraded-mode error logging. */
+function failureDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isModActionRecord(value: unknown): value is ModActionRecord {
@@ -119,9 +140,13 @@ function isModActionRecord(value: unknown): value is ModActionRecord {
  * Row ids must be unique even for identical records in the same millisecond:
  * ZADD overwrites an existing member (updating its score), so a shared id
  * would silently collapse two distinct infractions into one row.
+ *
+ * `crypto.randomUUID()` (standard in Node 16.7+ and modern runtimes; a global
+ * here) is used purely for uniqueness, not security — unlike `Math.random()
+ * .toString(36)`, it can never yield an empty suffix (Math.random() === 0).
  */
 function newRecordId(at: number): string {
-  return `${at}-${Math.random().toString(36).slice(2)}`;
+  return `${at}-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
 
 /**
@@ -148,21 +173,34 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           score: stored.at,
         });
         return { ok: added > 0, record: stored };
-      } catch {
+      } catch (error) {
+        // Degradation: the action still proceeds without a history row
+        // (ok:false), but the failed write must show up in the logs.
+        console.error(`[history] append ${historyKey(username)} failed: ${failureDetail(error)}`);
         return { ok: false, record: stored };
       }
     },
 
     async summary(username) {
+      const key = historyKey(username);
       try {
-        const key = historyKey(username);
         // ZCARD counts raw members, corrupt payloads included.
         const total = await redis.zCard(key);
         // Rank -1 is the highest-score member. The score is structural, so no
         // member payload is parsed and corrupt rows cannot break the summary.
         const [latest] = await redis.zRange(key, -1, -1);
-        return { total, latestAt: latest?.score };
-      } catch {
+        // Freeze guard: a corrupt member with a future epoch-ms score would
+        // otherwise pin latestAt in the future indefinitely, keeping the
+        // ladder's quiet time at zero and freezing decay for as long as the
+        // score lies ahead. Clamp to now + 60s — enough allowance for modest
+        // clock skew between the app host and Redis, while guaranteeing decay
+        // resumes accruing almost immediately (src/lib/ladder.ts).
+        const latestAt = latest ? Math.min(latest.score, Date.now() + 60_000) : undefined;
+        return { total, latestAt };
+      } catch (error) {
+        // Degradation: an unreadable summary is treated as a fresh user, but
+        // the failure must show up in the logs.
+        console.error(`[history] summary ${key} failed: ${failureDetail(error)}`);
         return { total: 0, latestAt: undefined };
       }
     },
@@ -182,7 +220,10 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           }
         }
         return records;
-      } catch {
+      } catch (error) {
+        // Degradation: an unreadable history is treated as empty, but the
+        // failure must show up in the logs.
+        console.error(`[history] load ${historyKey(username)} failed: ${failureDetail(error)}`);
         return [];
       }
     },
@@ -207,7 +248,10 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
         // stay visible; a miss remains a documented no-op success.
         console.debug(`[history] remove miss for ${username}: no record with id=${id}`);
         return true;
-      } catch {
+      } catch (error) {
+        // Degradation: the compensation caller treats false as "record may
+        // still exist", but the failure must show up in the logs.
+        console.error(`[history] remove ${historyKey(username)} failed: ${failureDetail(error)}`);
         return false;
       }
     },

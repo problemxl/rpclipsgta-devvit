@@ -1,6 +1,6 @@
 import { effectivePriors, LADDER, pickRung, type LadderRung } from '../lib/ladder.js';
 import { ruleByNumber } from '../lib/rules.js';
-import type { HistoryStore, ModActionRecord, RedisSetOptions, RedisStringLike } from '../lib/history.js';
+import type { HistoryStore, ModActionRecord, RedisStringLike } from '../lib/history.js';
 
 const RULES_WIKI = 'https://www.reddit.com/r/RPClipsGTA/wiki/subreddit/rules/';
 const MODMAIL_APPEAL =

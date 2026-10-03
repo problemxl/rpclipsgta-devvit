@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { effectivePriors } from '../src/lib/ladder.js';
 import {
   createHistoryStore,
   historyKey,
@@ -96,11 +97,11 @@ describe('history store', () => {
     const history = createHistoryStore(redis);
     const appended = await history.append('SomeUser', record(1));
     expect(appended.ok).toBe(true);
-    expect(historyKey('someuser')).toBe('modactions:user:someuser');
+    expect(historyKey('someuser')).toBe('modactions:z:user:someuser');
 
-    const rows = redis.rows('modactions:user:someuser');
+    const rows = redis.rows('modactions:z:user:someuser');
     expect(rows.size).toBe(1);
-    expect(appended.record.id).toMatch(/^1-[a-z0-9]+$/); // `${at}-${random}` shape
+    expect(appended.record.id).toMatch(/^1-[0-9a-f]{12}$/); // `${at}-${uuid hex slice}` shape
     expect(rows.get(JSON.stringify({ ...record(1), id: appended.record.id }))).toBe(1); // score = at
     await expect(history.load('SOMEUSER')).resolves.toEqual([
       { ...record(1), id: appended.record.id },
@@ -128,6 +129,26 @@ describe('history store', () => {
     expect(loaded).toHaveLength(2);
     expect(loaded.every((row) => row.at === 7)).toBe(true);
     expect(new Set(loaded.map((row) => row.id)).size).toBe(2);
+  });
+
+  it('clamps a future-dated score so a corrupt member cannot freeze decay', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    // A score ~10 decay periods ahead would otherwise pin latestAt in the
+    // future, keeping quiet time at zero and freezing decay for years.
+    const farFuture = Date.now() + 10 * 90 * 24 * 60 * 60 * 1000;
+    redis.seed(historyKey('user'), 'corrupt-future-member', farFuture);
+
+    const summary = await history.summary('user');
+    expect(summary.total).toBe(1);
+    // Clamped to now + 60s (60s clock-skew allowance) instead of the corrupt
+    // far-future score.
+    expect(summary.latestAt).toBeLessThanOrEqual(Date.now() + 60_000);
+    expect(summary.latestAt).toBeGreaterThan(Date.now());
+    // With the clamp, decay engages normally: one full 90-day quiet stretch
+    // after the clamped latest action removes the row's whole contribution.
+    const afterNinetyDays = (summary.latestAt ?? 0) + 90 * 24 * 60 * 60 * 1000 + 1;
+    expect(effectivePriors(summary.total, summary.latestAt, afterNinetyDays)).toBe(0);
   });
 
   it('summarizes an empty history as zero rows without a latest action', async () => {
@@ -161,8 +182,18 @@ describe('history store', () => {
     const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
     await expect(history.load('missing')).resolves.toEqual([]);
-    redis.fail = true;
-    await expect(history.load('failure')).resolves.toEqual([]);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      redis.fail = true;
+      await expect(history.load('failure')).resolves.toEqual([]);
+      // The degraded [] is documented, but the redis failure must be logged.
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] load modactions:z:user:failure failed: redis down'
+      );
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it('drops corrupt members on load and keeps the valid ones', async () => {
@@ -204,7 +235,7 @@ describe('history store', () => {
     const history = createHistoryStore(redis);
     const appended = await history.append('user', record(1));
     expect(appended.ok).toBe(false);
-    expect(appended.record.id).toMatch(/^1-[a-z0-9]+$/); // identity returned regardless
+    expect(appended.record.id).toMatch(/^1-[0-9a-f]{12}$/); // identity returned regardless
     expect(await history.load('user')).toEqual([]);
   });
 
@@ -212,9 +243,18 @@ describe('history store', () => {
     const redis = new FakeZSetRedis();
     redis.fail = true;
     const history = createHistoryStore(redis);
-    const appended = await history.append('user', record(1));
-    expect(appended.ok).toBe(false);
-    await expect(history.load('user')).resolves.toEqual([]);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const appended = await history.append('user', record(1));
+      expect(appended.ok).toBe(false);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] append modactions:z:user:user failed: redis down'
+      );
+      await expect(history.load('user')).resolves.toEqual([]);
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it('removes exactly the row with the matching id and nothing else', async () => {
@@ -275,7 +315,32 @@ describe('history store', () => {
     const history = createHistoryStore(redis);
     await history.append('user', record(1));
     redis.fail = true;
-    await expect(history.remove('user', 'any')).resolves.toBe(false);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(history.remove('user', 'any')).resolves.toBe(false);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] remove modactions:z:user:user failed: redis down'
+      );
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('degrades a failing summary to a fresh user and logs the failure', async () => {
+    const redis = new FakeZSetRedis();
+    redis.fail = true;
+    const history = createHistoryStore(redis);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(history.summary('user')).resolves.toEqual({ total: 0, latestAt: undefined });
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] summary modactions:z:user:user failed: redis down'
+      );
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it('keeps the entire lifetime history — no record cap', async () => {
