@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   runAutoEscalation,
@@ -172,17 +172,41 @@ describe('runAutoEscalation', () => {
     expect(state.removed).toEqual(['t3_abc123']);
   });
 
-  it('removes punish-class violations without service configuration', async () => {
-    const state = deps(undefined, { escalate: undefined });
-    const outcome = await runAutoEscalation(
-      input({ url: 'https://bad.example/clip' }),
-      state.deps
-    );
-    expect(outcome).toMatchObject({
-      status: 'actioned-unescalated',
-      reason: 'service-not-configured',
+  it('removes punish-class violations without service configuration and logs the manual fallback', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const state = deps(undefined, { escalate: undefined });
+      const outcome = await runAutoEscalation(
+        input({ url: 'https://bad.example/clip' }),
+        state.deps
+      );
+      expect(outcome).toMatchObject({
+        status: 'actioned-unescalated',
+        reason: 'service-not-configured',
+      });
+      expect(state.removed).toEqual(['t3_abc123']);
+      expect(state.escalated).toEqual([]);
+      expect([...logSpy.mock.calls.flat(), ...errorSpy.mock.calls.flat()].join('\n')).toContain(
+        'manual Escalate'
+      );
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('releases the seen claim when a pre-removal dependency fails', async () => {
+    const state = deps(undefined, {
+      isModerator: async () => {
+        throw new Error('moderator lookup failed');
+      },
     });
-    expect(state.removed).toEqual(['t3_abc123']);
+    await expect(
+      runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps)
+    ).resolves.toEqual({ status: 'failed', detail: 'moderator lookup failed' });
+    expect(state.redis.values.has('autoescalate:seen:abc123')).toBe(false);
+    expect(state.removed).toEqual([]);
     expect(state.escalated).toEqual([]);
   });
 
@@ -222,16 +246,30 @@ describe('runAutoEscalation', () => {
     expect(state.escalated[0]).toMatchObject({ rule: 5 });
   });
 
-  it('converts escalation errors to outcomes after successful removal', async () => {
-    const state = deps(undefined, {
-      escalate: async () => {
-        throw new Error('service unavailable');
-      },
-    });
-    await expect(
-      runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps)
-    ).resolves.toEqual({ status: 'escalate-failed', detail: 'service unavailable' });
-    expect(state.removed).toEqual(['t3_abc123']);
+  it('converts escalation errors to outcomes after successful removal and logs the manual fallback', async () => {
+    let escalateCalls = 0;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const state = deps(undefined, {
+        escalate: async () => {
+          escalateCalls += 1;
+          throw new Error('service unavailable');
+        },
+      });
+      await expect(
+        runAutoEscalation(input({ url: 'https://bad.example/clip' }), state.deps)
+      ).resolves.toEqual({ status: 'escalate-failed', detail: 'service unavailable' });
+      expect(state.removed).toEqual(['t3_abc123']);
+      expect(state.redis.values.has('autoescalate:seen:abc123')).toBe(true);
+      expect(escalateCalls).toBe(1);
+      expect([...logSpy.mock.calls.flat(), ...errorSpy.mock.calls.flat()].join('\n')).toContain(
+        'manual Escalate'
+      );
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
   it('does not escalate when removal fails and releases the seen claim', async () => {

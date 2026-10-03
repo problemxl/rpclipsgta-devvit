@@ -106,6 +106,9 @@ describe('detectContentViolations', () => {
     expect(rules(link({ isTextPost: true, url: '', body: 'Mr. X robbed the bank. It went poorly.' }))).not.toContain(4);
     expect(rules(link({ isTextPost: true, url: '', body: 'Version 2.0 is out' }))).toContain(4);
     expect(rules(link({ isTextPost: true, url: '', body: 'Check https://youtube.com/x now. Nice.' }))).not.toContain(4);
+    expect(rules(link({ isTextPost: true, url: '', body: 'See https://example.com/x. Next sentence.' }))).not.toContain(4);
+    expect(rules(link({ isTextPost: true, url: '', body: 'Check [this clip](https://clips.twitch.tv/x) out. It was wild.' }))).not.toContain(4);
+    expect(rules(link({ isTextPost: true, url: '', body: '[link](https://x.y) only.' }))).toContain(4);
     expect(rules(link({ isTextPost: true, url: '', body: 'line one\nline two' }))).toContain(4);
     expect(rules(link({ isTextPost: true, url: '', body: 'one. .' }))).toContain(4);
     expect(rules(link({ isTextPost: true, url: '', body: 'First! — Second?' }))).not.toContain(4);
@@ -146,8 +149,10 @@ describe('detectContentViolations', () => {
     expect(rules(link({ title: 'KOIL highlights' }))).toContain(12);
     expect(rules(link({ url: 'https://youtube.com/koil_clips/123' }))).toContain(12);
     expect(rules(link({ url: 'https://youtube.com/das%4DEHDI/x' }))).toContain(12);
+    expect(rules(link({ url: 'https://youtube.com/bad%zz/koil/123' }))).toContain(12);
     expect(rules(link({ url: 'https://youtube.com/koilicious/1' }))).not.toContain(12);
     expect(rules(link({ url: 'https://clips.twitch.tv/koil-stream' }))).toContain(12);
+    expect(rules(link({ url: 'https://youtube.com/zombie_barricades/1' }))).toContain(12);
     expect(rules(link({ url: 'https://youtube.com/zombie-barricades/1' }))).toContain(12);
   });
 
