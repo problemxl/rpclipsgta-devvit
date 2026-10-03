@@ -145,7 +145,13 @@ export async function punish(
   if (!rule) throw new Error(`Unknown rule: ${input.rule}`);
 
   const lockKey = punishLockKey(input.targetUser);
-  const lockResult = await deps.redis.set(lockKey, '1', {
+  // Owner token guarding the release: if execution outlives the TTL below and
+  // a second caller acquires the expired lock, this call's release must not
+  // delete the other caller's lock. Only a GET that still returns this exact
+  // token is followed by a DEL.
+  const now = deps.now ?? Date.now;
+  const lockToken = `${input.modUser}:${now()}:${Math.random().toString(36).slice(2)}`;
+  const lockResult = await deps.redis.set(lockKey, lockToken, {
     nx: true,
     expiration: new Date(Date.now() + LOCK_TTL_MS),
   });
@@ -153,10 +159,10 @@ export async function punish(
   if (!acquired) throw new Error('punishment already in progress for this user');
 
   try {
-    const now = deps.now ?? Date.now;
     const at = now();
-    // A history read failure is a failed escalation, not permission to execute
-    // a second action against a user whose current level is unknown.
+    // history.load() intentionally degrades redis read failures to an empty
+    // array: an unreadable history presents as fresh, so this action degrades
+    // to a warning rung rather than failing.
     const priorRecords = await deps.history.load(input.targetUser);
     const priorTimestamps = priorRecords
       .map((record) => record.at)
@@ -223,8 +229,21 @@ export async function punish(
       recorded,
     };
   } finally {
-    // Release only when this call acquired the lock; a failed NX must not
-    // delete another caller's lock.
-    if (acquired) await deps.redis.del(lockKey);
+    // Release only when this call acquired the lock, and only while the key
+    // still holds this call's owner token. The GET→DEL pair is not atomic —
+    // Devvit redis has no compare-and-delete — so a lock expiring exactly
+    // between GET and DEL can still be deleted after a second caller acquires
+    // it; that tiny race is accepted as unavoidable with this API.
+    // A redis failure here must never throw over an already-applied punishment
+    // result or mask the original execution error.
+    if (acquired) {
+      try {
+        const current = await deps.redis.get(lockKey);
+        if (current === lockToken) await deps.redis.del(lockKey);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error(`[punish] failed to release punishment lock ${lockKey}: ${detail}`);
+      }
+    }
   }
 }

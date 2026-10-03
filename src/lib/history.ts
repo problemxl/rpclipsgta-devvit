@@ -104,7 +104,14 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
         const key = historyKey(username);
         const records = parseHistory(await redis.get(key));
         const index = records.findIndex((candidate) => candidate === record || isSameRecord(candidate, record));
-        if (index < 0) return true;
+        if (index < 0) {
+          // Compensation anomalies (record already gone or never persisted)
+          // stay visible; a miss remains a documented no-op success.
+          console.debug(
+            `[history] remove miss for ${username}: no matching record (at=${record.at} rule=${record.rule} target=${record.targetThingId})`
+          );
+          return true;
+        }
         records.splice(index, 1);
         const result = await redis.set(key, JSON.stringify(records.slice(-HISTORY_MAX_RECORDS)), {
           expiration: new Date(Date.now() + HISTORY_TTL_DAYS * 24 * 60 * 60 * 1000),

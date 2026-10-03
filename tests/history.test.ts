@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   createHistoryStore,
@@ -138,5 +138,20 @@ describe('history store', () => {
 
     await expect(history.remove!('user', { ...first })).resolves.toBe(true);
     await expect(history.load('user')).resolves.toEqual([second]);
+  });
+
+  it('logs a debug line on a remove miss while still reporting success', async () => {
+    const redis = new MemoryRedis();
+    const history = createHistoryStore(redis);
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    try {
+      // A miss is a documented no-op success, but it must stay visible so
+      // compensation anomalies can be diagnosed.
+      await expect(history.remove!('user', record(999))).resolves.toBe(true);
+      expect(debug).toHaveBeenCalledTimes(1);
+      expect(String(debug.mock.calls[0]?.[0])).toContain('[history] remove miss for user');
+    } finally {
+      debug.mockRestore();
+    }
   });
 });

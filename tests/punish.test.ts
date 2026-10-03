@@ -237,7 +237,7 @@ describe('punish lock', () => {
     expect(redis.delCalls).toEqual([]); // never releases a lock it did not acquire
   });
 
-  it('acquires a lowercased lock with a ~30s TTL and releases it on success', async () => {
+  it('acquires a lowercased lock with a ~30s TTL, an owner token value, and releases it on success', async () => {
     const redis = new FakeRedis();
     const current = deps({ redis });
 
@@ -245,12 +245,89 @@ describe('punish lock', () => {
 
     const lockCalls = redis.lockCalls();
     expect(lockCalls).toHaveLength(1);
-    expect(lockCalls[0]).toMatchObject({ key: 'punish:lock:target', value: '1' });
+    expect(lockCalls[0]).toMatchObject({ key: 'punish:lock:target' });
+    // The value is a per-call owner token (mod user, timestamp, random suffix),
+    // not a constant — release only deletes when the stored value matches it.
+    expect(lockCalls[0].value).toMatch(/^Mod:\d+:[a-z0-9]+$/);
     expect(lockCalls[0].options?.nx).toBe(true);
     const ttlMs = lockCalls[0].options?.expiration?.getTime();
     expect(ttlMs).toBeGreaterThan(Date.now() + 25 * 1000);
     expect(ttlMs).toBeLessThanOrEqual(Date.now() + 30 * 1000);
     expect(redis.delCalls).toEqual(['punish:lock:target']);
+  });
+
+  it('releases by comparing the stored value against its own owner token', async () => {
+    const redis = new FakeRedis();
+    const current = deps({ redis });
+
+    await expect(punish(current, input)).resolves.toMatchObject({ action: 'warn', commentId: 't1_warning' });
+
+    // The lock held this call's token and the release deleted exactly that key.
+    expect(redis.lockCalls()[0].value).toMatch(/^Mod:/);
+    expect(redis.values.has(punishLockKey('Target'))).toBe(false);
+    expect(redis.delCalls).toEqual(['punish:lock:target']);
+  });
+
+  it('does not delete the lock when another owner acquired it after our TTL expired', async () => {
+    const redis = new FakeRedis();
+    const lockKey = punishLockKey('Target');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const current = deps({
+      redis,
+      submitComment: async () => {
+        await gate;
+        return 't1_warning';
+      },
+    });
+
+    const pending = punish(current, input);
+    await vi.waitFor(() => expect(redis.values.has(lockKey)).toBe(true));
+
+    // Simulate the ~30s TTL lapsing mid-execution: a second caller acquires
+    // the expired lock with its own token before this call releases.
+    redis.values.set(lockKey, 'Other:999:secondcaller');
+
+    release();
+    await expect(pending).resolves.toMatchObject({ action: 'warn', commentId: 't1_warning' });
+
+    // The second caller's lock survived this call's release attempt.
+    expect(redis.values.get(lockKey)).toBe('Other:999:secondcaller');
+    expect(redis.delCalls).toEqual([]);
+  });
+
+  it('resolves with the real result when the release GET or DEL rejects', async () => {
+    class FailingReleaseRedis extends FakeRedis {
+      constructor(private readonly failingMethod: 'get' | 'del') {
+        super();
+      }
+
+      override async get(key: string): Promise<string | undefined> {
+        if (this.failingMethod === 'get' && key.startsWith('punish:lock:')) {
+          throw new Error('redis down on get');
+        }
+        return super.get(key);
+      }
+
+      override async del(key: string): Promise<void> {
+        if (this.failingMethod === 'del' && key.startsWith('punish:lock:')) {
+          throw new Error('redis down on del');
+        }
+        return super.del(key);
+      }
+    }
+
+    for (const failingMethod of ['get', 'del'] as const) {
+      const redis = new FailingReleaseRedis(failingMethod);
+      const current = deps({ redis });
+      // A release failure is logged and swallowed; the punishment result and
+      // any original execution error are unaffected.
+      await expect(punish(current, input)).resolves.toMatchObject({
+        action: 'warn',
+        label: 'Warning',
+        commentId: 't1_warning',
+      });
+    }
   });
 
   it('releases the lock when execution fails', async () => {
