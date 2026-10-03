@@ -12,6 +12,8 @@ export interface ModActionRecord {
 export interface HistoryStore {
   load(username: string): Promise<ModActionRecord[]>;
   append(username: string, record: ModActionRecord): Promise<boolean>;
+  /** Remove one matching record during execution-failure compensation. */
+  remove?(username: string, record: ModActionRecord): Promise<boolean>;
 }
 
 /** Options for Redis SET, mirroring the installed @devvit/redis SetOptions. */
@@ -78,5 +80,34 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
         return false;
       }
     },
+
+    async remove(username: string, record: ModActionRecord): Promise<boolean> {
+      try {
+        const key = historyKey(username);
+        const records = parseHistory(await redis.get(key));
+        const index = records.findIndex(
+          (candidate) => candidate === record || isSameRecord(candidate, record)
+        );
+        if (index < 0) return true;
+        records.splice(index, 1);
+        await redis.set(key, JSON.stringify(records.slice(-HISTORY_MAX_RECORDS)), {
+          expiration: new Date(Date.now() + HISTORY_TTL_DAYS * 24 * 60 * 60 * 1000),
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
   };
+}
+
+function isSameRecord(left: ModActionRecord, right: ModActionRecord): boolean {
+  return (
+    left.at === right.at &&
+    left.rule === right.rule &&
+    left.action === right.action &&
+    left.label === right.label &&
+    left.modUser === right.modUser &&
+    left.targetThingId === right.targetThingId
+  );
 }

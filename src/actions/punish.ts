@@ -1,6 +1,6 @@
 import { effectivePriors, LADDER, pickRung, type LadderRung } from '../lib/ladder.js';
 import { ruleByNumber } from '../lib/rules.js';
-import type { HistoryStore, RedisLike } from '../lib/history.js';
+import type { HistoryStore, ModActionRecord, RedisLike } from '../lib/history.js';
 
 const RULES_WIKI = 'https://www.reddit.com/r/RPClipsGTA/wiki/subreddit/rules/';
 const MODMAIL_APPEAL =
@@ -105,7 +105,38 @@ export function punishLockKey(username: string): string {
   return `punish:lock:${username.toLowerCase()}`;
 }
 
-/** Execute the in-app ladder and best-effort record the resulting action. */
+function recordFor(input: PunishInput, at: number, rung: LadderRung): ModActionRecord {
+  return {
+    at,
+    rule: input.rule,
+    action: rung.action,
+    label: rung.label,
+    modUser: input.modUser,
+    targetThingId: input.targetThingId,
+  };
+}
+
+async function compensateRecord(
+  history: HistoryStore,
+  username: string,
+  record: ModActionRecord
+): Promise<void> {
+  if (!history.remove) {
+    console.error('[punish] execution failed; history store cannot compensate the pending record');
+    return;
+  }
+  try {
+    const removed = await history.remove(username, record);
+    if (!removed) {
+      console.error('[punish] execution failed; compensation could not remove the pending record');
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`[punish] execution failed; history compensation failed: ${detail}`);
+  }
+}
+
+/** Execute the ladder under a per-user lock and record before Reddit execution. */
 export async function punish(
   deps: PunishDeps,
   input: PunishInput
@@ -124,54 +155,58 @@ export async function punish(
   try {
     const now = deps.now ?? Date.now;
     const at = now();
-    let priorRecords: Awaited<ReturnType<HistoryStore['load']>> = [];
-    try {
-      priorRecords = await deps.history.load(input.targetUser);
-    } catch {
-      // A history outage must not prevent the Reddit action. It is treated as a
-      // fresh history, and the later append will report whether recording worked.
-    }
+    // A history read failure is a failed escalation, not permission to execute
+    // a second action against a user whose current level is unknown.
+    const priorRecords = await deps.history.load(input.targetUser);
     const priorTimestamps = priorRecords
       .map((record) => record.at)
       .filter((timestamp) => Number.isFinite(timestamp));
     const rung = pickRung(priorTimestamps, at);
     const effective = effectivePriors(priorTimestamps, at);
 
-    let commentId = '';
-    if (rung.action === 'warn') {
-      commentId = await deps.submitComment({
-        text: buildWarningComment({
-          targetUser: input.targetUser,
-          rule: input.rule,
-          ruleName: rule.name,
-          reason: input.reason,
-          rung,
-        }),
-        replyTargetThingId: input.targetThingId,
-      });
-    } else {
-      await deps.banUser({
-        username: input.targetUser,
-        subredditName: input.subredditName,
-        ...(rung.durationDays > 0 ? { durationDays: rung.durationDays } : {}),
-        message: banMessage(input, rung, rule.name),
-        reason: `R${input.rule} — ${rule.name}`,
-        note: `[devvit] by ${input.modUser}`,
-      });
-    }
-
+    const pendingRecord = recordFor(input, at, rung);
     let recorded = false;
     try {
-      recorded = await deps.history.append(input.targetUser, {
-        at,
-        rule: input.rule,
-        action: rung.action,
-        label: rung.label,
-        modUser: input.modUser,
-        targetThingId: input.targetThingId,
-      });
-    } catch {
+      recorded = await deps.history.append(input.targetUser, pendingRecord);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[punish] failed to pre-record ${input.targetUser}: ${detail}`);
       recorded = false;
+    }
+    if (!recorded) {
+      console.error(`[punish] proceeding without a history record for ${input.targetUser}`);
+    }
+
+    let commentId = '';
+    try {
+      if (rung.action === 'warn') {
+        commentId = await deps.submitComment({
+          text: buildWarningComment({
+            targetUser: input.targetUser,
+            rule: input.rule,
+            ruleName: rule.name,
+            reason: input.reason,
+            rung,
+          }),
+          replyTargetThingId: input.targetThingId,
+        });
+      } else {
+        await deps.banUser({
+          username: input.targetUser,
+          subredditName: input.subredditName,
+          ...(rung.durationDays > 0 ? { durationDays: rung.durationDays } : {}),
+          message: banMessage(input, rung, rule.name),
+          reason: `R${input.rule} — ${rule.name}`,
+          note: `[devvit] by ${input.modUser}`,
+        });
+      }
+    } catch (error) {
+      if (recorded) {
+        // There is a tiny crash window between the Reddit action and this
+        // compensation; pending-first makes a failed action visible otherwise.
+        await compensateRecord(deps.history, input.targetUser, pendingRecord);
+      }
+      throw error;
     }
 
     return {
