@@ -121,11 +121,11 @@ function hasAtLeastTwoSentences(body: string): boolean {
   const cleaned = body
     // Markdown links contribute their visible text, not their URL.
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-    // URLs do not contribute their path punctuation as sentence boundaries.
-    .replace(/https?:\/\/[^\s<>()]+/gi, ' ')
-    // Decimal points and common honorifics are not sentence boundaries.
-    .replace(/(\d)\.(?=\d)/g, `$1${SENTENCE_PLACEHOLDER}`)
-    .replace(/\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr)\.(?=\s+\p{Lu})/gu, SENTENCE_PLACEHOLDER);
+    // URLs do not contribute their path punctuation as sentence boundaries;
+    // preserve punctuation immediately following a bare URL.
+    .replace(/https?:\/\/[^\s<>()]+/gi, (url) => url.match(/[.!?]+$/u)?.[0] ?? ' ')
+    // Decimal points are not sentence boundaries.
+    .replace(/(\d)\.(?=\d)/g, `$1${SENTENCE_PLACEHOLDER}`);
 
   const sentenceCount = cleaned
     .split(/[.!?]+/)
