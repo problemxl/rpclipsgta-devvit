@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   BANNED_STREAMERS,
+  actionForRule,
   detectContentViolations,
   isDuplicateUrl,
   normalizeUrlForDuplication,
@@ -24,6 +25,38 @@ function link(overrides: Partial<SubmissionInput> = {}): SubmissionInput {
 function rules(submission: SubmissionInput): number[] {
   return detectContentViolations(submission).map((violation) => violation.rule);
 }
+
+describe('detection action policy', () => {
+  it.each([
+    [1, 'remove-and-escalate'],
+    [2, 'remove-and-escalate'],
+    [3, 'remove-and-escalate'],
+    [4, 'remove-and-escalate'],
+    [5, 'remove'],
+    [6, 'remove'],
+    [7, 'remove-and-escalate'],
+    [8, 'remove-and-escalate'],
+    [9, 'remove-and-escalate'],
+    [10, 'remove'],
+    [11, 'remove'],
+    [12, 'remove'],
+  ] as const)('maps R%s to %s', (rule, action) => {
+    expect(actionForRule(rule)).toBe(action);
+  });
+
+  it('uses the same policy map on detected violations', () => {
+    const cases = [
+      [link({ url: 'https://bad.example/clip' }), 5, 'remove'],
+      [link({ title: '😂 !!!' }), 4, 'remove-and-escalate'],
+      [link({ title: 'Koil clip' }), 12, 'remove'],
+    ] as const;
+
+    for (const [submission, rule, action] of cases) {
+      expect(detectContentViolations(submission).find((violation) => violation.rule === rule))
+        .toMatchObject({ rule, action });
+    }
+  });
+});
 
 describe('detection constants', () => {
   it('contains the eight wiki rule 5 domains and normalized rule 12 names', () => {
