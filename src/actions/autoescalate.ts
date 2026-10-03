@@ -9,24 +9,31 @@ import {
   type SubmissionInput,
   type Violation,
 } from '../lib/detection.js';
-import type { EscalatePayload, EscalateResult } from '../lib/service.js';
+import type { RedisLike, RedisSetOptions } from '../lib/history.js';
 
-/** The Redis options used by the installed Devvit Redis client. */
-export interface AutoRedisSetOptions {
-  readonly nx?: boolean;
-  readonly xx?: boolean;
-  readonly expiration?: Date;
+// The removal flow shares the exact structural Redis client used by the
+// history store and the punish lock; re-exported for existing callers.
+export type { RedisLike, RedisSetOptions as AutoRedisSetOptions };
+/** Payload passed across the framework-free removal/escalation seam. */
+export interface EscalatePayload {
+  readonly target_user: string;
+  readonly target_id: string;
+  /** The resolved target post's subreddit; punish refuses bans without one. */
+  readonly subreddit_name: string;
+  readonly rule: number;
+  readonly reason: string;
+  readonly mod_user: string;
 }
 
-/** The small structural Redis subset needed by this action. */
-export interface RedisLike {
-  get(key: string): Promise<string | undefined>;
-  set(
-    key: string,
-    value: string,
-    options?: AutoRedisSetOptions
-  ): Promise<string | undefined>;
-  readonly del: (key: string) => Promise<unknown>;
+/** Result shape retained for removal toasts and existing action callers. */
+export interface EscalateResult {
+  readonly action: 'warn' | 'ban';
+  readonly duration_days: number;
+  readonly label: string;
+  readonly comment_id: string;
+  readonly priors: number;
+  readonly rule_name: string;
+  readonly recorded: boolean;
 }
 
 export type EscalateFn = (payload: EscalatePayload) => Promise<EscalateResult>;
@@ -35,10 +42,8 @@ export type EscalateFn = (payload: EscalatePayload) => Promise<EscalateResult>;
 export interface ModRemovalDeps {
   readonly redis: RedisLike;
   readonly removePost: (thingId: string) => Promise<void>;
-  /** An already configured service client, if one is available. */
-  readonly escalate?: EscalateFn;
-  /** Lazily configures the service only after a punishable violation is found. */
-  readonly getEscalate?: () => Promise<EscalateFn | undefined>;
+  /** The always-available in-app punishment function. */
+  readonly escalate: EscalateFn;
   readonly now?: () => number;
 }
 
@@ -47,12 +52,14 @@ export interface ModRemovalInput extends SubmissionInput {
   readonly postId: string;
   readonly authorName: string;
   readonly modUser: string;
+  /** The resolved post's subreddit, threaded to punish for ban safety. */
+  readonly subredditName: string;
 }
 
 /** The smaller input needed when a moderator picks a rule in the form. */
 export type ManualRuleRemovalInput = Pick<
   ModRemovalInput,
-  'postId' | 'authorName' | 'modUser'
+  'postId' | 'authorName' | 'modUser' | 'subredditName'
 >;
 
 /** Result when removal and any policy-required escalation succeeded. */
@@ -60,13 +67,6 @@ export interface ModRemovalActionedOutcome {
   readonly status: 'actioned';
   readonly violation: Violation;
   readonly escalateResult?: EscalateResult;
-}
-
-/** Removal succeeded but the escalation service was not configured. */
-export interface ModRemovalUnescalatedOutcome {
-  readonly status: 'actioned-unescalated';
-  readonly reason: 'service-not-configured';
-  readonly violation: Violation;
 }
 
 /** Every terminal result returned by either removal entry point. */
@@ -77,8 +77,7 @@ export type ModRemovalOutcome =
   | { readonly status: 'escalate-failed'; readonly detail: string }
   | { readonly status: 'remove-failed'; readonly detail: string }
   | { readonly status: 'failed'; readonly detail: string }
-  | ModRemovalActionedOutcome
-  | ModRemovalUnescalatedOutcome;
+  | ModRemovalActionedOutcome;
 
 /** A framework callback failure kept separate from an action outcome. */
 export type ModRemovalSafeOutcome =
@@ -145,16 +144,13 @@ async function claimSeen(
   return { key, claimed: Boolean(result) };
 }
 
-async function resolveEscalate(
-  deps: ModRemovalDeps
-): Promise<EscalateFn | undefined> {
-  if (deps.escalate) return deps.escalate;
-  if (!deps.getEscalate) return undefined;
-  return deps.getEscalate();
-}
-
 async function applyViolation(
-  input: { postId: string; authorName: string; modUser: string },
+  input: {
+    postId: string;
+    authorName: string;
+    modUser: string;
+    subredditName: string;
+  },
   violation: Violation,
   reason: string,
   deps: ModRemovalDeps,
@@ -175,38 +171,16 @@ async function applyViolation(
     return audit({ status: 'actioned', violation }, input.postId);
   }
 
-  let escalate: EscalateFn | undefined;
-  try {
-    escalate = await resolveEscalate(deps);
-  } catch (error) {
-    const detail = detailOf(error);
-    console.error(
-      `[mod-remove] escalation setup failed ${input.postId}: ${detail}; ` +
-        'removal succeeded; use the manual Escalate menu'
-    );
-    return audit({ status: 'escalate-failed', detail }, input.postId);
-  }
-
-  if (!escalate) {
-    console.error(
-      `[mod-remove] escalation skipped for ${input.postId}: service-not-configured; ` +
-        'use the manual Escalate menu'
-    );
-    return audit(
-      { status: 'actioned-unescalated', reason: 'service-not-configured', violation },
-      input.postId
-    );
-  }
-
   const payload: EscalatePayload = {
     target_user: input.authorName,
     target_id: thingId,
+    subreddit_name: input.subredditName,
     rule: violation.rule,
     reason,
     mod_user: input.modUser,
   };
   try {
-    const escalateResult = await escalate(payload);
+    const escalateResult = await deps.escalate(payload);
     return audit({ status: 'actioned', violation, escalateResult }, input.postId);
   } catch (error) {
     const detail = detailOf(error);
@@ -379,13 +353,10 @@ export async function applyManualRuleRemovalSafely(
 
 /** Pure success text used by the Devvit menu and unit tests. */
 export function buildRemovalSuccessToast(
-  outcome: ModRemovalActionedOutcome | ModRemovalUnescalatedOutcome,
+  outcome: ModRemovalActionedOutcome,
   ruleName?: string
 ): string {
   const label = `R${outcome.violation.rule}${ruleName ? ` — ${ruleName}` : ''}`;
-  if (outcome.status === 'actioned-unescalated') {
-    return `Removed post (${label}); not escalated — use the manual Escalate option.`;
-  }
   return outcome.escalateResult
     ? `Removed post (${label}) and escalated.`
     : `Removed post (${label}); no escalation required.`;
@@ -393,7 +364,7 @@ export function buildRemovalSuccessToast(
 
 /** Pure failure text used by the Devvit menu and unit tests. */
 export function buildRemovalFailureToast(
-  outcome: Exclude<ModRemovalSafeOutcome, ModRemovalActionedOutcome | ModRemovalUnescalatedOutcome | { readonly status: 'clean' } | { readonly status: 'skipped-author' } | { readonly status: 'already-processed' }>
+  outcome: Exclude<ModRemovalSafeOutcome, ModRemovalActionedOutcome | { readonly status: 'clean' } | { readonly status: 'skipped-author' } | { readonly status: 'already-processed' }>
 ): string {
   return outcome.status === 'escalate-failed'
     ? `Escalation failed after removal: ${outcome.detail}. Use the manual Escalate option.`

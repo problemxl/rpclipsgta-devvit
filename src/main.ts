@@ -6,12 +6,12 @@
  * creation makes a normal link post with the original Twitch/Kick URL; it is
  * moderator-initiated and never creates a comment or crosspost.
  *
- * Failure handling is deliberately minimal: failures surface as a short
- * error toast only. No PM fallbacks — the service handles user notification
- * and its own recording fallbacks (see README).
+ * Escalations are executed entirely in the app: the ladder and decay policy
+ * are pure code, action history is in installation Redis, and Reddit receives
+ * the warning comment or ban directly.
  */
 
-import { Devvit, SettingScope } from '@devvit/public-api';
+import { Devvit } from '@devvit/public-api';
 
 import {
   applyManualRuleRemovalSafely,
@@ -38,67 +38,21 @@ import {
 } from './actions/fixture.js';
 import { actionForRule } from './lib/detection.js';
 import { ruleByNumber, RULES } from './lib/rules.js';
-import { callEscalate, type EscalatePayload } from './lib/service.js';
-
-// =============================================================================
-// ⚠️⚠️⚠️  EDIT ME BEFORE UPLOAD  ⚠️⚠️⚠️
-//
-// SERVICE_BASE_URL must be the PUBLIC base URL of the Python escalation
-// service (e.g. your Coolify deployment) — `https://` protocol, no path.
-// The app POSTs to `${SERVICE_BASE_URL}/devvit/escalate`.
-//
-// Devvit apps execute on Reddit's servers: `localhost` / LAN / 127.0.0.1
-// addresses are unreachable from there. Additionally, fetch domains are
-// STATIC — the host is baked into the app bundle at upload time from this
-// constant (see API_NOTES.md §a). It cannot be set per-installation via app
-// settings, and wildcards are not supported. Changing the service host means
-// editing this constant and RE-UPLOADING the app.
-//
-// Example:
-//   const SERVICE_BASE_URL = 'https://escalate.example.com';
-// =============================================================================
-const SERVICE_BASE_URL = 'https://escalate.rpclips.example.com';
-
-// The allowlist takes bare hostnames only (no protocol/port/path) and is
-// registered at upload time — derive it here, at module top, per the
-// platform's static-domain requirement (API_NOTES.md §a).
-const SERVICE_HOST = new URL(SERVICE_BASE_URL).host;
+import { createHistoryStore } from './lib/history.js';
+import { punish, type PunishDeps, type PunishResult } from './actions/punish.js';
+import type { EscalateFn, EscalatePayload, EscalateResult } from './actions/autoescalate.js';
 
 Devvit.configure({
   redditAPI: true,
   redis: true,
-  http: { domains: [SERVICE_HOST] },
 });
-
-// The shared service token and its URL are app-scoped SECRETS, set via the CLI:
-//   devvit settings set escalate-token
-//   devvit settings set service-url
-// The token must match ESCALATE_TOKEN on the Python service.
-Devvit.addSettings([
-  {
-    type: 'string',
-    name: 'escalate-token',
-    label: 'Escalation service token (ESCALATE_TOKEN)',
-    helpText: 'Shared secret sent as X-Escalate-Token; must match the Python service.',
-    scope: SettingScope.App,
-    isSecret: true,
-  },
-  {
-    type: 'string',
-    name: 'service-url',
-    label: 'Escalation service base URL',
-    helpText: `Full https:// URL of the Python service (must use the host baked into this app: ${SERVICE_HOST}).`,
-    scope: SettingScope.App,
-    isSecret: true,
-  },
-]);
 
 const escalateForm = Devvit.createForm(
   {
     title: 'Escalate',
     description:
-      'The escalation service decides the punishment automatically based on how many ' +
-      'prior mod actions the author already has: a warning first, then escalating bans.',
+      'The in-app ladder applies a warning first, then escalating bans based on prior ' +
+      'actions, with three-month decay between punishments.',
     acceptLabel: 'Apply',
     fields: [
       {
@@ -115,11 +69,10 @@ const escalateForm = Devvit.createForm(
         type: 'string',
         name: 'reason',
         label: 'Reason (optional)',
-        helpText: 'Forwarded to the service and included in the warning / ban message.',
+        helpText: 'Included in the warning / ban message.'
       },
     ],
   },
-  // Thin handler: all real logic lives on the Python service.
   async (event, context) => {
     // -- Form input -----------------------------------------------------------
     const rule = ruleByNumber(Number(event.values.rule?.[0])); // select values are string[]
@@ -145,54 +98,31 @@ const escalateForm = Devvit.createForm(
       return;
     }
 
-    // -- Settings ---------------------------------------------------------------
-    const [token, rawServiceUrl] = await Promise.all([
-      context.settings.get<string>('escalate-token'),
-      context.settings.get<string>('service-url'),
-    ]);
-    const serviceUrl = normalizeBaseUrl(rawServiceUrl);
-    if (!token || !serviceUrl) {
-      safeToast(
-        context,
-        'Service settings are not configured ' +
-          '(devvit settings set escalate-token / service-url). Action aborted.'
-      );
-      return;
-    }
-    if (!isAllowedServiceHost(serviceUrl)) {
-      // Fetches to other hosts are blocked by the platform anyway — fail with
-      // a clear message instead of an opaque plugin error.
-      safeToast(
-        context,
-        `The service-url setting must use the host baked into this app (${SERVICE_HOST}) — ` +
-          'otherwise the fetch is blocked. Action aborted.'
-      );
-      return;
-    }
-
     try {
       // -- Resolve the target thing (comment vs post) -------------------------
       const target = targetId.startsWith('t1_')
         ? targetFromComment(await context.reddit.getCommentById(targetId))
         : targetFromPost(await context.reddit.getPostById(targetId));
 
-      // -- Hand off to the service --------------------------------------------
-      const payload: EscalatePayload = {
-        target_user: target.authorName,
-        target_id: target.thingId,
-        rule: rule.number,
-        reason,
-        mod_user: modUsername,
-      };
-      const result = await callEscalate(fetch, serviceUrl, token, payload);
+      const result = await punish(
+        createPunishDeps(context),
+        {
+          targetUser: target.authorName,
+          targetThingId: target.thingId,
+          // The resolved target's subreddit; never a context fallback that
+          // could diverge from where the comment/ban is applied.
+          subredditName: target.subredditName || context.subredditName || '',
+          rule: rule.number,
+          reason,
+          modUser: modUsername,
+        }
+      );
       console.log(
-        `[escalate] service executed ${result.label} on u/${target.authorName} ` +
+        `[escalate] app executed ${result.label} on u/${target.authorName} ` +
           `(priors: ${result.priors}, recorded: ${result.recorded})`
       );
       safeToast(context, buildSuccessToast({ result, targetUser: target.authorName, rule }));
     } catch (err) {
-      // No PM fallback: the service handles user notification and its own
-      // recording fallbacks. The mod gets a short toast; details are logged.
       const detail = err instanceof Error ? err.message : String(err);
       console.error(`[escalate] action failed: ${detail}`);
       safeToast(context, buildFailureToast(detail));
@@ -330,7 +260,7 @@ const removePostForm = Devvit.createForm(
         type: 'string',
         name: 'reason',
         label: 'Reason (optional)',
-        helpText: 'Forwarded to the escalation service when this rule escalates.',
+        helpText: 'Included in the warning / ban message when this rule escalates.',
       },
     ],
   },
@@ -359,6 +289,7 @@ const removePostForm = Devvit.createForm(
           postId: post.id,
           authorName: post.authorName,
           modUser,
+          subredditName: post.subredditName,
         },
         rule,
         typeof event.values.reason === 'string' ? event.values.reason : '',
@@ -403,6 +334,7 @@ Devvit.addMenuItem({
           body: post.body ?? '',
           isTextPost: post.body !== undefined,
           modUser,
+          subredditName: post.subredditName,
         },
         createModRemovalDeps(context)
       );
@@ -431,27 +363,70 @@ Devvit.addMenuItem({
   },
 });
 
+function createPunishDeps(context: Devvit.Context): PunishDeps {
+  return {
+    history: createHistoryStore(context.redis),
+    // The same Redis client serializes punishments per user via the lock in
+    // punish().
+    redis: context.redis,
+    submitComment: async ({ text, replyTargetThingId }) => {
+      const comment = await context.reddit.submitComment({
+        id: replyTargetThingId as `t1_${string}` | `t3_${string}`,
+        text,
+        runAs: 'APP',
+      });
+      return comment.id;
+    },
+    banUser: async ({ username, subredditName, durationDays, message, reason, note }) => {
+      await context.reddit.banUser({
+        username,
+        subredditName,
+        ...(durationDays === undefined ? {} : { duration: durationDays }),
+        message,
+        reason,
+        note,
+      });
+    },
+  };
+}
+
+function createEscalateFn(context: Devvit.Context): EscalateFn {
+  const punishDeps = createPunishDeps(context);
+  return async (payload: EscalatePayload): Promise<EscalateResult> => {
+    const result: PunishResult = await punish(punishDeps, {
+      targetUser: payload.target_user,
+      targetThingId: payload.target_id,
+      // The RESOLVED post's subreddit threaded through the removal seam; an
+      // empty name makes punish refuse any ban before banUser is called.
+      subredditName: payload.subreddit_name,
+      rule: payload.rule,
+      reason: payload.reason,
+      modUser: payload.mod_user,
+    });
+    return {
+      action: result.action,
+      duration_days: result.durationDays,
+      label: result.label,
+      comment_id: result.commentId,
+      priors: result.priors,
+      rule_name: result.ruleName,
+      recorded: result.recorded,
+    };
+  };
+}
+
 function createModRemovalDeps(context: Devvit.Context) {
   return {
     redis: context.redis,
     removePost: (thingId: string) =>
       context.reddit.remove(thingId as `t3_${string}`, false),
-    getEscalate: async () => {
-      const [token, rawServiceUrl] = await Promise.all([
-        context.settings.get<string>('escalate-token'),
-        context.settings.get<string>('service-url'),
-      ]);
-      const serviceUrl = normalizeBaseUrl(rawServiceUrl);
-      if (!token || !serviceUrl || !isAllowedServiceHost(serviceUrl)) return undefined;
-      return (payload: EscalatePayload) => callEscalate(fetch, serviceUrl, token, payload);
-    },
+    escalate: createEscalateFn(context),
   };
 }
 
 function showRemovalOutcome(context: Devvit.Context, outcome: ModRemovalSafeOutcome): void {
   switch (outcome.status) {
     case 'actioned':
-    case 'actioned-unescalated':
       safeToast(
         context,
         buildRemovalSuccessToast(outcome, ruleByNumber(outcome.violation.rule)?.name)
@@ -484,22 +459,6 @@ function safeToast(context: Devvit.Context, text: string): void {
     context.ui.showToast(text);
   } catch {
     // Swallow: a failed toast must not throw over the handler's result.
-  }
-}
-
-/** Trim whitespace and trailing slashes so `${baseUrl}/devvit/...` never doubles up. */
-function normalizeBaseUrl(url: string | undefined): string | undefined {
-  const trimmed = url?.trim().replace(/\/+$/, '');
-  return trimmed ? trimmed : undefined;
-}
-
-/** Host comparison lenient about a leading `www.`, like configure() is. */
-function isAllowedServiceHost(baseUrl: string): boolean {
-  try {
-    const host = new URL(baseUrl).host.replace(/^www\./, '');
-    return host === SERVICE_HOST;
-  } catch {
-    return false;
   }
 }
 

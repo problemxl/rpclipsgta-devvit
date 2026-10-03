@@ -5,14 +5,11 @@
  * can be unit-tested with vitest without the Devvit runtime. `src/main.ts`
  * wires these helpers into the mod menu / form handlers.
  *
- * The app is a thin trigger: it resolves the target, then hands rule + reason
- * + target + actor to the Python service, which picks and executes the ladder
- * step (warning comment or ban) and records it. Execution helpers (warning
- * text, ban params, record fields) therefore live on the service now — this
- * module only keeps target resolution and the toast text builders.
+ * The app resolves the target and delegates execution to the in-app ladder.
+ * This module keeps target resolution and toast text builders framework-free.
  */
 
-import type { EscalateResult } from '../lib/service.js';
+import type { PunishResult } from './punish.js';
 import type { Rule } from '../lib/rules.js';
 
 /** Which kind of thing the mod action targets. */
@@ -104,11 +101,11 @@ export function ruleLabel(rule: Rule): string {
 /**
  * Success toast for a completed escalation. Warns show the rule
  * (`Warned u/x (R2 — Toxicity)`), bans show the ladder label
- * (`Banned u/x — 7 day ban`). Appends `(not recorded)` when the service
- * executed the action but failed to write the PocketBase record.
+ * (`Banned u/x — 7 day ban`). Appends `(not recorded)` when the action
+ * executed but its Redis history record could not be written.
  */
 export function buildSuccessToast(params: {
-  result: EscalateResult;
+  result: PunishResult;
   /** Username of the target user, without the leading `u/`. */
   targetUser: string;
   /** The rule the acting mod selected in the form. */
@@ -122,7 +119,7 @@ export function buildSuccessToast(params: {
   return result.recorded ? summary : `${summary} (not recorded)`;
 }
 
-/** Short failure toast — the service already handles its own fallbacks. */
+/** Short failure toast for an execution failure. */
 export function buildFailureToast(detail: string): string {
   return `Escalation failed: ${detail}`;
 }
