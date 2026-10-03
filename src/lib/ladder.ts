@@ -21,11 +21,12 @@ export const LADDER: readonly LadderRung[] = [
   { action: 'ban', durationDays: 0, label: 'Permanent ban' },
 ] as const;
 
+/** Three months is represented as 90 days for deterministic decay. */
 const THREE_MONTHS_MS = 90 * 24 * 60 * 60 * 1000;
 
 /**
  * Count prior actions after one level of decay for every full three-month
- * quiet stretch since the latest prior action.
+ * (90-day) quiet stretch since the latest prior action.
  */
 export function effectivePriors(priorTimestamps: readonly number[], now: number): number {
   if (priorTimestamps.length === 0) return 0;

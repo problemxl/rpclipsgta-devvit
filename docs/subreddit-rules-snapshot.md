@@ -118,7 +118,10 @@ R5 > R6 > R4 > R12, and the locked action policy is remove + escalate for
 R1, R2, R3, R4, R7, R8, and R9, versus remove-only for R5, R6, R10, R11, and
 R12. Escalations carry the pressing moderator's username in `mod_user`.
 Escalation is always available in-app through the Reddit API and Redis; there
-are no service settings or manual service fallback. A seen claim is released
+are no service settings or manual service fallback. Implementation notes: the
+policy's "three months" decay interval is represented deterministically as 90
+days, and history is retained for 540 days (five effective levels × 90 days,
+plus a 90-day buffer). A seen claim is released
 before or during failed removal, but retained after removal; URL duplicate
 claims are made only by otherwise-clean posts and use GET-then-SET in the
 low-concurrency mod path.

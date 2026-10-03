@@ -34,18 +34,36 @@ export interface RedisLike {
   del(key: string): Promise<unknown>;
 }
 
-export const HISTORY_TTL_DAYS = 400;
+/** Five effective levels × 90 days, plus a 90-day retention buffer. */
+export const HISTORY_TTL_DAYS = 540;
 export const HISTORY_MAX_RECORDS = 50;
 
 export function historyKey(username: string): string {
   return `modactions:user:${username.toLowerCase()}`;
 }
 
+function isModActionRecord(value: unknown): value is ModActionRecord {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Partial<ModActionRecord>;
+  return (
+    typeof record.at === 'number' &&
+    Number.isFinite(record.at) &&
+    (record.action === 'warn' || record.action === 'ban') &&
+    typeof record.rule === 'number' &&
+    Number.isInteger(record.rule) &&
+    record.rule >= 1 &&
+    record.rule <= 12 &&
+    typeof record.label === 'string' &&
+    typeof record.modUser === 'string' &&
+    typeof record.targetThingId === 'string'
+  );
+}
+
 function parseHistory(value: string | undefined): ModActionRecord[] {
   if (value === undefined) return [];
   try {
     const parsed: unknown = JSON.parse(value);
-    return Array.isArray(parsed) ? (parsed as ModActionRecord[]) : [];
+    return Array.isArray(parsed) ? parsed.filter(isModActionRecord) : [];
   } catch {
     return [];
   }
@@ -72,10 +90,10 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
         const records = parseHistory(await redis.get(key));
         records.push(record);
         const recent = records.slice(-HISTORY_MAX_RECORDS);
-        await redis.set(key, JSON.stringify(recent), {
+        const result = await redis.set(key, JSON.stringify(recent), {
           expiration: new Date(Date.now() + HISTORY_TTL_DAYS * 24 * 60 * 60 * 1000),
         });
-        return true;
+        return typeof result === 'string';
       } catch {
         return false;
       }
@@ -85,15 +103,13 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
       try {
         const key = historyKey(username);
         const records = parseHistory(await redis.get(key));
-        const index = records.findIndex(
-          (candidate) => candidate === record || isSameRecord(candidate, record)
-        );
+        const index = records.findIndex((candidate) => candidate === record || isSameRecord(candidate, record));
         if (index < 0) return true;
         records.splice(index, 1);
-        await redis.set(key, JSON.stringify(records.slice(-HISTORY_MAX_RECORDS)), {
+        const result = await redis.set(key, JSON.stringify(records.slice(-HISTORY_MAX_RECORDS)), {
           expiration: new Date(Date.now() + HISTORY_TTL_DAYS * 24 * 60 * 60 * 1000),
         });
-        return true;
+        return typeof result === 'string';
       } catch {
         return false;
       }
