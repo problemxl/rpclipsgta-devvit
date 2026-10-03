@@ -78,11 +78,9 @@ changes.
 3. Ban appeals go through modmail; abuse during appeals can increase
    punishment.
 
-> ⚠️ Discrepancy note: the Python escalation service's documented ladder
-> (README §Endpoint contract: Warning, 3, 7, 30, Permanent) is missing the
-> **Level 4 — 14 day ban** rung present in this wiki. The ladder lives in the
-> Python service, not in this app; the service should be updated to match the
-> wiki's six-level ladder (and, ideally, the 3-month decay).
+> The six-level ladder, including the **Level 4 — 14 day ban** rung and
+> three-month decay, is enforced by the app in `src/lib/ladder.ts`. Action
+> history is kept in the app's per-user Redis JSON arrays.
 
 ## Policy — AutoModerator / accounts
 
@@ -119,7 +117,8 @@ moderator-initiated through the **Remove post** menu action; there is no
 R5 > R6 > R4 > R12, and the locked action policy is remove + escalate for
 R1, R2, R3, R4, R7, R8, and R9, versus remove-only for R5, R6, R10, R11, and
 R12. Escalations carry the pressing moderator's username in `mod_user`.
-Missing service settings produce an unescalated removal with the manual
-Escalate menu as fallback. A seen claim is released before or during failed
-removal, but retained after removal; URL duplicate claims are made only by
-otherwise-clean posts and use GET-then-SET in the low-concurrency mod path.
+Escalation is always available in-app through the Reddit API and Redis; there
+are no service settings or manual service fallback. A seen claim is released
+before or during failed removal, but retained after removal; URL duplicate
+claims are made only by otherwise-clean posts and use GET-then-SET in the
+low-concurrency mod path.
