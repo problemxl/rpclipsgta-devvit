@@ -1,5 +1,13 @@
 # API Notes — @devvit/public-api 0.14.2
 
+> **Historical reference only.** This file contains examples from the retired
+> PocketBase-backed implementation, including generic Devvit HTTP/fetch
+> permissions and settings for that old service. The current app does **not**
+> configure `http`, call `fetch`, use PocketBase, or declare email/password
+> settings. Do not apply those retired examples to the current app. The only
+> network/email helper in this repository is the explicitly local
+> `scripts/gen-test-accounts.mjs` CLI, which is outside the Devvit bundle.
+
 All signatures below are quoted/verified from the installed typings under
 `node_modules/@devvit/public-api` (and its `@devvit/*` dependencies). Import
 path for everything app-facing is `@devvit/public-api`.

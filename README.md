@@ -16,8 +16,16 @@ A self-contained moderator-actions Devvit app for r/RPClipsGTA. It provides:
   ladder position (or reset them) for testing escalation and decay.
 
 There is no external escalation endpoint, Python runtime, PocketBase dependency,
-network allowlist, or app secret. All execution happens through Devvit's Reddit
-and Redis APIs.
+network allowlist, or app secret. The Devvit entry point and its dependency graph
+never import or invoke anything under `scripts/`, never use `fetch` or a mail
+client, and never connect to Guerrilla Mail or any other mail server. All app
+execution happens through Devvit's Reddit and Redis APIs.
+
+The only email/network helper is the local, manually invoked
+`scripts/gen-test-accounts.mjs` CLI. It is not bundled with or imported by the
+app, and it is not run by any app path or package lifecycle script. Account
+signup remains manual; use the helper only outside Devvit when preparing local
+end-to-end test accounts.
 
 ## In-app escalation engine
 
@@ -198,14 +206,17 @@ Two properties matter:
   does not auto-clear existing or partial history; clear explicitly before
   retrying.
 
-Throwaway Reddit accounts for end-to-end testing are prepared with
-`scripts/gen-test-accounts.mjs` (credentials + disposable inboxes; signups stay
-manual). The helper accepts `gen [1-10]` and `check [--wait seconds]` or
+Throwaway Reddit accounts for end-to-end testing are prepared, only outside
+Devvit, with the local CLI `scripts/gen-test-accounts.mjs` (credentials +
+disposable inboxes; signups stay manual). The CLI is the repository's sole
+email/network helper: the app does not import, bundle, invoke, or share its
+Guerrilla Mail logic, and the Devvit manifest has no generic HTTP permission.
+The helper accepts `gen [1-10]` and `check [--wait seconds]` or
 `check [--wait=seconds]`, applies request timeouts, validates Reddit verification
 links as exact HTTPS `reddit.com`/`www.reddit.com` URLs, and writes the local
 credential file with mode `0600`. `test-accounts.txt` is gitignored; do not
 paste or commit it. The helper never calls Reddit signup APIs or any Reddit
-endpoint.
+endpoint; use the normal Reddit signup UI manually.
 
 Testing playbook:
 
