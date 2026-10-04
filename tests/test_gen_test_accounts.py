@@ -381,6 +381,74 @@ class AccountHelperTests(unittest.TestCase):
         self.assertEqual(helper.main(["--help"], stdout=out, stderr=StringIO()), 0)
         self.assertIn("human-guided Reddit signup", out.getvalue())
 
+    def test_tui_generates_account_and_reveals_password_only_after_confirmation(self):
+        transport = FakeTransport([
+            {"sid_token": "sid", "email_addr": "initial@guerrillamailblock.com"},
+            {"email_addr": "rpcl.tui@guerrillamailblock.com"},
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "accounts.txt"
+            out = StringIO()
+            result = helper.run_tui(
+                client=helper.GuerrillaMailClient(transport=transport),
+                account_path=path,
+                stdin=StringIO("1\ny\n3\n"),
+                stdout=out,
+                stderr=StringIO(),
+            )
+            account = helper.load_accounts(path)[0]
+        self.assertEqual(result, 0)
+        self.assertIn("Email:    rpcl.tui@guerrillamailblock.com", out.getvalue())
+        self.assertIn(f"Username: {account.username}", out.getvalue())
+        self.assertIn(f"Password: {account.password}", out.getvalue())
+        self.assertIn("confirmation", out.getvalue().lower())
+
+    def test_tui_keeps_password_hidden_when_confirmation_is_declined(self):
+        transport = FakeTransport([
+            {"sid_token": "sid", "email_addr": "initial@guerrillamailblock.com"},
+            {"email_addr": "rpcl.hidden@guerrillamailblock.com"},
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "accounts.txt"
+            out = StringIO()
+            result = helper.run_tui(
+                client=helper.GuerrillaMailClient(transport=transport),
+                account_path=path,
+                stdin=StringIO("1\nn\n3\n"),
+                stdout=out,
+                stderr=StringIO(),
+            )
+            password = helper.load_accounts(path)[0].password
+        self.assertEqual(result, 0)
+        self.assertNotIn(password, out.getvalue())
+        self.assertIn("Password hidden", out.getvalue())
+
+    def test_tui_checks_inbox_with_mocked_fetch_and_exits(self):
+        account = helper.Account("user_tui", "Password1!", "tui@example.test", helper.SessionState("sid"))
+        transport = FakeTransport([{"list": []}])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "accounts.txt"
+            helper.save_accounts_atomic(path, [account])
+            out = StringIO()
+            result = helper.run_tui(
+                client=helper.GuerrillaMailClient(transport=transport),
+                account_path=path,
+                stdin=StringIO("2\n0\n0\nn\n3\n"),
+                stdout=out,
+                stderr=StringIO(),
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertIn("Polling 1 inbox(es)", out.getvalue())
+        self.assertIn("Exit", out.getvalue())
+
+    def test_main_does_not_start_tui_without_tty(self):
+        out, err = StringIO(), StringIO()
+        result = helper.main([], stdin=StringIO(), stdout=out, stderr=err)
+        self.assertEqual(result, 2)
+        self.assertIn("non-interactive", err.getvalue())
+        self.assertIn("python scripts/gen-test-accounts.py gen", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

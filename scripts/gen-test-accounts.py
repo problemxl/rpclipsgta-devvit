@@ -5,9 +5,10 @@ This is a local-only helper.  It creates Guerrilla Mail inboxes, generates
 credentials, and optionally displays carefully validated verification-link
 candidates.  A person must complete signup at Reddit's normal web UI.
 
-The core uses only the Python standard library. The CLI is deliberately
-noninteractive so it remains easy to audit and automate without adding a
-browser or interactive dependency.
+The core uses only the Python standard library. With no command in a real
+terminal, the script presents a small interactive text menu; explicit `gen`
+and `check` commands remain noninteractive for automation. Neither mode adds a
+browser or automates Reddit signup.
 """
 
 from __future__ import annotations
@@ -1109,10 +1110,14 @@ def parse_command_args(args: Sequence[str]) -> dict[str, Any]:
         if values:
             raise UsageError("help does not accept arguments")
         return {"command": "help"}
-    if command not in {"gen", "check"}:
-        raise UsageError(f'unknown command "{command}" — use: gen [count] | check [--wait seconds]')
+    if command not in {"gen", "check", "tui"}:
+        raise UsageError(f'unknown command "{command}" — use: gen [count] | check [--wait seconds] | tui')
     result: dict[str, Any] = {"command": command}
-    if command == "gen":
+    if command == "tui":
+        # The shared option loop below permits --store while rejecting polling
+        # options, which have no meaning in the menu.
+        pass
+    elif command == "gen":
         count = 3
         if values and not values[0].startswith("-"):
             raw = values.pop(0)
@@ -1193,6 +1198,9 @@ def parse_command_args(args: Sequence[str]) -> dict[str, Any]:
 
 HELP_TEXT = """Usage: python scripts/gen-test-accounts.py [COMMAND] [OPTIONS]
 
+With no command in a terminal, an interactive text menu is shown. Use `tui`
+to request that menu explicitly. The menu is standard-library only.
+
 Prepare Guerrilla Mail inboxes and credentials for human-guided Reddit signup.
 This tool never signs up for Reddit, uses a Reddit API/browser, bypasses CAPTCHA,
 or opens verification links.
@@ -1200,6 +1208,7 @@ or opens verification links.
 Commands:
   gen [COUNT]             Create COUNT accounts (default: 3, range: 1-10).
   check                   Poll saved inboxes for Reddit verification mail.
+  tui                     Open the interactive terminal menu.
 
 Options:
   --wait SECONDS         Overall polling window (default: 120, max: 3600).
@@ -1218,7 +1227,200 @@ Exit status:
 
 Verification links are validated HTTPS Reddit candidates and are shown for
 manual inspection only. They are bearer-like values; protect terminal output.
+
+When no TTY is available, the interactive menu is refused rather than waiting
+for input; use an explicit `gen` or `check` command for noninteractive use.
 """
+
+
+def _stream_is_tty(stream: TextIO) -> bool:
+    """Return whether a stream is an interactive terminal without assuming it has isatty."""
+
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
+def _tui_readline(prompt: str, *, stdin: TextIO, stdout: TextIO) -> str | None:
+    """Print a prompt and read one line, treating EOF as a normal exit."""
+
+    print(prompt, file=stdout, end="", flush=True)
+    try:
+        line = stdin.readline()
+    except (EOFError, OSError):
+        return None
+    if line == "":
+        return None
+    return line.strip()
+
+
+def _tui_yes_no(prompt: str, *, stdin: TextIO, stdout: TextIO, default: bool = False) -> bool | None:
+    """Read a yes/no answer; return None on EOF and keep invalid input local."""
+
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        answer = _tui_readline(f"{prompt} [{suffix}] ", stdin=stdin, stdout=stdout)
+        if answer is None:
+            return None
+        if not answer:
+            return default
+        if answer.lower() in {"y", "yes"}:
+            return True
+        if answer.lower() in {"n", "no"}:
+            return False
+        print("Please answer yes or no.", file=stdout)
+
+
+def _tui_integer(
+    prompt: str,
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int | None:
+    """Read a bounded integer from the menu, accepting the displayed default."""
+
+    while True:
+        answer = _tui_readline(f"{prompt} [{default}] ", stdin=stdin, stdout=stdout)
+        if answer is None:
+            return None
+        if not answer:
+            return default
+        if re.fullmatch(r"\d+", answer):
+            value = int(answer)
+            if minimum <= value <= maximum:
+                return value
+        print(f"Please enter a number from {minimum} to {maximum}.", file=stdout)
+
+
+def _tui_generate(
+    *,
+    client: GuerrillaMailClient,
+    account_path: Path | str,
+    stdin: TextIO,
+    stdout: TextIO,
+) -> bool:
+    """Generate one account and offer a deliberate, one-shot password reveal."""
+
+    print("\nGenerating one disposable inbox and credential set…", file=stdout)
+    created = generate_accounts(1, client=client, account_path=account_path, stdout=stdout)
+    account = created[0]
+    print("\nGenerated account (signup remains manual):", file=stdout)
+    print(f"  Email:    {account.email}", file=stdout)
+    print(f"  Username: {account.username}", file=stdout)
+    print("  Password: hidden (stored in the private account file)", file=stdout)
+    reveal = _tui_yes_no(
+        "Confirmation: reveal the password in this terminal? It is a secret and may be captured in terminal logs.",
+        stdin=stdin,
+        stdout=stdout,
+    )
+    if reveal:
+        print(f"  Password: {account.password}", file=stdout)
+    elif reveal is False:
+        print("  Password hidden; retrieve it from the private account file when needed.", file=stdout)
+    return reveal is not None
+
+
+def _tui_check(
+    *,
+    client: GuerrillaMailClient,
+    account_path: Path | str,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> bool:
+    """Run one human-configured inbox check without opening any links."""
+
+    wait_seconds = _tui_integer(
+        "Polling window in seconds (0 = one immediate check)",
+        stdin=stdin,
+        stdout=stdout,
+        default=DEFAULT_WAIT,
+        minimum=0,
+        maximum=MAX_WAIT,
+    )
+    if wait_seconds is None:
+        return False
+    interval_seconds = _tui_integer(
+        "Delay between checks in seconds",
+        stdin=stdin,
+        stdout=stdout,
+        default=DEFAULT_INTERVAL,
+        minimum=0,
+        maximum=MAX_INTERVAL,
+    )
+    if interval_seconds is None:
+        return False
+    show_links = _tui_yes_no(
+        "Reveal verification URL query tokens? Review links manually; never open them automatically.",
+        stdin=stdin,
+        stdout=stdout,
+    )
+    if show_links is None:
+        return False
+    result = check_accounts(
+        wait_seconds,
+        interval_seconds=interval_seconds,
+        show_links=show_links,
+        client=client,
+        account_path=account_path,
+        stdout=stdout,
+        stderr=stderr,
+        clock=clock,
+        sleep=sleep,
+    )
+    if result:
+        print("Inbox check completed with one or more request/deadline failures.", file=stderr)
+    return True
+
+
+def run_tui(
+    *,
+    client: GuerrillaMailClient | None = None,
+    account_path: Path | str = DEFAULT_ACCOUNT_PATH,
+    stdin: TextIO = sys.stdin,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Run the small terminal menu; all external work remains in the core helpers."""
+
+    if client is None:
+        client = GuerrillaMailClient()
+    print("Local test-account helper", file=stdout)
+    print("Manual Reddit signup only; this tool never submits signup or opens links.", file=stdout)
+    while True:
+        print("\nMenu", file=stdout)
+        print("  1) Generate inbox + username + password", file=stdout)
+        print("  2) Check inbox for Reddit verification", file=stdout)
+        print("  3) Exit", file=stdout)
+        choice = _tui_readline("Select an option: ", stdin=stdin, stdout=stdout)
+        if choice is None or choice == "3":
+            print("\nExit.", file=stdout)
+            return 0
+        try:
+            if choice == "1":
+                _tui_generate(client=client, account_path=account_path, stdin=stdin, stdout=stdout)
+            elif choice == "2":
+                _tui_check(
+                    client=client,
+                    account_path=account_path,
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=stderr,
+                    clock=clock,
+                    sleep=sleep,
+                )
+            else:
+                print("Please select 1, 2, or 3.", file=stdout)
+        except (HelperError, OSError, ValueError) as error:
+            print(f"Failed: {_safe_text(error)}", file=stderr)
 
 
 def main(
@@ -1226,20 +1428,55 @@ def main(
     *,
     client: GuerrillaMailClient | None = None,
     account_path: Path | str | None = None,
+    stdin: TextIO | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     args = list(sys.argv[1:] if args is None else args)
+    stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
     try:
+        # A bare invocation is the interactive entry point, but must never turn
+        # a redirected job into a process waiting forever for input.
+        if not args:
+            if not (_stream_is_tty(stdin) and _stream_is_tty(stdout)):
+                print(
+                    "Interactive menu requires a TTY; use --help or an explicit "
+                    "non-interactive command (for example: python scripts/gen-test-accounts.py gen).",
+                    file=stderr,
+                )
+                return 2
+            path = Path(account_path or DEFAULT_ACCOUNT_PATH)
+            return run_tui(
+                client=client,
+                account_path=path,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                clock=clock,
+                sleep=sleep,
+            )
         parsed = parse_command_args(args)
         if parsed["command"] == "help":
             print(HELP_TEXT, file=stdout, end="")
             return 0
         path = Path(account_path or parsed.get("store") or DEFAULT_ACCOUNT_PATH)
+        if parsed["command"] == "tui":
+            if not (_stream_is_tty(stdin) and _stream_is_tty(stdout)):
+                print("The tui command requires an interactive TTY; use gen or check for non-interactive use.", file=stderr)
+                return 2
+            return run_tui(
+                client=client,
+                account_path=path,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                clock=clock,
+                sleep=sleep,
+            )
         if client is None:
             client = GuerrillaMailClient()
         if parsed["command"] == "gen":

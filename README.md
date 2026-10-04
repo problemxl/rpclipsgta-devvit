@@ -211,9 +211,13 @@ Two properties matter:
 
 Throwaway Reddit accounts for end-to-end testing are prepared only outside
 Devvit with the standalone Python helper `scripts/gen-test-accounts.py`.
-It accepts noninteractive `gen [1-10]` and `check [--wait seconds]` commands.
+It provides a standard-library interactive terminal menu (bare invocation or
+`tui`) with options to generate an inbox/credentials, check verification mail,
+and exit. It also accepts safe noninteractive `gen [1-10]` and
+`check [--wait seconds]` commands; these remain suitable for automation.
 Positive `--wait` values are hard overall polling windows; `--wait 0` performs
-one immediate poll. It uses bounded standard-library HTTP requests to create
+one immediate poll. A menu invocation with redirected/non-TTY input refuses
+immediately instead of waiting. It uses bounded standard-library HTTP requests to create
 Guerrilla Mail
 inboxes, keeps per-account session tokens/cookies, validates candidate
 verification links as exact HTTPS Reddit verification routes, and writes

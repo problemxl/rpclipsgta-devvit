@@ -36,7 +36,11 @@ package installation is required.
 # Show commands, limits, exit statuses, and safety notes
 python scripts/gen-test-accounts.py --help
 
-# Noninteractive commands
+# Interactive text menu (bare invocation or explicit tui; requires a TTY)
+python scripts/gen-test-accounts.py
+python scripts/gen-test-accounts.py tui
+
+# Noninteractive commands (safe for scripts and CI)
 python scripts/gen-test-accounts.py gen       # creates three accounts
 python scripts/gen-test-accounts.py gen 1
 python scripts/gen-test-accounts.py check --wait 120 --interval 10
@@ -46,9 +50,16 @@ python scripts/gen-test-accounts.py check --wait=0  # one immediate poll
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-The CLI is intentionally noninteractive: `gen` creates records and `check`
-checks inboxes. `check` redacts verification query tokens by default; use
-`--show-links` only when a human is ready to inspect a candidate manually.
+The menu is a small standard-library text UI: generate one inbox plus a
+username/password, display the generated email and username, and reveal the
+password only after an explicit confirmation; check saved inboxes for
+verification mail; or exit. It never signs up for Reddit or opens a link.
+`check` and the menu redact verification query tokens by default; use
+`--show-links` (CLI) or the menu confirmation only when a human is ready to
+inspect a candidate manually. The explicit `gen` and `check` commands remain
+noninteractive and suitable for scripts. Bare `python scripts/gen-test-accounts.py`
+or `tui` refuses immediately when stdin/stdout are not TTYs, so redirected jobs
+do not hang.
 A positive `--wait` is a hard overall polling window, including bounded network
 reads; `--wait 0` performs one immediate poll using the normal request timeout.
 Verification links are never opened automatically. The `--store PATH` option is
@@ -96,6 +107,6 @@ rm -f test-accounts.txt
   controlled terminal.
 - There is no automated Reddit signup and no guarantee that Reddit accepts a
   disposable address or the generated username.
-- The CLI is intentionally noninteractive and does not require Textual or
-  another third-party dependency. Use the injected/mock transport in tests for
-  deterministic automation.
+- The menu does not require Textual or another third-party dependency; it uses
+  standard-library terminal prompts. Use the injected/mock transport in tests
+  for deterministic automation.
