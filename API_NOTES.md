@@ -65,10 +65,16 @@ command surface:
 The relevant source is `src/lib/user-lock.ts`, `src/lib/history.ts`, and
 `src/actions/seed.ts`. The transaction mock shipped in the installed package
 is only a test double; the app's deterministic tests model WATCH's
-abort-on-change behavior explicitly. The app provides no reconciliation
-command or direct Redis admin access. Pending history rows are intentionally
-not auto-repaired: administrators must reconcile the Reddit result using
-separately controlled ownership-fenced tooling.
+abort-on-change behavior explicitly. The app provides a dev/QA-only reconciliation form for one exact pending row;
+its hardcoded environment guard runs before authorization, locking, or history
+access. The operator must inspect `context.reddit.getModerationLog()` and the
+target comment/ban and choose only a definite applied/not-applied result.
+Unknown outcomes remain pending; the tool never retries Reddit and never
+unlocks a user. Production is NO-GO for app-local recovery: pending rows and
+stuck locks require installation-owner-controlled tooling only after process
+quiescence, exact member identity, atomic WATCH fencing, and post-state
+verification. Never use an unconditional lock DEL or blindly resolve an
+ambiguous Reddit outcome.
 
 ---
 

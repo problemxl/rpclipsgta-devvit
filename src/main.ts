@@ -53,6 +53,12 @@ import {
   runSeedSafely,
   type SeedInput,
 } from './actions/seed.js';
+import {
+  buildReconcilePendingToast,
+  parsePendingResolution,
+  runReconcilePendingSafely,
+  type ReconcilePendingInput,
+} from './actions/reconcile-pending.js';
 import { actionForRule } from './lib/detection.js';
 import { ruleByNumber, RULES, type Rule } from './lib/rules.js';
 import { createHistoryStore } from './lib/history.js';
@@ -141,7 +147,7 @@ const escalateForm = Devvit.createForm(
       );
       console.log(
         `[escalate] app executed ${result.label} on u/${target.authorName} ` +
-          `(priors: ${result.priors}, recorded: ${result.recorded})`
+          `(priors: ${result.priors}, recorded: ${result.recorded}, finalized:${result.finalized})`
       );
       safeToast(context, buildSuccessToast({ result, targetUser: target.authorName, rule }));
     } catch (err) {
@@ -578,6 +584,85 @@ Devvit.addMenuItem({
   },
 });
 
+const reconcilePendingForm = Devvit.createForm(
+  {
+    title: 'Dev/QA reconcile pending action',
+    description:
+      'Inspect Reddit moderator log and the target comment/ban first. Unknown outcomes stay pending. ' +
+      'This tool never retries Reddit and never unlocks a user.',
+    acceptLabel: 'Reconcile',
+    fields: [
+      {
+        type: 'string',
+        name: 'username',
+        label: 'Target username',
+        required: true,
+        helpText: 'The username whose exact pending row is shown in the app logs/toast.',
+      },
+      {
+        type: 'string',
+        name: 'recordId',
+        label: 'Exact pending record id',
+        required: true,
+      },
+      {
+        type: 'select',
+        name: 'resolution',
+        label: 'Resolution',
+        required: true,
+        options: [
+          { label: 'Inspect only', value: 'inspect' },
+          { label: 'Reddit definitely applied — mark applied', value: 'applied' },
+          { label: 'Reddit definitely did not apply — remove pending row', value: 'not-applied' },
+        ],
+      },
+      {
+        type: 'boolean',
+        name: 'confirmExternalOutcome',
+        label: 'I inspected Reddit and the selected outcome is definite (not unknown)',
+      },
+    ],
+  },
+  async (event, context) => {
+    const actor = context.username?.trim() ?? '';
+    const resolution = parsePendingResolution(event.values.resolution);
+    if (!resolution) {
+      safeToast(context, 'No valid reconciliation resolution selected — action aborted.');
+      return;
+    }
+    const input: ReconcilePendingInput = {
+      subredditName: context.subredditName?.trim() ?? '',
+      actor,
+      username: typeof event.values.username === 'string' ? event.values.username : '',
+      recordId: typeof event.values.recordId === 'string' ? event.values.recordId : '',
+      resolution,
+      confirmExternalOutcome: event.values.confirmExternalOutcome === true,
+    };
+    const outcome = await runReconcilePendingSafely(
+      {
+        history: createHistoryStore(context.redis),
+        redis: context.redis,
+        authorizeActor: async (name, username) =>
+          (await context.reddit
+            .getModerators({ subredditName: name, username, limit: 1, pageSize: 1 })
+            .all()).length > 0,
+      },
+      input
+    );
+    safeToast(context, buildReconcilePendingToast(outcome));
+  }
+);
+
+Devvit.addMenuItem({
+  label: 'Reconcile pending action (dev/QA)',
+  description: 'Inspect and resolve one known pending Reddit outcome; never retries or unlocks',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: (_event, context) => {
+    context.ui.showForm(reconcilePendingForm);
+  },
+});
+
 function createPunishDeps(context: Devvit.Context): PunishDeps {
   return {
     history: createHistoryStore(context.redis),
@@ -635,6 +720,8 @@ function createEscalateFn(context: Devvit.Context): EscalateFn {
       priors: result.priors,
       rule_name: result.ruleName,
       recorded: result.recorded,
+      finalized: result.finalized,
+      ...(result.pendingRecordId ? { pending_record_id: result.pendingRecordId } : {}),
     };
   };
 }

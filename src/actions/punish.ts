@@ -49,7 +49,9 @@ export interface PunishResult {
   readonly ruleName: string;
   readonly recorded: boolean;
   /** True only when a stored pending marker was finalized after Reddit success. */
-  readonly finalized?: boolean;
+  readonly finalized: boolean;
+  /** Exact row id to give the dev/QA reconciliation operator when needed. */
+  readonly pendingRecordId?: string;
 }
 
 export interface WarningCommentInput {
@@ -188,7 +190,15 @@ export async function punish(
       recorded = false;
     }
     if (!recorded) {
-      console.error(`[punish] proceeding without a history record for ${input.targetUser}`);
+      // A Reddit action without a positively confirmed pending marker cannot
+      // be safely retried or reconciled. Fail closed before crossing the
+      // external side-effect boundary. If the append may have landed despite
+      // an ambiguous Redis reply, the returned id remains useful to an
+      // administrator inspecting the history; never guess by deleting it.
+      const id = pendingRecord?.id ? ` (${pendingRecord.id})` : '';
+      throw new Error(
+        `could not confirm pending history record${id}; no Reddit action was attempted`
+      );
     }
 
     let commentId = '';
@@ -231,6 +241,10 @@ export async function punish(
             `[punish] Reddit outcome unknown for ${input.targetUser}; ` +
               `pending record ${pendingRecord.id} retained for manual reconciliation: ${detail}`
           );
+          throw new Error(
+            `Reddit outcome unknown; pending record ${pendingRecord.id} retained. ` +
+              `Inspect Reddit before reconciliation; do not retry. Original error: ${detail}`
+          );
         } else {
           // A pre-call ownership failure proves this invocation did not start
           // Reddit work. Compensation is still conditional: removeOwned()
@@ -254,13 +268,31 @@ export async function punish(
 
     let finalized = false;
     if (recorded && pendingRecord) {
-      finalized = await deps.history.markApplied(input.targetUser, pendingRecord.id, {
-        redis: deps.redis,
-        key: lock.key,
-        token: lock.token,
-      });
+      // The lock is deliberately held through every bounded retry. Each
+      // attempt re-proves ownership; a lost lock stops retries rather than
+      // mutating history under a replacement owner.
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          await assertUserActionLockHeld(deps.redis, lock);
+          finalized = await deps.history.markApplied(input.targetUser, pendingRecord.id, {
+            redis: deps.redis,
+            key: lock.key,
+            token: lock.token,
+          });
+          if (finalized) break;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          console.error(
+            `[punish] finalization attempt ${attempt}/3 for ${pendingRecord.id} stopped: ${detail}`
+          );
+          break;
+        }
+      }
       if (!finalized) {
-        console.error(`[punish] Reddit action applied but pending record ${pendingRecord.id} could not be finalized`);
+        console.error(
+          `[punish] Reddit action applied but pending record ${pendingRecord.id} ` +
+            'could not be finalized after 3 safe attempts'
+        );
       }
     }
 
@@ -273,6 +305,7 @@ export async function punish(
       ruleName: rule.name,
       recorded,
       finalized,
+      ...(pendingRecord ? { pendingRecordId: pendingRecord.id } : {}),
     };
   } finally {
     // A Redis release failure must never throw over an already-applied

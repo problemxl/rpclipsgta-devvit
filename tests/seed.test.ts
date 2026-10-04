@@ -48,25 +48,42 @@ class FakeLockRedis implements RedisStringLike {
     const redis = this;
     const snapshot = new Map(keys.map((key) => [key, this.values.get(key)]));
     let deletion: string[] = [];
+    let zremCount = 0;
+    let zaddCount = 0;
+    let multiStarted = false;
     const transaction = {
-      async multi() {},
+      async multi() {
+        multiStarted = true;
+      },
       async del(...names: string[]) {
+        if (!multiStarted) throw new Error('MULTI required');
         deletion = names;
         return transaction;
       },
-      async zRem() {
+      async zRem(_key: string, _members: string[]) {
+        if (!multiStarted) throw new Error('MULTI required');
+        zremCount += 1;
         return transaction;
       },
-      async zAdd() {
+      async zAdd(_key: string, ..._members: { member: string; score: number }[]) {
+        if (!multiStarted) throw new Error('MULTI required');
+        zaddCount += 1;
         return transaction;
       },
-      async exec() {
+      async exec(): Promise<unknown[]> {
+        if (!multiStarted) throw new Error('MULTI required');
         if (keys.some((key) => redis.values.get(key) !== snapshot.get(key))) return [];
         for (const name of deletion) await redis.del(name);
-        return deletion.map(() => 'OK');
+        return [
+          ...deletion.map(() => 1),
+          ...Array.from({ length: zremCount }, () => 1),
+          ...Array.from({ length: zaddCount }, () => 1),
+        ];
       },
       async discard() {
         deletion = [];
+        zremCount = 0;
+        zaddCount = 0;
       },
     };
     return transaction;

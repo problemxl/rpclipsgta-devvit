@@ -101,8 +101,9 @@ export function ruleLabel(rule: Rule): string {
 /**
  * Success toast for a completed escalation. Warns show the rule
  * (`Warned u/x (R2 — Toxicity)`), bans show the ladder label
- * (`Banned u/x — 7 day ban`). Appends `(not recorded)` when the action
- * executed but its Redis history record could not be written.
+ * (`Banned u/x — 7 day ban`). A Reddit success whose pending history marker
+ * could not be finalized is called out as `finalized:false`; it must never
+ * look like an ordinary completed success because retry remains blocked.
  */
 export function buildSuccessToast(params: {
   result: PunishResult;
@@ -116,6 +117,10 @@ export function buildSuccessToast(params: {
     result.action === 'warn'
       ? `Warned u/${targetUser} (${ruleLabel(rule)})`
       : `Banned u/${targetUser} — ${result.label}`;
+  if (result.finalized === false) {
+    const record = result.pendingRecordId ? ` Record: ${result.pendingRecordId}.` : '';
+    return `${summary} [finalized:false] Reddit action applied; history finalization failed.${record} Do not retry; reconcile the pending record.`;
+  }
   return result.recorded ? summary : `${summary} (not recorded)`;
 }
 

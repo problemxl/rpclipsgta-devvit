@@ -25,7 +25,7 @@ const COMMENT: CommentLike = {
 };
 const BAN_RESULT: PunishResult = {
   action: 'ban', durationDays: 7, label: '7 day ban', commentId: '', priors: 2,
-  ruleName: 'Toxicity', recorded: true,
+  ruleName: 'Toxicity', recorded: true, finalized: true,
 };
 
 describe('target helpers', () => {
@@ -57,7 +57,7 @@ describe('toast builders', () => {
   it('formats rule labels', () => expect(ruleLabel(TOXICITY)).toBe('R2 — Toxicity'));
   it('formats a warning', () => {
     expect(buildSuccessToast({
-      result: { action: 'warn', durationDays: 0, label: 'Warning', commentId: 't1_x', priors: 0, ruleName: 'Toxicity', recorded: true },
+      result: { action: 'warn', durationDays: 0, label: 'Warning', commentId: 't1_x', priors: 0, ruleName: 'Toxicity', recorded: true, finalized: true },
       targetUser: 'spammer99', rule: TOXICITY,
     })).toBe('Warned u/spammer99 (R2 — Toxicity)');
   });
@@ -72,9 +72,19 @@ describe('toast builders', () => {
   });
   it('marks unrecorded warnings too', () => {
     expect(buildSuccessToast({
-      result: { action: 'warn', durationDays: 0, label: 'Warning', commentId: 't1_x', priors: 0, ruleName: 'Toxicity', recorded: false },
+      result: { action: 'warn', durationDays: 0, label: 'Warning', commentId: 't1_x', priors: 0, ruleName: 'Toxicity', recorded: false, finalized: true },
       targetUser: 'spammer99', rule: TOXICITY,
     })).toBe('Warned u/spammer99 (R2 — Toxicity) (not recorded)');
+  });
+  it('marks Reddit success with an unfinalized pending record prominently', () => {
+    expect(buildSuccessToast({
+      result: { ...BAN_RESULT, finalized: false },
+      targetUser: 'spammer99', rule: TOXICITY,
+    })).toContain('[finalized:false]');
+    expect(buildSuccessToast({
+      result: { ...BAN_RESULT, finalized: false },
+      targetUser: 'spammer99', rule: TOXICITY,
+    })).toContain('Do not retry');
   });
   it('keeps failure details short', () => expect(buildFailureToast('Reddit rejected the action')).toBe('Escalation failed: Reddit rejected the action'));
 });

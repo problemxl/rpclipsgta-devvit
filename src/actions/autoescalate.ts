@@ -38,6 +38,8 @@ export interface EscalateResult {
   readonly priors: number;
   readonly rule_name: string;
   readonly recorded: boolean;
+  readonly finalized: boolean;
+  readonly pending_record_id?: string;
 }
 
 export type EscalateFn = (payload: EscalatePayload) => Promise<EscalateResult>;
@@ -361,9 +363,11 @@ export function buildRemovalSuccessToast(
   ruleName?: string
 ): string {
   const label = `R${outcome.violation.rule}${ruleName ? ` — ${ruleName}` : ''}`;
-  return outcome.escalateResult
-    ? `Removed post (${label}) and escalated.`
-    : `Removed post (${label}); no escalation required.`;
+  if (!outcome.escalateResult) return `Removed post (${label}); no escalation required.`;
+  if (outcome.escalateResult.finalized === false) {
+    return `Removed post (${label}) and escalated [finalized:false]. Reddit action applied; history finalization failed. Do not retry; reconcile the pending record.`;
+  }
+  return `Removed post (${label}) and escalated.`;
 }
 
 /** Pure failure text used by the Devvit menu and unit tests. */
@@ -574,6 +578,10 @@ export function buildRemoveEscalateSuccessToast(params: {
     result.action === 'warn'
       ? `Removed & warned u/${targetUser} (${ruleLabel(rule)})`
       : `Removed & banned u/${targetUser} — ${result.label}`;
+  if (result.finalized === false) {
+    const record = result.pendingRecordId ? ` Record: ${result.pendingRecordId}.` : '';
+    return `${summary} [finalized:false] Reddit action applied; history finalization failed.${record} Do not retry; reconcile the pending record.`;
+  }
   return result.recorded ? summary : `${summary} (not recorded)`;
 }
 

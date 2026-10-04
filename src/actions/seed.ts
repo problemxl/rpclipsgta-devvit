@@ -13,24 +13,18 @@
  */
 
 import type { HistoryStore, ModActionRecord, RedisLeaseStore } from '../lib/history.js';
+import { DEV_QA_SUBREDDITS, isDevQaSubreddit } from '../lib/dev-qa.js';
 import {
   acquireUserActionLock,
   assertUserActionLockHeld,
   releaseUserActionLock,
 } from '../lib/user-lock.js';
 
-/** The only subreddits the seed tool may ever run in (dev and QA installs). */
-export const SEED_ALLOWED_SUBREDDITS = ['S17Cjn21GT', 'rpclipsgta_mod_dev'] as const;
+/** Compatibility names for the seed tool's public/tested allowlist API. */
+export const SEED_ALLOWED_SUBREDDITS = DEV_QA_SUBREDDITS;
 
 /** Case-insensitive allowlist match; subreddit names arrive in any casing. */
-export function isSeedAllowedSubreddit(subredditName: string | undefined): boolean {
-  const normalized = subredditName?.trim().toLowerCase();
-  return (
-    normalized !== undefined &&
-    normalized.length > 0 &&
-    SEED_ALLOWED_SUBREDDITS.some((allowed) => allowed.toLowerCase() === normalized)
-  );
-}
+export const isSeedAllowedSubreddit = isDevQaSubreddit;
 
 /** Inclusive integer bounds for the seed parameters. */
 export const SEED_MIN_PRIORS = 1;

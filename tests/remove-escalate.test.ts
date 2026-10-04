@@ -23,6 +23,7 @@ const WARN: PunishResult = {
   priors: 0,
   ruleName: 'Toxicity',
   recorded: true,
+  finalized: true,
 };
 const BAN: PunishResult = {
   action: 'ban',
@@ -32,6 +33,7 @@ const BAN: PunishResult = {
   priors: 1,
   ruleName: 'Toxicity',
   recorded: true,
+  finalized: true,
 };
 
 function input(overrides: Partial<RemoveEscalateInput> = {}): RemoveEscalateInput {
@@ -135,11 +137,24 @@ describe('remove & escalate toast builders', () => {
   it('marks actions whose history was not recorded', () => {
     expect(
       buildRemoveEscalateSuccessToast({
-        result: { ...WARN, recorded: false },
+        result: { ...WARN, recorded: false, finalized: true },
         targetUser: 'poster',
         rule: TOXICITY,
       })
     ).toBe('Removed & warned u/poster (R2 — Toxicity) (not recorded)');
+  });
+
+  it('marks Reddit success with an unfinalized pending record prominently', () => {
+    expect(buildRemoveEscalateSuccessToast({
+      result: { ...WARN, finalized: false },
+      targetUser: 'poster',
+      rule: TOXICITY,
+    })).toContain('[finalized:false]');
+    expect(buildRemoveEscalateSuccessToast({
+      result: { ...WARN, finalized: false },
+      targetUser: 'poster',
+      rule: TOXICITY,
+    })).toContain('Do not retry');
   });
 
   it('reports already-processed presses', () => {

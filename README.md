@@ -78,8 +78,10 @@ rules, and optionally supplies a reason. The app resolves the target and then:
    only through an ownership-fenced WATCH transaction; if ownership is lost,
    the row is retained. After confirming that Reddit applied the action, an
    administrator must finalize the pending row before retrying. Reddit
-   execution is still attempted even if recording fails; the success toast then includes `(not recorded)`. Bans are refused
-   outright when the resolved subreddit name is empty.
+   execution is **not** attempted unless Redis positively confirms the pending
+   row was added (`ZADD` reply exactly `1`); an append error, zero, malformed,
+   or ambiguous result fails closed before Reddit. Bans are refused outright
+   when the resolved subreddit name is empty.
 6. Releases the lock in a `finally` block — only when it was acquired. The
    flow also checks ownership immediately before the history append and before
    the Reddit call, and fails closed if the owner token changed. A Redis
@@ -106,7 +108,12 @@ The toast formats remain:
 
 - warning: `Warned u/x (R2 — Toxicity)`
 - ban: `Banned u/x — 7 day ban`
-- either action can append ` (not recorded)` when Redis history cannot be saved.
+- a Reddit success whose marker is not finalized is prominently shown as
+  `[finalized:false] ... Do not retry; reconcile the pending record`, including
+  the exact row id when available. Bounded finalization retries run while the
+  owner lock is held.
+- an unrecorded action is no longer a success state: the Reddit call is
+  prevented until the pending row is confirmed.
 
 ## Moderator clip fixtures
 
@@ -265,28 +272,41 @@ Testing playbook:
 3. **Decay:** seed 1 prior at age 90 days and trigger a violation — the rung
    must have decayed back to a warning. Clear the user between scenarios.
 
-### Stuck-lock operational recovery
+### Dev/QA recovery and production NO-GO
 
-The app intentionally exposes no lock-recovery menu. Do not run an
+The **Reconcile pending action (dev/QA)** moderator tool is a safe, bounded
+workflow for the two allowlisted installations (`S17Cjn21GT` and
+`rpclipsgta_mod_dev`). It requires the exact username and pending row id,
+rechecks moderator membership, acquires the same non-expiring per-user lock,
+and offers inspect-only, definitely-applied, or definitely-not-applied. The
+operator must inspect Reddit's moderator log and the target comment or ban
+before selecting a definite outcome. It never retries Reddit, never guesses
+an ambiguous outcome, and never deletes a lock. Each mutation is WATCH-fenced
+against both the owner token and history member, validates numeric
+`ZREM`/`ZADD` EXEC replies, and verifies post-state while the lock is held.
+Unknown, missing, corrupt, or conflicting state remains unresolved.
+
+Stuck-lock recovery is deliberately **not** an in-app feature. Do not run an
 unconditional `DEL punish:lock:{user}`: it can delete a newer owner while an
-old request is still able to call Reddit. First obtain an external quiescence
-guarantee (stop or drain the relevant worker, or otherwise prove that the old
-invocation and its Reddit request are dead). Then use an administrator Redis
-tool that supports compare-and-delete against the exact observed owner token.
-If that primitive or the quiescence proof is unavailable, leave the lock in
-place and escalate operationally; do not guess, force-delete, or retry the
-moderation action. This is an operational procedure, not a fencing guarantee.
+old request is still able to call Reddit. If reconciliation reports a held
+lock, stop and escalate; do not assume age or a moderator confirmation proves
+the old request is dead.
 
-For a `state: pending` action, inspect Reddit's moderator log and the target
-comment/ban first. The app does not provide a reconciliation command or direct
-Redis admin access. If Reddit definitely applied the action, an administrator
-must use separately controlled Redis tooling that ownership-fences the exact
-history member to finalize it; if Reddit definitely did not apply it, use the
-same ownership-fenced tooling to remove that exact pending member. If the
-outcome remains uncertain, leave the row pending. The app intentionally
-provides no automatic retry or in-app history-repair menu. If suitable
-ownership-fenced tooling is unavailable, escalate to the installation owner;
-do not edit the sorted set with an unconditional command.
+**Production is NO-GO for automated recovery/reconciliation.** This repository
+has no supported production Redis admin command and the Devvit runtime cannot
+fence a Reddit request that already started. For production, the installation
+owner must first stop/drain the relevant worker and prove the old invocation
+and Reddit request cannot complete; inspect the Reddit moderator log and target
+state; then use separately controlled Redis tooling with an atomic
+compare-and-delete/`WATCH` transaction against the exact observed owner token
+and exact serialized pending member. Confirm the post-state before restoring
+traffic. Confirmed applied means replace only that member with its state-less
+record; confirmed not-applied means remove only that member; uncertain means
+leave it pending and do not retry. A timeout, old timestamp, absent comment
+lookup, or operator assertion is not proof. If quiescence, direct access,
+exact identity, atomic fencing, or post-verification is unavailable, leave the
+row/lock in place and escalate to the installation owner. Never blindly
+resolve an ambiguous Reddit outcome or force-unlock in production.
 
 ## Publish checklist
 
@@ -308,6 +328,12 @@ do not edit the sorted set with an unconditional command.
 7. Smoke-test fixtures from a source post containing a real-looking Twitch or
    Kick clip URL. Choose each target once, verify the exact URL and title prefix,
    then repeat the action to confirm no second post is created.
+8. In dev/QA, induce an ambiguous Reddit result and run the reconciliation drill:
+   inspect the moderator log, verify retry is blocked while pending, reconcile
+   only a definite result by exact row id, verify the row post-state, and
+   confirm retry is possible only after successful reconciliation. Any failure
+   of append confirmation, strict numeric EXEC validation, finalization toast,
+   exact reconciliation, or retry fencing is a **production NO-GO**.
 
 ## Development
 

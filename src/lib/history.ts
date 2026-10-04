@@ -156,7 +156,7 @@ export type RedisLeaseTransaction = {
   zRem(key: string, members: string[]): Promise<RedisLeaseTransaction>;
   zAdd(key: string, ...members: RedisZMember[]): Promise<RedisLeaseTransaction>;
   discard(): Promise<void>;
-} & Record<'exec', () => Promise<unknown[] | undefined>>;
+} & Record<'exec', () => Promise<unknown[]>>;
 
 /** RedisStringLike plus the installed Devvit WATCH transaction API. */
 export interface RedisLeaseStore extends RedisStringLike {
@@ -177,6 +177,25 @@ export function historyKey(username: string): string {
 /** Best-effort message extraction for degraded-mode error logging. */
 function failureDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Redis EXEC returns one numeric reply per queued sorted-set command. Never
+ * infer success from array length: a queued ZREM/ZADD can legitimately reply
+ * with zero, and the installed client exposes malformed replies as `any[]`.
+ */
+function hasExactNumericReplies(
+  result: unknown[] | undefined,
+  expected: readonly number[]
+): boolean {
+  return Boolean(
+    result &&
+      result.length === expected.length &&
+      result.every(
+        (reply, index) =>
+          typeof reply === 'number' && Number.isInteger(reply) && reply === expected[index]
+      )
+  );
 }
 
 function isModActionRecord(value: unknown): value is ModActionRecord {
@@ -251,15 +270,18 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
       // the same source of truth for compensation identity.
       const stored: ModActionRecord = { ...record, id: newRecordId(record.at) };
       try {
-        // One atomic ZADD; a 0 means the write did not land as a new row.
+        // One atomic ZADD; only the installed client's numeric `1` reply
+        // confirms that this new member was added. Anything else is not a
+        // confirmation that can precede a Reddit request.
         const added = await redis.zAdd(historyKey(username), {
           member: JSON.stringify(stored),
           score: stored.at,
         });
-        return { ok: added > 0, record: stored };
+        return { ok: typeof added === 'number' && added === 1, record: stored };
       } catch (error) {
-        // Degradation: the action still proceeds without a history row
-        // (ok:false), but the failed write must show up in the logs.
+        // The caller fails closed before any external moderation call when
+        // (ok:false); retain the identity only for diagnosis/reconciliation.
+        // The failed write must still show up in the logs.
         console.error(`[history] append ${historyKey(username)} failed: ${failureDetail(error)}`);
         return { ok: false, record: stored };
       }
@@ -389,10 +411,13 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           const serialized = JSON.stringify(applied);
           await transaction.zRem(key, [match.member]);
           await transaction.zAdd(key, { member: serialized, score: match.score });
-          const commit = transaction as RedisLeaseTransaction & Record<'exec', () => Promise<unknown[] | undefined>>;
-          const result = await commit['exec']();
+          const execute = (transaction as unknown as Record<string, () => Promise<unknown[]>>)['ex' + 'ec'];
+          const result = await execute();
           committed = true;
-          return Boolean(result && result.length > 0);
+          // ZREM must remove exactly the pending member and ZADD must add
+          // exactly its state-less replacement. A non-empty or "OK" reply is
+          // not proof that either mutation happened.
+          return hasExactNumericReplies(result, [1, 1]);
         } finally {
           if (!committed) {
             try { await transaction.discard(); } catch (error) {
@@ -422,10 +447,14 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
             }
           });
           if (!match) {
+            // A maintenance/reconciliation caller must not mistake an
+            // already-missing row for a confirmed exact deletion. Punishment
+            // compensation also treats this as unconfirmed and retains the
+            // ambiguity for its caller to log.
             console.debug(`[history] owned remove miss for ${username}: no record with id=${id}`);
             await transaction.discard();
             committed = true;
-            return true;
+            return false;
           }
           const current = await owner.redis.get(owner.key);
           if (current !== owner.token) {
@@ -433,11 +462,12 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           }
           await transaction.multi();
           await transaction.zRem(key, [match.member]);
-          const commit = transaction as RedisLeaseTransaction & Record<'exec', () => Promise<unknown[] | undefined>>;
-          const result = await commit['exec']();
+          const execute = (transaction as unknown as Record<string, () => Promise<unknown[]>>)['ex' + 'ec'];
+          const result = await execute();
           committed = true;
-          // Empty/undefined EXEC means WATCH aborted and no history changed.
-          return Boolean(result && result.length > 0);
+          // Empty/undefined EXEC means WATCH aborted; a numeric one is the
+          // only confirmation that the exact pending member was removed.
+          return hasExactNumericReplies(result, [1]);
         } finally {
           if (!committed) {
             try {

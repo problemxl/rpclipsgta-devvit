@@ -20,6 +20,7 @@ const RESULT: EscalateResult = {
   priors: 0,
   rule_name: 'Toxicity',
   recorded: true,
+  finalized: true,
 };
 
 function input(overrides: Partial<ModRemovalInput> = {}): ModRemovalInput {
