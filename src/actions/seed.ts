@@ -62,6 +62,12 @@ export interface SeedDeps {
 /** The two operations the tool performs on one user's history. */
 export type SeedOperation = 'seed' | 'clear';
 
+/** Parse a select field without defaulting tampered or missing values. */
+export function parseSeedOperation(values: readonly string[] | undefined): SeedOperation | undefined {
+  if (!values || values.length !== 1) return undefined;
+  return values[0] === 'seed' || values[0] === 'clear' ? values[0] : undefined;
+}
+
 export interface SeedInput {
   readonly subredditName: string;
   /** Authenticated moderator identity from the form context, never form input. */
@@ -180,7 +186,10 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
     }
 
     // -- 'seed': validate both numbers before any write ---------------------
-    if (input.operation === 'seed' && !isIntegerInRange(input.priors, SEED_MIN_PRIORS, SEED_MAX_PRIORS)) {
+    if (
+      input.operation === 'seed' &&
+      !isIntegerInRange(input.priors, SEED_MIN_PRIORS, SEED_MAX_PRIORS)
+    ) {
       return audit({
         status: 'invalid',
         detail: `priors must be a whole number ${SEED_MIN_PRIORS}-${SEED_MAX_PRIORS}`,

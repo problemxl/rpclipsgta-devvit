@@ -13,6 +13,7 @@ import {
   buildSeedToast,
   isSeedAllowedSubreddit,
   normalizeSeedUsername,
+  parseSeedOperation,
   runSeedSafely,
   seedHistory,
   SEED_ALLOWED_SUBREDDITS,
@@ -135,6 +136,20 @@ describe('isSeedAllowedSubreddit', () => {
     expect(isSeedAllowedSubreddit('rpclipsgta_test')).toBe(false);
     expect(isSeedAllowedSubreddit('')).toBe(false);
     expect(isSeedAllowedSubreddit(undefined)).toBe(false);
+  });
+});
+
+describe('parseSeedOperation', () => {
+  it('accepts exactly one known form value', () => {
+    expect(parseSeedOperation(['seed'])).toBe('seed');
+    expect(parseSeedOperation(['clear'])).toBe('clear');
+  });
+
+  it('rejects missing, repeated, and tampered form values', () => {
+    expect(parseSeedOperation(undefined)).toBeUndefined();
+    expect(parseSeedOperation([])).toBeUndefined();
+    expect(parseSeedOperation(['seed', 'clear'])).toBeUndefined();
+    expect(parseSeedOperation(['delete'])).toBeUndefined();
   });
 });
 

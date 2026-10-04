@@ -49,9 +49,9 @@ import {
 } from './actions/fixture.js';
 import {
   buildSeedToast,
+  parseSeedOperation,
   runSeedSafely,
   type SeedInput,
-  type SeedOperation,
 } from './actions/seed.js';
 import { actionForRule } from './lib/detection.js';
 import { ruleByNumber, RULES, type Rule } from './lib/rules.js';
@@ -528,8 +528,12 @@ const seedForm = Devvit.createForm(
     // before calling seedHistory, which re-validates the bounds anyway.
     const priors = numericFormValue(event.values.priors);
     const latestAgeDays = numericFormValue(event.values.latestAgeDays);
-    const operation: SeedOperation = event.values.operation?.[0] === 'clear' ? 'clear' : 'seed';
+    const operation = parseSeedOperation(event.values.operation);
     const actor = context.username?.trim();
+    if (!operation) {
+      safeToast(context, 'No valid operation selected — action aborted.');
+      return;
+    }
     if (!actor) {
       safeToast(context, 'Could not determine the acting moderator. Action aborted.');
       return;
