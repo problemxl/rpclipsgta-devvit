@@ -15,17 +15,20 @@ A self-contained moderator-actions Devvit app for r/RPClipsGTA. It provides:
 - **Seed test history**: dev/QA-only moderator tool to place a user at any
   ladder position (or reset them) for testing escalation and decay.
 
-There is no external escalation endpoint, Python runtime, PocketBase dependency,
-network allowlist, or app secret. The Devvit entry point and its dependency graph
-never import or invoke anything under `scripts/`, never use `fetch` or a mail
-client, and never connect to Guerrilla Mail or any other mail server. All app
-execution happens through Devvit's Reddit and Redis APIs.
+There is no external escalation endpoint, Python runtime bundled into the app,
+PocketBase dependency, network allowlist, or app secret. The Devvit entry point
+and its dependency graph never import or invoke anything under `scripts/`, never
+use `fetch` or a mail client, and never connect to Guerrilla Mail or any other
+mail server. All app execution happens through Devvit's Reddit and Redis APIs.
 
-The only email/network helper is the local, manually invoked
-`scripts/gen-test-accounts.mjs` CLI. It is not bundled with or imported by the
-app, and it is not run by any app path or package lifecycle script. Account
-signup remains manual; use the helper only outside Devvit when preparing local
-end-to-end test accounts.
+The local, manually invoked `scripts/gen-test-accounts.py` helper is a standalone
+Python tool outside Devvit. It is not bundled with or imported by the app, and it
+is not run by an app path or package lifecycle script. It uses only the Python
+standard library to create Guerrilla Mail inboxes and generate credentials.
+Account signup remains manual: it never calls Reddit signup APIs, uses a Reddit
+browser/API, bypasses CAPTCHA, or opens verification links automatically. See
+`docs/test-account-helper.md` for its security, session, storage, and testing
+details.
 
 ## In-app escalation engine
 
@@ -206,17 +209,19 @@ Two properties matter:
   does not auto-clear existing or partial history; clear explicitly before
   retrying.
 
-Throwaway Reddit accounts for end-to-end testing are prepared, only outside
-Devvit, with the local CLI `scripts/gen-test-accounts.mjs` (credentials +
-disposable inboxes; signups stay manual). The CLI is the repository's sole
-email/network helper: the app does not import, bundle, invoke, or share its
-Guerrilla Mail logic, and the Devvit manifest has no generic HTTP permission.
-The helper accepts `gen [1-10]` and `check [--wait seconds]` or
-`check [--wait=seconds]`, applies request timeouts, validates Reddit verification
-links as exact HTTPS `reddit.com`/`www.reddit.com` URLs, and writes the local
-credential file with mode `0600`. `test-accounts.txt` is gitignored; do not
-paste or commit it. The helper never calls Reddit signup APIs or any Reddit
-endpoint; use the normal Reddit signup UI manually.
+Throwaway Reddit accounts for end-to-end testing are prepared only outside
+Devvit with the standalone Python helper `scripts/gen-test-accounts.py`.
+It accepts noninteractive `gen [1-10]` and `check [--wait seconds]` commands.
+Positive `--wait` values are hard overall polling windows; `--wait 0` performs
+one immediate poll. It uses bounded standard-library HTTP requests to create
+Guerrilla Mail
+inboxes, keeps per-account session tokens/cookies, validates candidate
+verification links as exact HTTPS Reddit verification routes, and writes
+`test-accounts.txt` atomically with mode `0600`. Verification links are printed
+as candidates for cautious human review; query tokens are redacted unless
+`check --show-links` is explicitly requested. `test-accounts.txt` is gitignored;
+never paste or commit it. The helper never calls Reddit signup APIs or any
+Reddit endpoint; use the normal Reddit signup UI manually.
 
 Testing playbook:
 
@@ -232,19 +237,21 @@ Testing playbook:
 ## Publish checklist
 
 1. Run `npm run build && npm test` — both must be green.
-2. `devvit login`.
-3. `devvit upload` (or `devvit publish`). No secrets or external URL settings
+2. Run `python -m unittest discover -s tests -p 'test_*.py'` — local helper tests
+   are deterministic and do not call Guerrilla Mail.
+3. `devvit login`.
+4. `devvit upload` (or `devvit publish`). No secrets or external URL settings
    are required.
-4. Install the app to the source and test subreddits via the app installation
+5. Install the app to the source and test subreddits via the app installation
    page (`https://developers.reddit.com/r/<subreddit>/apps`). Fixture creation
    is intended only for source posts in `r/rpclipsgta`; the handler rejects
    other source subreddits.
-5. Smoke-test escalation with a test account. Confirm a fresh account gets the
+6. Smoke-test escalation with a test account. Confirm a fresh account gets the
    warning toast (`Warned u/... (R1 — Reddit Rules)`), the warning reply, and a
    Redis history record. Exercise repeat and decay rungs before production use
    — in the dev/QA subreddits the **Seed test history** tool (see *Testing the
    ladder*) places any user on any rung in seconds.
-6. Smoke-test fixtures from a source post containing a real-looking Twitch or
+7. Smoke-test fixtures from a source post containing a real-looking Twitch or
    Kick clip URL. Choose each target once, verify the exact URL and title prefix,
    then repeat the action to confirm no second post is created.
 
@@ -271,3 +278,6 @@ npm test        # vitest run — unit tests, no network or Devvit runtime
 - `tests/ladder.test.ts`, `tests/history.test.ts`, `tests/punish.test.ts`,
   `tests/seed.test.ts` — deterministic engine, storage, execution, and
   dev/QA-seeding coverage.
+- `tests/test_gen_test_accounts.py` — offline mocked transport, CLI,
+  URL, session, permission, and atomic-storage coverage for the standalone
+  helper.

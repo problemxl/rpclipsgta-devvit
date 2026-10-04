@@ -3,3 +3,10 @@ dist/
 .devvit/
 .env
 test-accounts.txt
+test-accounts.txt.lock
+# Local Python helper state and caches
+.test-accounts.txt.*.tmp
+scripts/.test-accounts.*.tmp
+scripts/__pycache__/
+tests/__pycache__/
+*.py[cod]

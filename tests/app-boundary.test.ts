@@ -115,7 +115,7 @@ describe('Devvit app boundary', () => {
     expect(graph.externalSpecifiers).toEqual(['@devvit/public-api']);
     expect(appBoundaryViolations(allSource)).toEqual([]);
     expect(
-      allSource.some((file) => /gen-test-accounts|scripts\//i.test(readFileSync(file, 'utf8')))
+      allSource.some((file) => /gen-test-accounts|scripts\/|test-accounts\.txt|Guerrilla/i.test(readFileSync(file, 'utf8')))
     ).toBe(false);
 
     const manifest = readFileSync(join(REPOSITORY_ROOT, 'devvit.yaml'), 'utf8');
@@ -131,7 +131,7 @@ describe('Devvit app boundary', () => {
       scripts?: Record<string, string>;
     };
     expect(Object.values(packageJson.scripts ?? {}).join('\n')).not.toMatch(
-      /gen-test-accounts|guerrilla|smtp|imap|pop3/i
+      /gen-test-accounts|guerrilla|smtp|imap|pop3|python .*test-account/i
     );
     const runtimeDependencies = Object.keys(packageJson.dependencies ?? {});
     const forbiddenRuntimeDependency =

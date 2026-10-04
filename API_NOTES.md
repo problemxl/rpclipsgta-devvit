@@ -6,7 +6,8 @@
 > configure `http`, call `fetch`, use PocketBase, or declare email/password
 > settings. Do not apply those retired examples to the current app. The only
 > network/email helper in this repository is the explicitly local
-> `scripts/gen-test-accounts.mjs` CLI, which is outside the Devvit bundle.
+> `scripts/gen-test-accounts.py` CLI, which is outside the Devvit bundle and is
+> not imported by the app.
 
 All signatures below are quoted/verified from the installed typings under
 `node_modules/@devvit/public-api` (and its `@devvit/*` dependencies). Import
