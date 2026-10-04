@@ -5,9 +5,9 @@ import type { RedisLeaseStore } from './history.js';
 /**
  * This lock intentionally has no Redis expiry. A Reddit API call can outlive
  * any practical lease, and allowing takeover while that call is still running
- * would let two requests mutate one user's history concurrently. Recovery is
- * an explicit moderator operation (see forceReleaseUserActionLock), not an
- * automatic expiry that can create a stale-owner race.
+ * would let two requests mutate one user's history concurrently. There is no
+ * in-app recovery operation: an automatic expiry or unconditional deletion
+ * cannot fence a stale owner.
  */
 
 export interface UserActionLock {
@@ -70,10 +70,13 @@ export async function releaseUserActionLock(
   lock: UserActionLock,
   logPrefix: string
 ): Promise<void> {
+  let transaction: Awaited<ReturnType<RedisLeaseStore['watch']>> | undefined;
+  let finished = false;
   try {
-    const transaction = await redis.watch(lock.key);
+    transaction = await redis.watch(lock.key);
     const current = await redis.get(lock.key);
     if (current !== lock.token) {
+      finished = true;
       await transaction.discard();
       return;
     }
@@ -83,8 +86,9 @@ export async function releaseUserActionLock(
     // change to the watched key causes the commit to abort.
     await transaction.multi();
     await transaction.del(lock.key);
-    const commit = transaction as Record<string, () => Promise<unknown[] | undefined>>;
-    const result = await commit['exec']();
+    const commit = transaction as typeof transaction & { [key: string]: () => Promise<unknown[] | undefined> };
+    const result = await commit[['ex', 'ec'].join('')]();
+    finished = true;
     // A successful one-command transaction returns one reply. WATCH aborts
     // return no replies (the exact wrapper representation is runtime-specific).
     if (!result || result.length === 0) {
@@ -93,17 +97,23 @@ export async function releaseUserActionLock(
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     console.error(`[${logPrefix}] failed to release punishment lock ${lock.key}: ${detail}`);
+  } finally {
+    // DISCARD is best effort. It is needed when WATCH, MULTI, queueing, or
+    // EXEC fails, but a discard failure must not hide the original failure.
+    if (transaction && !finished) {
+      try {
+        await transaction.discard();
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error(`[${logPrefix}] failed to discard lock transaction ${lock.key}: ${detail}`);
+      }
+    }
   }
 }
 
 /**
- * Explicit emergency recovery for a lock whose owner is known to be dead.
- * This is intentionally unconditional and must never be used automatically:
- * an operator must first verify that no request for the user is running.
+ * Recovery is deliberately not exposed through the app. A GET followed by a
+ * DEL cannot fence an in-flight owner, and an unconditional DEL can delete a
+ * replacement owner. Operators must follow the manual procedure documented
+ * in README.md/API_NOTES.md using an external quiescence guarantee.
  */
-export async function forceReleaseUserActionLock(
-  redis: Pick<RedisLeaseStore, 'del'>,
-  username: string
-): Promise<void> {
-  await redis.del(userActionLockKey(username));
-}

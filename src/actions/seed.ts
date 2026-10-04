@@ -285,12 +285,29 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
       }
 
       await assertUserActionLockHeld(deps.redis, lock);
-      const verified = await deps.history.summaryStrict(username);
       const expectedLatestAt = at - latestAgeDays * DAY_MS;
+      const verified = await deps.history.summaryStrict(username);
+      const verifiedRows = await deps.history.loadStrict(username);
+      const expectedTimes = Array.from(
+        { length: priors },
+        (_, index) => at - (latestAgeDays + (priors - index - 1)) * DAY_MS
+      );
+      const exactRows =
+        verifiedRows.ok &&
+        verifiedRows.rows.length === priors &&
+        verifiedRows.rows.every((row, index) =>
+          row.at === expectedTimes[index] &&
+          row.rule === SEED_RECORD_FIELDS.rule &&
+          row.action === SEED_RECORD_FIELDS.action &&
+          row.label === SEED_RECORD_FIELDS.label &&
+          row.modUser === SEED_RECORD_FIELDS.modUser &&
+          row.targetThingId === SEED_RECORD_FIELDS.targetThingId
+        );
       if (
         !verified.ok ||
         verified.summary.total !== priors ||
-        verified.summary.latestAt !== expectedLatestAt
+        verified.summary.latestAt !== expectedLatestAt ||
+        !exactRows
       ) {
         return audit({
           status: 'failed',

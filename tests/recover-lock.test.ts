@@ -11,9 +11,12 @@ class FakeRedis {
   delCalls: string[] = [];
   failDelete = false;
 
+  async get(key: string): Promise<string | undefined> {
+    return this.values.get(key);
+  }
+
   async del(key: string): Promise<void> {
     this.delCalls.push(key);
-    if (this.failDelete) throw new Error('redis unavailable');
     this.values.delete(key);
   }
 }
@@ -54,31 +57,27 @@ describe('recoverUserActionLock', () => {
     expect(redis.delCalls).toEqual([]);
   });
 
-  it('deletes only the normalized user lock after authorized confirmation', async () => {
+  it('fails closed and does not mutate a lock even after confirmation', async () => {
     const redis = new FakeRedis();
     redis.values.set(userActionLockKey('ladder_user'), 'dead-owner');
 
     await expect(
       recoverUserActionLock({ redis, authorizeActor: async () => true }, input())
-    ).resolves.toEqual({ status: 'recovered', username: 'ladder_user' });
-    expect(redis.delCalls).toEqual([userActionLockKey('ladder_user')]);
-    expect(redis.values.has(userActionLockKey('ladder_user'))).toBe(false);
-  });
-
-  it('reports delete failures without claiming recovery', async () => {
-    const redis = new FakeRedis();
-    redis.failDelete = true;
-
-    await expect(
-      recoverUserActionLock({ redis, authorizeActor: async () => true }, input())
-    ).resolves.toMatchObject({ status: 'failed', detail: 'lock may still be held: redis unavailable' });
+    ).resolves.toEqual({
+      status: 'disabled',
+      detail: 'in-app recovery is disabled; follow the manual quiescence procedure in the runbook',
+    });
+    expect(redis.values.get(userActionLockKey('ladder_user'))).toBe('dead-owner');
   });
 });
 
 describe('buildLockRecoveryToast', () => {
-  it('warns the operator that recovery is an emergency action', () => {
+  it('warns the operator that in-app recovery is disabled', () => {
     expect(
-      buildLockRecoveryToast({ status: 'recovered', username: 'ladder_user' })
-    ).toBe('Recovered the action lock for u/ladder_user; verify no action is still running');
+      buildLockRecoveryToast({
+        status: 'disabled',
+        detail: 'follow the manual quiescence procedure',
+      })
+    ).toBe('Lock recovery disabled: follow the manual quiescence procedure');
   });
 });

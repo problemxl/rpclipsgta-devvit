@@ -1,10 +1,13 @@
-/** Explicit moderator recovery for a stuck per-user action lock. */
+/**
+ * Retained as a fail-closed compatibility seam for callers that may still
+ * reference the former recovery action. The production menu is removed.
+ */
 
 import type { RedisLeaseStore } from '../lib/history.js';
-import { forceReleaseUserActionLock } from '../lib/user-lock.js';
+import { userActionLockKey } from '../lib/user-lock.js';
 
 export interface LockRecoveryDeps {
-  readonly redis: Pick<RedisLeaseStore, 'del'>;
+  readonly redis: Pick<RedisLeaseStore, 'get'>;
   readonly authorizeActor: (subredditName: string, actor: string) => Promise<boolean>;
 }
 
@@ -19,7 +22,7 @@ export interface LockRecoveryInput {
 export type LockRecoveryOutcome =
   | { readonly status: 'denied'; readonly detail: string }
   | { readonly status: 'invalid'; readonly detail: string }
-  | { readonly status: 'recovered'; readonly username: string }
+  | { readonly status: 'disabled'; readonly detail: string }
   | { readonly status: 'failed'; readonly detail: string };
 
 function detailOf(error: unknown): string {
@@ -42,9 +45,10 @@ function validUsername(username: string): boolean {
 }
 
 /**
- * Delete a lock only after an authenticated moderator explicitly confirms that
- * its owner is dead. This is emergency recovery, not an automatic timeout;
- * using it while a request is running can permit overlap and is unsafe.
+ * This menu is intentionally disabled. Redis has no fencing token that can
+ * make an already-running Reddit request harmless after lock deletion, so an
+ * in-app GET/DEL recovery would be unsafe. Operators must use the documented
+ * manual procedure only after establishing process-level quiescence.
  */
 export async function recoverUserActionLock(
   deps: LockRecoveryDeps,
@@ -79,20 +83,26 @@ export async function recoverUserActionLock(
     });
   }
 
+  // Keep the authorization and validation path testable, but fail closed
+  // before any mutation. There is no safe app-local compare-and-delete/fence.
   try {
-    await forceReleaseUserActionLock(deps.redis, username);
-    return audit({ status: 'recovered', username });
+    await deps.redis.get(userActionLockKey(username));
   } catch (error) {
     const detail = detailOf(error);
-    console.error(`[lock-recovery] failed for u/${username}: ${detail}`);
-    return audit({ status: 'failed', detail: `lock may still be held: ${detail}` });
+    console.error(`[lock-recovery] lock inspection failed for u/${username}: ${detail}`);
+    return audit({ status: 'failed', detail: `lock state could not be inspected: ${detail}` });
   }
+  return audit({
+    status: 'disabled',
+    detail:
+      'in-app recovery is disabled; follow the manual quiescence procedure in the runbook',
+  });
 }
 
 export function buildLockRecoveryToast(outcome: LockRecoveryOutcome): string {
   switch (outcome.status) {
-    case 'recovered':
-      return `Recovered the action lock for u/${outcome.username}; verify no action is still running`;
+    case 'disabled':
+      return `Lock recovery disabled: ${outcome.detail}`;
     case 'denied':
       return `Lock recovery denied: ${outcome.detail}`;
     case 'invalid':

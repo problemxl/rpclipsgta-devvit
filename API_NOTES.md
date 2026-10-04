@@ -40,25 +40,29 @@ command surface:
   value when NX declines the write; it does not expose Lua or an atomic
   compare-delete helper.
 - The installed client exposes `watch(...keys)`, returning a transaction with
-  `multi()`, queued `del()`, and `exec()`. The app reads the owner token after
-  WATCH, queues DEL only when it matches, and commits the transaction. A
-  changed watched key aborts the transaction, so release never performs an
-  unsafe GET-then-DEL.
+  `multi()`, queued `del()`/`zRem()`, `discard()`, and `exec()`. The app reads
+  the owner token after WATCH, queues destructive work only when it matches,
+  and commits the transaction. A changed watched key aborts the transaction,
+  so release and ownership-fenced compensation never perform an unsafe
+  GET-then-DEL or stale history mutation.
 - Redis has expiry support, but a 30-second lease is not sound for this flow:
   a Reddit request can run longer and then mutate history or perform an
   external action after a new owner takes over. The shared action lock is
-  therefore non-expiring. A crashed request can leave it held; the app offers
-  an authenticated, confirmation-gated **Recover stuck action lock** operation.
-  Recovery is intentionally manual and unsafe if used while a request is live.
-  Redis cannot cancel an already-started Reddit call, so the operator must
-  verify the old request is dead before recovery.
+  therefore non-expiring. The app intentionally exposes no recovery menu:
+  Redis cannot fence an already-started Reddit call, and an unconditional DEL
+  could delete a replacement owner. Operators must obtain external quiescence
+  and use a separate administrative compare-and-delete procedure documented in
+  README.md; if either guarantee is unavailable, leave the lock in place.
 - The Redis client has no atomic sorted-set replace operation. Seed therefore
   performs a strict summary read, rejects any non-empty history, appends the
   requested rows, and verifies count/newest score before reporting success.
   A partial batch remains visible and must be explicitly cleared before retry.
+  Punishment also uses strict summary reads; a Redis read failure never becomes
+  a fresh-user warning path. A started Reddit request that times out or throws
+  leaves its pending row for manual reconciliation because the external result
+  is ambiguous.
 
-The relevant source is `src/lib/user-lock.ts`, `src/actions/recover-lock.ts`,
-and `src/actions/seed.ts`. The transaction mock shipped in the installed
+The relevant source is `src/lib/user-lock.ts` and `src/actions/seed.ts`. The transaction mock shipped in the installed
 package is only a test double; the app's deterministic tests model WATCH's
 abort-on-change behavior explicitly.
 

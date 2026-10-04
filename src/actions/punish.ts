@@ -119,24 +119,15 @@ function pendingRecordFor(input: PunishInput, at: number, rung: LadderRung): Omi
   };
 }
 
-async function compensateRecord(
-  history: HistoryStore,
-  username: string,
-  record: ModActionRecord
-): Promise<void> {
-  try {
-    // Compensation is by the row's unique id, never by field comparison.
-    const removed = await history.remove(username, record.id);
-    if (!removed) {
-      console.error('[punish] execution failed; compensation could not remove the pending record');
-    }
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    console.error(`[punish] execution failed; history compensation failed: ${detail}`);
-  }
-}
-
-/** Execute the ladder under a per-user lock and record before Reddit execution. */
+/**
+ * Execute the ladder under a per-user lock and record before Reddit execution.
+ *
+ * The history row is a pending action marker. Once a Reddit request has been
+ * started, an exception or timeout has an ambiguous external outcome; the row
+ * is retained and reconciliation is manual. Removing it would make an
+ * already-applied warning/ban look like it never happened and could cause an
+ * unsafe automatic retry.
+ */
 export async function punish(
   deps: PunishDeps,
   input: PunishInput
@@ -150,16 +141,16 @@ export async function punish(
   const lock = await acquireUserActionLock(deps.redis, input.targetUser, input.modUser, now);
 
   try {
-    // Refuse to continue if an explicit recovery changed ownership before a
-    // history mutation. Redis read failures are also fail-closed here.
+    // Refuse to continue if an explicit operational recovery changed
+    // ownership before a history mutation. Redis read failures are fail-closed
+    // here: unknown history must never be treated as a fresh user.
     await assertUserActionLockHeld(deps.redis, lock);
     const at = now();
-    // history.summary() intentionally degrades redis read failures to a fresh
-    // history (total 0): an unreadable summary presents as no priors, so the
-    // action degrades to a warning rung — contained, rather than failing. Rung
-    // selection needs only that O(1)-ish summary (ZCARD + newest score); the
-    // full history is never loaded here.
-    const summary = await deps.history.summary(input.targetUser);
+    const strictSummary = await deps.history.summaryStrict(input.targetUser);
+    if (!strictSummary.ok) {
+      throw new Error('could not read action history; no Reddit action was attempted');
+    }
+    const summary = strictSummary.summary;
     const rung = pickRung(summary.total, summary.latestAt, at);
     const effective = effectivePriors(summary.total, summary.latestAt, at);
 
@@ -191,11 +182,13 @@ export async function punish(
     }
 
     let commentId = '';
+    let redditCallStarted = false;
     try {
       // A Reddit call cannot be rolled back once started. Check ownership at
-      // the last safe point so a recovered/stale request never starts a new
-      // external action after losing the shared lock.
+      // the last safe point so an operationally recovered request never starts
+      // a new external action after losing the shared lock.
       await assertUserActionLockHeld(deps.redis, lock);
+      redditCallStarted = true;
       if (rung.action === 'warn') {
         commentId = await deps.submitComment({
           text: buildWarningComment({
@@ -218,10 +211,33 @@ export async function punish(
         });
       }
     } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
       if (recorded && pendingRecord) {
-        // There is a tiny crash window between the Reddit action and this
-        // compensation; pending-first makes a failed action visible otherwise.
-        await compensateRecord(deps.history, input.targetUser, pendingRecord);
+        if (redditCallStarted) {
+          // Timeout/exception is not proof that Reddit rejected the request.
+          // Keep the marker and require an operator to reconcile Reddit before
+          // any retry; never auto-remove or auto-retry an ambiguous outcome.
+          console.error(
+            `[punish] Reddit outcome unknown for ${input.targetUser}; ` +
+              `pending record ${pendingRecord.id} retained for manual reconciliation: ${detail}`
+          );
+        } else {
+          // A pre-call ownership failure proves this invocation did not start
+          // Reddit work. Compensation is still conditional: removeOwned()
+          // watches the lock and refuses to mutate history after ownership is
+          // lost or changes during the transaction.
+          const removed = await deps.history.removeOwned(input.targetUser, pendingRecord.id, {
+            redis: deps.redis,
+            key: lock.key,
+            token: lock.token,
+          });
+          if (!removed) {
+            console.error(
+              `[punish] pre-call failure for ${input.targetUser}; pending record ` +
+                `${pendingRecord.id} retained because ownership was not proven: ${detail}`
+            );
+          }
+        }
       }
       throw error;
     }

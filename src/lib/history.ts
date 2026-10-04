@@ -20,9 +20,21 @@ export interface HistorySummary {
   readonly latestAt: number | undefined;
 }
 
+/** Ownership proof used by the only history compensation path. */
+export interface HistoryMutationOwner {
+  readonly redis: RedisLeaseStore;
+  readonly key: string;
+  readonly token: string;
+}
+
 /** A strict read used by destructive test tooling that must fail closed. */
 export type StrictHistorySummary =
   | { readonly ok: true; readonly summary: HistorySummary }
+  | { readonly ok: false };
+
+/** Strict full-history read used by exact seed verification. */
+export type StrictHistoryRows =
+  | { readonly ok: true; readonly rows: ModActionRecord[] }
   | { readonly ok: false };
 
 /** The stored record (including its generated id) and whether the write landed. */
@@ -32,9 +44,10 @@ export interface AppendOutcome {
 }
 
 /**
- * Failure policy: every operation degrades instead of throwing (summary ⇒
- * fresh, load ⇒ [], append ⇒ ok:false, remove ⇒ false) but always logs the
- * failure first, so a broken Redis is visible rather than silently swallowed.
+ * Failure policy: ordinary reads/writes log and return degraded results for
+ * non-destructive callers. Punishment uses summaryStrict() and fails closed;
+ * owned compensation returns false unless ownership and the transaction are
+ * both proven.
  */
 export interface HistoryStore {
   /**
@@ -55,8 +68,16 @@ export interface HistoryStore {
   summaryStrict(username: string): Promise<StrictHistorySummary>;
   /** All retained records, oldest first. Corrupt members are dropped silently. */
   load(username: string): Promise<ModActionRecord[]>;
-  /** Remove one row by id during execution-failure compensation. */
+  /** Read every member strictly; corruption or Redis failure returns ok:false. */
+  loadStrict(username: string): Promise<StrictHistoryRows>;
+  /** Remove one row by id for explicitly owned maintenance. */
   remove(username: string, id: string): Promise<boolean>;
+  /** Remove a pending row only while the owner token remains held. */
+  removeOwned(
+    username: string,
+    id: string,
+    owner: HistoryMutationOwner
+  ): Promise<boolean>;
   /**
    * Delete the user's ENTIRE history (dev/QA seed tooling). A missing key is
    * still a success — the post-state is "no history" either way.
@@ -124,6 +145,7 @@ export interface RedisStringLike {
 export type RedisLeaseTransaction = {
   multi(): Promise<void>;
   del(...keys: string[]): Promise<RedisLeaseTransaction>;
+  zRem?: (key: string, members: string[]) => Promise<RedisLeaseTransaction>;
   discard(): Promise<void>;
 } & Record<'exec', () => Promise<unknown[] | undefined>>;
 
@@ -280,6 +302,31 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
       }
     },
 
+    async loadStrict(username) {
+      try {
+        const rows = await redis.zRange(historyKey(username), 0, -1);
+        const records: ModActionRecord[] = [];
+        for (const row of rows) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(row.member);
+          } catch {
+            console.error(`[history] strict load ${historyKey(username)} found invalid JSON`);
+            return { ok: false };
+          }
+          if (!isModActionRecord(parsed) || parsed.at !== row.score) {
+            console.error(`[history] strict load ${historyKey(username)} found an invalid member`);
+            return { ok: false };
+          }
+          records.push(parsed);
+        }
+        return { ok: true, rows: records };
+      } catch (error) {
+        console.error(`[history] strict load ${historyKey(username)} failed: ${failureDetail(error)}`);
+        return { ok: false };
+      }
+    },
+
     async remove(username, id) {
       try {
         const key = historyKey(username);
@@ -288,7 +335,6 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           try {
             const parsed: unknown = JSON.parse(row.member);
             if (isModActionRecord(parsed) && parsed.id === id) {
-              // Remove the exact member string; nothing else is touched.
               await redis.zRem(key, [row.member]);
               return true;
             }
@@ -296,14 +342,63 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
             // Unparseable members can never match an id; skip them.
           }
         }
-        // Compensation anomalies (record already gone or never persisted)
-        // stay visible; a miss remains a documented no-op success.
         console.debug(`[history] remove miss for ${username}: no record with id=${id}`);
         return true;
       } catch (error) {
-        // Degradation: the compensation caller treats false as "record may
-        // still exist", but the failure must show up in the logs.
         console.error(`[history] remove ${historyKey(username)} failed: ${failureDetail(error)}`);
+        return false;
+      }
+    },
+
+    async removeOwned(username, id, owner) {
+      try {
+        const key = historyKey(username);
+        const rows = await redis.zRange(key, 0, -1);
+        const match = rows.find((row) => {
+          try {
+            const parsed: unknown = JSON.parse(row.member);
+            return isModActionRecord(parsed) && parsed.id === id;
+          } catch {
+            return false;
+          }
+        });
+        if (!match) {
+          console.debug(`[history] owned remove miss for ${username}: no record with id=${id}`);
+          return true;
+        }
+
+        const transaction = await owner.redis.watch(owner.key);
+        let committed = false;
+        try {
+          const current = await owner.redis.get(owner.key);
+          if (current !== owner.token) {
+            return false;
+          }
+          await transaction.multi();
+          const fenced = transaction as RedisLeaseTransaction & {
+            zRem: (key: string, members: string[]) => Promise<RedisLeaseTransaction>;
+          };
+          if (!fenced.zRem) {
+            console.error('[history] ownership-fenced compensation unavailable: transaction lacks zRem');
+            return false;
+          }
+          await fenced.zRem(key, [match.member]);
+          const commit = transaction as RedisLeaseTransaction & Record<'exec', () => Promise<unknown[] | undefined>>;
+          const result = await commit['exec']();
+          committed = true;
+          // Empty/undefined EXEC means WATCH aborted and no history changed.
+          return Boolean(result && result.length > 0);
+        } finally {
+          if (!committed) {
+            try {
+              await transaction.discard();
+            } catch (discardError) {
+              console.error(`[history] owned remove discard failed: ${failureDetail(discardError)}`);
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`[history] owned remove ${historyKey(username)} failed: ${failureDetail(error)}`);
         return false;
       }
     },

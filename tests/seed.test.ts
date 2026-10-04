@@ -54,6 +54,9 @@ class FakeLockRedis implements RedisStringLike {
         deletion = names;
         return transaction;
       },
+      async zRem() {
+        return transaction;
+      },
       async exec() {
         if (keys.some((key) => redis.values.get(key) !== snapshot.get(key))) return [];
         for (const name of deletion) await redis.del(name);
@@ -117,8 +120,21 @@ class FakeHistory implements HistoryStore {
       .map((row, index) => ({ ...row.record, id: `row-${index + 1}` }));
   }
 
+  async loadStrict(username: string): Promise<{ ok: true; rows: ModActionRecord[] } | { ok: false }> {
+    if (this.throwOnEveryCall) return { ok: false };
+    return {
+      ok: true,
+      rows: (await this.load(username)).map((row) => ({ ...row, id: row.id })),
+    };
+  }
+
   async remove(): Promise<boolean> {
     if (this.throwOnEveryCall) throw new Error('remove exploded');
+    return false;
+  }
+
+  async removeOwned(): Promise<boolean> {
+    if (this.throwOnEveryCall) throw new Error('remove owned exploded');
     return false;
   }
 
@@ -354,6 +370,43 @@ describe('seedHistory — seeding', () => {
       seedHistory(current, input({ username: 'u/Ladder_User', priors: 1, latestAgeDays: 0 }))
     ).resolves.toMatchObject({ status: 'seeded', username: 'ladder_user' });
     expect(current.history.appends[0]?.username).toBe('ladder_user');
+  });
+
+  it('does not claim success when an intermediate seeded timestamp is wrong', async () => {
+    const current = deps();
+    const original = current.history.loadStrict.bind(current.history);
+    current.history.loadStrict = async (username) => {
+      const result = await original(username);
+      if (!result.ok) return result;
+      return {
+        ok: true,
+        rows: result.rows.map((row, index) => index === 1 ? { ...row, at: row.at + DAY } : row),
+      };
+    };
+
+    await expect(seedHistory(current, input({ priors: 3 }))).resolves.toEqual({
+      status: 'failed',
+      detail: 'seed verification failed; clear u/ladder_user and retry',
+    });
+    expect(current.history.appends).toHaveLength(3);
+  });
+
+  it('does not claim success when a seeded row has unexpected synthetic fields', async () => {
+    const current = deps();
+    const original = current.history.loadStrict.bind(current.history);
+    current.history.loadStrict = async (username) => {
+      const result = await original(username);
+      if (!result.ok) return result;
+      return {
+        ok: true,
+        rows: result.rows.map((row, index) => index === 0 ? { ...row, modUser: 'wrong-owner' } : row),
+      };
+    };
+
+    await expect(seedHistory(current, input({ priors: 2 }))).resolves.toMatchObject({
+      status: 'failed',
+      detail: 'seed verification failed; clear u/ladder_user and retry',
+    });
   });
 
   it('rejects a seed when history already exists and requires an explicit clear first', async () => {
@@ -625,7 +678,9 @@ describe('seedHistory — never throws', () => {
               summary: () => Promise.reject(new Error('impossible')),
               summaryStrict: () => Promise.reject(new Error('impossible')),
               load: () => Promise.reject(new Error('impossible')),
+              loadStrict: () => Promise.reject(new Error('impossible')),
               remove: () => Promise.reject(new Error('impossible')),
+              removeOwned: () => Promise.reject(new Error('impossible')),
               clear: () => Promise.reject(new Error('impossible')),
             },
             redis: new FakeLockRedis(),

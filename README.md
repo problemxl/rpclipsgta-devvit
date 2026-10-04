@@ -41,15 +41,15 @@ rules, and optionally supplies a reason. The app resolves the target and then:
    expiry: a Reddit call can outlive any practical lease, and expiry would
    permit a stale request to overlap a takeover. Release uses Redis
    WATCH/MULTI/EXEC to compare the owner token and delete only if the key did
-   not change. If a request crashes, a moderator must use the separate
-   **Recover stuck action lock** tool after confirming that no request is still
-   running; this is deliberately an explicit operational recovery, not a
-   silent or unsafe takeover.
-2. Reads an O(1)-ish summary of `modactions:z:user:{lowercased username}`: a
-   Redis sorted set holding one row per infraction — the record JSON, which
-   includes a unique id — scored by its epoch-ms timestamp. The summary is the
-   `ZCARD` row count plus the newest row's score; the full history is never
-   loaded for rung selection.
+   not change. There is deliberately no in-app recovery menu: Redis lock
+   deletion cannot fence an already-running request or its Reddit call.
+2. Reads an O(1)-ish **strict** summary of
+   `modactions:z:user:{lowercased username}`: a Redis sorted set holding one
+   row per infraction — the record JSON, which includes a unique id — scored by
+   its epoch-ms timestamp. The summary is the `ZCARD` row count plus the
+   newest row's score; if either Redis read fails, the action fails closed and
+   no Reddit action is attempted. The full history is never loaded for rung
+   selection.
 3. Applies the wiki ladder and decay policy:
 
    | Effective prior actions | Action |
@@ -69,14 +69,20 @@ rules, and optionally supplies a reason. The app resolves the target and then:
    rule reason, and `[devvit] by {modUser}` note. Permanent bans omit duration.
 5. Appends the action to the sorted set **before** execution
    (pending-record-first) as a new row with a freshly minted unique id, so
-   identical records can never overwrite each other. If the Reddit call then
-   fails, the pending row is compensated (removed by id) so the next action
-   sees no phantom prior. Reddit execution is still attempted even if recording
+   identical records can never overwrite each other. A failure or timeout
+   after the Reddit request starts has an unknown external outcome: the
+   pending row is retained, logged with its id, and requires manual Reddit
+   reconciliation before retry. It is never auto-removed or auto-retried. A
+   locally proven pre-call ownership failure may remove its own pending row
+   only through an ownership-fenced WATCH transaction; if ownership is lost,
+   the row is retained. Reddit execution is still attempted even if recording
    fails; the success toast then includes `(not recorded)`. Bans are refused
    outright when the resolved subreddit name is empty.
 6. Releases the lock in a `finally` block — only when it was acquired. The
    flow also checks ownership immediately before the history append and before
-   the Reddit call, and fails closed if explicit recovery changed the token.
+   the Reddit call, and fails closed if the owner token changed. A Redis
+   history-read failure also fails closed rather than treating the user as
+   fresh.
 
 The warning comment links the rules wiki, explains the current violation and
 next ladder consequence, and points appeals to modmail. Reddit's comment API
@@ -166,9 +172,8 @@ Redis state is installation-scoped and idempotent:
 - `modactions:z:user:{username}` — lifetime in-app action history, one
   sorted-set row per infraction.
 - `punish:lock:{username}` — non-expiring owner-token lock. It is released
-  with WATCH/MULTI/EXEC, never with an unsafe GET-then-DEL sequence. A stuck
-  lock requires explicit moderator recovery after checking that no action is
-  running.
+  with WATCH/MULTI/EXEC, never with an unsafe GET-then-DEL sequence. There is
+  no in-app recovery because deletion cannot fence a stale owner.
 
 ## Remove & escalate action
 
@@ -222,9 +227,8 @@ Two properties matter:
   they would after months of real actions. Seed and clear share the exact
   per-user non-expiring owner-token lock used by punishment, so they cannot
   interleave with a punish/clear operation. A crashed request can leave this
-  lock until a moderator uses **Recover stuck action lock** after confirming
-  that no action is running. Clearing a user (`DEL` of the
-  history key) resets them to a fresh first-offense state. If a batch write
+  lock held. Clearing a user (`DEL` of the history key) resets them to a fresh
+  first-offense state. If a batch write
   fails part-way through, the tool reports the landed count and deliberately
   does not auto-clear existing or partial history; clear explicitly before
   retrying. The success toast says that the history was empty when the exact
@@ -258,6 +262,18 @@ Testing playbook:
    (2 priors ⇒ 7 day ban). Seed 5 for the permanent-ban rung.
 3. **Decay:** seed 1 prior at age 90 days and trigger a violation — the rung
    must have decayed back to a warning. Clear the user between scenarios.
+
+### Stuck-lock operational recovery
+
+The app intentionally exposes no lock-recovery menu. Do not run an
+unconditional `DEL punish:lock:{user}`: it can delete a newer owner while an
+old request is still able to call Reddit. First obtain an external quiescence
+guarantee (stop or drain the relevant worker, or otherwise prove that the old
+invocation and its Reddit request are dead). Then use an administrator Redis
+tool that supports compare-and-delete against the exact observed owner token.
+If that primitive or the quiescence proof is unavailable, leave the lock in
+place and escalate operationally; do not guess, force-delete, or retry the
+moderation action. This is an operational procedure, not a fencing guarantee.
 
 ## Publish checklist
 
@@ -293,9 +309,7 @@ npm test        # vitest run — unit tests, no network or Devvit runtime
   (sorted set, one row per infraction), including strict fail-closed summaries
   for exact seeding.
 - `src/lib/user-lock.ts` — shared non-expiring owner-token lock with
-  WATCH/MULTI/EXEC compare-delete and explicit recovery.
-- `src/actions/recover-lock.ts` — authenticated, confirmation-gated stuck-lock
-  recovery.
+  WATCH/MULTI/EXEC compare-delete; no unsafe recovery operation is exposed.
 - `src/actions/escalate.ts` — pure target resolution and toast builders.
 - `src/actions/fixture.ts` — fixture targets, URL/title validation, and dedupe.
 - `src/actions/seed.ts` — dev/QA-only history seeding and clearing for ladder
