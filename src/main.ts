@@ -529,16 +529,32 @@ const seedForm = Devvit.createForm(
     const priors = numericFormValue(event.values.priors);
     const latestAgeDays = numericFormValue(event.values.latestAgeDays);
     const operation: SeedOperation = event.values.operation?.[0] === 'clear' ? 'clear' : 'seed';
+    const actor = context.username?.trim();
+    if (!actor) {
+      safeToast(context, 'Could not determine the acting moderator. Action aborted.');
+      return;
+    }
 
     try {
       const seedInput: SeedInput = {
         subredditName,
+        actor,
         username: typeof event.values.username === 'string' ? event.values.username : '',
         operation,
         ...(operation === 'seed' && priors !== undefined ? { priors } : {}),
         ...(operation === 'seed' && latestAgeDays !== undefined ? { latestAgeDays } : {}),
       };
-      const outcome = await runSeedSafely({ history: createHistoryStore(context.redis) }, seedInput);
+      const outcome = await runSeedSafely(
+        {
+          history: createHistoryStore(context.redis),
+          redis: context.redis,
+          authorizeActor: async (name, username) =>
+            (await context.reddit
+              .getModerators({ subredditName: name, username, limit: 1, pageSize: 1 })
+              .all()).length > 0,
+        },
+        seedInput
+      );
       safeToast(context, buildSeedToast(outcome));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);

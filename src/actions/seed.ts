@@ -8,11 +8,15 @@
  * tell them apart from real infractions — that is what makes the tool useful.
  *
  * SAFETY: the subreddit allowlist is checked FIRST on every call, so a form
- * replay or a stray install in the production subreddit is refused before any
- * username is normalized or any row is written.
+ * replay or a stray install in the production subreddit is refused before
+ * authorization, username normalization, Redis locking, or any history access.
  */
 
-import type { HistoryStore } from '../lib/history.js';
+import type { HistoryStore, RedisStringLike } from '../lib/history.js';
+import {
+  acquireUserActionLock,
+  releaseUserActionLock,
+} from '../lib/user-lock.js';
 
 /** The only subreddits the seed tool may ever run in (dev and QA installs). */
 export const SEED_ALLOWED_SUBREDDITS = ['S17Cjn21GT', 'rpclipsgta_mod_dev'] as const;
@@ -48,6 +52,10 @@ const SEED_RECORD_FIELDS = {
 /** Structural dependencies, satisfied by main.ts wiring and by unit tests. */
 export interface SeedDeps {
   readonly history: HistoryStore;
+  /** The same installation Redis used by punish(), for shared user locking. */
+  readonly redis: RedisStringLike;
+  /** Verify the current actor against Reddit's moderator listing. */
+  readonly authorizeActor: (subredditName: string, actor: string) => Promise<boolean>;
   readonly now?: () => number;
 }
 
@@ -56,6 +64,8 @@ export type SeedOperation = 'seed' | 'clear';
 
 export interface SeedInput {
   readonly subredditName: string;
+  /** Authenticated moderator identity from the form context, never form input. */
+  readonly actor: string;
   readonly username: string;
   readonly operation: SeedOperation;
   /** Rows to write; required for 'seed', ignored for 'clear'. */
@@ -66,7 +76,7 @@ export interface SeedInput {
 
 /** Every terminal result returned by the seed tool. */
 export type SeedOutcome =
-  | { readonly status: 'denied' }
+  | { readonly status: 'denied'; readonly detail?: string }
   | { readonly status: 'invalid'; readonly detail: string }
   | {
       readonly status: 'seeded';
@@ -108,6 +118,11 @@ function isIntegerInRange(value: unknown, min: number, max: number): value is nu
   return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
 }
 
+/** Reddit's legacy username format: 3–20 ASCII letters, digits, `_`, or `-`. */
+function isValidSeedUsername(username: string): boolean {
+  return /^[a-z0-9_-]{3,20}$/i.test(username);
+}
+
 /**
  * Seed synthetic priors or clear a user's history — dev/QA subreddits only.
  *
@@ -117,6 +132,7 @@ function isIntegerInRange(value: unknown, min: number, max: number): value is nu
  * `latestAgeDays` old and drives the ladder's decay clock.
  *
  * Never throws: every failure path degrades to a terminal outcome and logs.
+ * Partial batches are intentionally retained and reported; use clear before retrying.
  */
 export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<SeedOutcome> {
   // -- Allowlist guard FIRST: production history must never be touched. -----
@@ -130,30 +146,48 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
   }
 
   try {
-    const username = normalizeSeedUsername(input.username);
+    // Menu visibility is not authorization. Verify the actor after the hard
+    // subreddit guard, but before normalization, locking, or any history call.
+    const actor = typeof input.actor === 'string' ? input.actor.trim() : '';
+    if (!actor) {
+      return audit({ status: 'denied', detail: 'acting moderator is required' });
+    }
+    let authorized: boolean;
+    try {
+      authorized = await deps.authorizeActor(input.subredditName.trim(), actor);
+    } catch (error) {
+      console.error(`[seed] moderator authorization failed: ${detailOf(error)}`);
+      return audit({
+        status: 'denied',
+        detail: 'moderator authorization could not be verified',
+      });
+    }
+    if (!authorized) {
+      return audit({ status: 'denied', detail: 'acting user is not a moderator' });
+    }
+
+    const username =
+      typeof input.username === 'string' ? normalizeSeedUsername(input.username) : '';
     if (!username) {
       return audit({ status: 'invalid', detail: 'username is required' });
     }
+    if (!isValidSeedUsername(username)) {
+      return audit({ status: 'invalid', detail: 'username must be a valid Reddit username' });
+    }
 
-    if (input.operation === 'clear') {
-      const cleared = await deps.history.clear(username);
-      if (!cleared) {
-        return audit({
-          status: 'failed',
-          detail: `redis refused the clear for u/${username}; history may remain`,
-        });
-      }
-      return audit({ status: 'cleared', username });
+    if (input.operation !== 'seed' && input.operation !== 'clear') {
+      return audit({ status: 'invalid', detail: 'operation must be seed or clear' });
     }
 
     // -- 'seed': validate both numbers before any write ---------------------
-    if (!isIntegerInRange(input.priors, SEED_MIN_PRIORS, SEED_MAX_PRIORS)) {
+    if (input.operation === 'seed' && !isIntegerInRange(input.priors, SEED_MIN_PRIORS, SEED_MAX_PRIORS)) {
       return audit({
         status: 'invalid',
         detail: `priors must be a whole number ${SEED_MIN_PRIORS}-${SEED_MAX_PRIORS}`,
       });
     }
     if (
+      input.operation === 'seed' &&
       !isIntegerInRange(
         input.latestAgeDays,
         SEED_MIN_LATEST_AGE_DAYS,
@@ -166,36 +200,65 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
       });
     }
 
-    const priors: number = input.priors;
-    const latestAgeDays: number = input.latestAgeDays;
     const now = deps.now ?? Date.now;
-    const at = now();
-
-    // Append is what mints the row ids, so writes go one-by-one through the
-    // same HistoryStore the punish flow uses.
-    let landed = 0;
-    for (let k = 1; k <= priors; k += 1) {
-      const rowAt = at - (latestAgeDays + (priors - k)) * DAY_MS;
-      const appended = await deps.history.append(username, {
-        at: rowAt,
-        ...SEED_RECORD_FIELDS,
-      });
-      if (!appended.ok) {
-        // No auto-clear: the operator decides (Clear history is one press
-        // away), because deleting rows the tool does not own would be worse.
-        return audit({
-          status: 'failed',
-          detail: `only ${landed} of ${priors} rows landed; clear u/${username} and retry`,
-        });
+    const lock = await acquireUserActionLock(deps.redis, username, actor, now);
+    try {
+      if (input.operation === 'clear') {
+        const cleared = await deps.history.clear(username);
+        if (!cleared) {
+          return audit({
+            status: 'failed',
+            detail: `redis refused the clear for u/${username}; history may remain`,
+          });
+        }
+        return audit({ status: 'cleared', username });
       }
-      landed += 1;
-    }
 
-    return audit({ status: 'seeded', username, priors, latestAgeDays });
+      const priors: number = input.priors as number;
+      const latestAgeDays: number = input.latestAgeDays as number;
+      const at = now();
+
+      // Append is what mints the row ids, so writes go one-by-one through the
+      // same HistoryStore the punish flow uses. The lock covers the whole
+      // batch, preventing punish/clear from interleaving with a partial seed.
+      let landed = 0;
+      for (let k = 1; k <= priors; k += 1) {
+        const rowAt = at - (latestAgeDays + (priors - k)) * DAY_MS;
+        let appended: Awaited<ReturnType<HistoryStore['append']>>;
+        try {
+          appended = await deps.history.append(username, {
+            at: rowAt,
+            ...SEED_RECORD_FIELDS,
+          });
+        } catch (error) {
+          const detail = detailOf(error);
+          console.error(`[seed] append failed after ${landed} of ${priors}: ${detail}`);
+          // No auto-clear: the operator decides (Clear history is one press
+          // away), because deleting rows the tool does not own would be worse.
+          return audit({
+            status: 'failed',
+            detail: `only ${landed} of ${priors} rows landed; ${detailOf(error)}`,
+          });
+        }
+        if (!appended.ok) {
+          // No auto-clear: the operator decides (Clear history is one press
+          // away), because deleting rows the tool does not own would be worse.
+          return audit({
+            status: 'failed',
+            detail: `only ${landed} of ${priors} rows landed; clear u/${username} and retry`,
+          });
+        }
+        landed += 1;
+      }
+
+      return audit({ status: 'seeded', username, priors, latestAgeDays });
+    } finally {
+      await releaseUserActionLock(deps.redis, lock, 'seed');
+    }
   } catch (error) {
     const detail = detailOf(error);
     console.error(`[seed] unexpected failure: ${detail}`);
-    return { status: 'failed', detail };
+    return audit({ status: 'failed', detail });
   }
 }
 
@@ -218,7 +281,9 @@ export function buildSeedToast(outcome: SeedSafeOutcome): string {
     case 'cleared':
       return `Cleared history for u/${outcome.username}`;
     case 'denied':
-      return 'Test tool is only available in the dev/QA subreddits.';
+      return outcome.detail
+        ? `Seed denied: ${outcome.detail}`
+        : 'Test tool is only available in the dev/QA subreddits.';
     case 'invalid':
       return `Invalid seed input: ${outcome.detail}`;
     case 'failed':

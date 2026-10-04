@@ -1,12 +1,15 @@
 import { effectivePriors, LADDER, pickRung, type LadderRung } from '../lib/ladder.js';
 import { ruleByNumber } from '../lib/rules.js';
 import type { HistoryStore, ModActionRecord, RedisStringLike } from '../lib/history.js';
+import {
+  acquireUserActionLock,
+  releaseUserActionLock,
+  userActionLockKey,
+} from '../lib/user-lock.js';
 
 const RULES_WIKI = 'https://www.reddit.com/r/RPClipsGTA/wiki/subreddit/rules/';
 const MODMAIL_APPEAL =
   'If you would like to appeal, please contact the moderators via modmail.';
-
-const LOCK_TTL_MS = 30 * 1000;
 
 export interface PunishDeps {
   readonly history: HistoryStore;
@@ -101,9 +104,7 @@ function banMessage(input: PunishInput, rung: LadderRung, ruleName: string): str
 }
 
 /** Redis key used to serialize every action for one normalized username. */
-export function punishLockKey(username: string): string {
-  return `punish:lock:${username.toLowerCase()}`;
-}
+export const punishLockKey = userActionLockKey;
 
 /** The pending row shape handed to append(), which mints the unique id. */
 function pendingRecordFor(input: PunishInput, at: number, rung: LadderRung): Omit<ModActionRecord, 'id'> {
@@ -142,19 +143,10 @@ export async function punish(
   const rule = ruleByNumber(input.rule);
   if (!rule) throw new Error(`Unknown rule: ${input.rule}`);
 
-  const lockKey = punishLockKey(input.targetUser);
-  // Owner token guarding the release: if execution outlives the TTL below and
-  // a second caller acquires the expired lock, this call's release must not
-  // delete the other caller's lock. Only a GET that still returns this exact
-  // token is followed by a DEL.
+  // This is the same lock key and lease used by seed/clear. A seed can never
+  // interleave with a punishment's summary/append/execution sequence.
   const now = deps.now ?? Date.now;
-  const lockToken = `${input.modUser}:${now()}:${Math.random().toString(36).slice(2)}`;
-  const lockResult = await deps.redis.set(lockKey, lockToken, {
-    nx: true,
-    expiration: new Date(Date.now() + LOCK_TTL_MS),
-  });
-  const acquired = typeof lockResult === 'string';
-  if (!acquired) throw new Error('punishment already in progress for this user');
+  const lock = await acquireUserActionLock(deps.redis, input.targetUser, input.modUser, now);
 
   try {
     const at = now();
@@ -233,21 +225,8 @@ export async function punish(
       recorded,
     };
   } finally {
-    // Release only when this call acquired the lock, and only while the key
-    // still holds this call's owner token. The GET→DEL pair is not atomic —
-    // Devvit redis has no compare-and-delete — so a lock expiring exactly
-    // between GET and DEL can still be deleted after a second caller acquires
-    // it; that tiny race is accepted as unavoidable with this API.
-    // A redis failure here must never throw over an already-applied punishment
-    // result or mask the original execution error.
-    if (acquired) {
-      try {
-        const current = await deps.redis.get(lockKey);
-        if (current === lockToken) await deps.redis.del(lockKey);
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        console.error(`[punish] failed to release punishment lock ${lockKey}: ${detail}`);
-      }
-    }
+    // A Redis release failure must never throw over an already-applied
+    // punishment result or mask the original execution error.
+    await releaseUserActionLock(deps.redis, lock, 'punish');
   }
 }

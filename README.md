@@ -181,18 +181,31 @@ Two properties matter:
 - **Hard dev/QA-only guard.** Every call first checks the subreddit against
   exactly `S17Cjn21GT` (development) and `rpclipsgta_mod_dev` (QA/staging),
   case-insensitively. Anywhere else — including production — the tool refuses
-  before any username is normalized or any row is written, and logs the denial
-  loudly. The rows themselves are honest synthetics: rule 11 warnings recorded
-  as `modUser: seed-tool` against `t3_seeded`.
+  before moderator authorization, username normalization, Redis locking, or any
+  history access, and logs the denial loudly. Menu visibility is not treated as
+  authorization: the form handler verifies the authenticated actor against
+  Reddit's current moderator listing before it can seed or clear. The rows
+  themselves are honest synthetics: rule 11 warnings recorded as
+  `modUser: seed-tool` against `t3_seeded`.
 - **Seeded rows are indistinguishable from real ones to the ladder.** They go
   through the same `HistoryStore` and per-user sorted set the punish flow
   reads, so rung selection and 90-day decay behave in a seeded test exactly as
-  they would after months of real actions. Clearing a user (`DEL` of the
-  history key) resets them to a fresh first-offense state.
+  they would after months of real actions. Seed and clear share the exact
+  per-user Redis lease used by punishment, so they cannot interleave with a
+  punish/clear operation while the lease is valid. Clearing a user (`DEL` of
+  the history key) resets them to a fresh first-offense state. If a batch write
+  fails part-way through, the tool reports the landed count and deliberately
+  does not auto-clear existing or partial history; clear explicitly before
+  retrying.
 
 Throwaway Reddit accounts for end-to-end testing are prepared with
 `scripts/gen-test-accounts.mjs` (credentials + disposable inboxes; signups stay
-manual).
+manual). The helper accepts `gen [1-10]` and `check [--wait seconds]` or
+`check [--wait=seconds]`, applies request timeouts, validates Reddit verification
+links as exact HTTPS `reddit.com`/`www.reddit.com` URLs, and writes the local
+credential file with mode `0600`. `test-accounts.txt` is gitignored; do not
+paste or commit it. The helper never calls Reddit signup APIs or any Reddit
+endpoint.
 
 Testing playbook:
 
