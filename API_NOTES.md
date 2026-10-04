@@ -59,12 +59,15 @@ command surface:
   A partial batch remains visible and must be explicitly cleared before retry.
   Punishment also uses strict summary reads; a Redis read failure never becomes
   a fresh-user warning path. A started Reddit request that times out or throws
-  leaves its pending row for manual reconciliation because the external result
-  is ambiguous.
+  leaves an explicit pending row that blocks retry until manual reconciliation
+  finalizes or removes it, because the external result is ambiguous.
 
-The relevant source is `src/lib/user-lock.ts` and `src/actions/seed.ts`. The transaction mock shipped in the installed
-package is only a test double; the app's deterministic tests model WATCH's
-abort-on-change behavior explicitly.
+The relevant source is `src/lib/user-lock.ts`, `src/lib/history.ts`, and
+`src/actions/seed.ts`. The transaction mock shipped in the installed package
+is only a test double; the app's deterministic tests model WATCH's
+abort-on-change behavior explicitly. Pending history rows are intentionally
+not auto-repaired: administrators must reconcile the Reddit result and use an
+ownership-fenced history operation.
 
 ---
 

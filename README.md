@@ -71,12 +71,14 @@ rules, and optionally supplies a reason. The app resolves the target and then:
    (pending-record-first) as a new row with a freshly minted unique id, so
    identical records can never overwrite each other. A failure or timeout
    after the Reddit request starts has an unknown external outcome: the
-   pending row is retained, logged with its id, and requires manual Reddit
-   reconciliation before retry. It is never auto-removed or auto-retried. A
+   pending row is retained with an explicit `state: pending`, logged with its
+   id, and blocks subsequent automated punishment until an operator reconciles
+   the Reddit result. It is never auto-removed or auto-retried. A
    locally proven pre-call ownership failure may remove its own pending row
    only through an ownership-fenced WATCH transaction; if ownership is lost,
-   the row is retained. Reddit execution is still attempted even if recording
-   fails; the success toast then includes `(not recorded)`. Bans are refused
+   the row is retained. After confirming that Reddit applied the action, an
+   administrator must finalize the pending row before retrying. Reddit
+   execution is still attempted even if recording fails; the success toast then includes `(not recorded)`. Bans are refused
    outright when the resolved subreddit name is empty.
 6. Releases the lock in a `finally` block — only when it was acquired. The
    flow also checks ownership immediately before the history append and before
@@ -274,6 +276,14 @@ tool that supports compare-and-delete against the exact observed owner token.
 If that primitive or the quiescence proof is unavailable, leave the lock in
 place and escalate operationally; do not guess, force-delete, or retry the
 moderation action. This is an operational procedure, not a fencing guarantee.
+
+For a `state: pending` action, inspect Reddit's moderator log and the target
+comment/ban first. If Reddit definitely applied the action, use an administrator
+operation that ownership-fences the exact history member to finalize it; if
+Reddit definitely did not apply it, use the same ownership-fenced operation to
+remove that exact pending member. If the outcome remains uncertain, leave the
+row pending. The app intentionally provides no automatic retry or in-app
+history-repair menu.
 
 ## Publish checklist
 

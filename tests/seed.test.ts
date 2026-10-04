@@ -57,6 +57,9 @@ class FakeLockRedis implements RedisStringLike {
       async zRem() {
         return transaction;
       },
+      async zAdd() {
+        return transaction;
+      },
       async exec() {
         if (keys.some((key) => redis.values.get(key) !== snapshot.get(key))) return [];
         for (const name of deletion) await redis.del(name);
@@ -136,6 +139,11 @@ class FakeHistory implements HistoryStore {
   async removeOwned(): Promise<boolean> {
     if (this.throwOnEveryCall) throw new Error('remove owned exploded');
     return false;
+  }
+
+  async markApplied(): Promise<boolean> {
+    if (this.throwOnEveryCall) throw new Error('mark applied exploded');
+    return true;
   }
 
   async clear(username: string): Promise<boolean> {
@@ -681,6 +689,7 @@ describe('seedHistory — never throws', () => {
               loadStrict: () => Promise.reject(new Error('impossible')),
               remove: () => Promise.reject(new Error('impossible')),
               removeOwned: () => Promise.reject(new Error('impossible')),
+              markApplied: () => Promise.reject(new Error('impossible')),
               clear: () => Promise.reject(new Error('impossible')),
             },
             redis: new FakeLockRedis(),

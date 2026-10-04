@@ -12,6 +12,8 @@ export interface ModActionRecord {
   readonly label: string;
   readonly modUser: string;
   readonly targetThingId: string;
+  /** Pending rows represent an action whose Reddit outcome is unresolved. */
+  readonly state?: 'pending';
 }
 
 /** Row count plus the newest action time, without parsing any member payload. */
@@ -32,7 +34,7 @@ export type StrictHistorySummary =
   | { readonly ok: true; readonly summary: HistorySummary }
   | { readonly ok: false };
 
-/** Strict full-history read used by exact seed verification. */
+/** Strict full-history read used by exact seed verification and retry blocking. */
 export type StrictHistoryRows =
   | { readonly ok: true; readonly rows: ModActionRecord[] }
   | { readonly ok: false };
@@ -74,6 +76,12 @@ export interface HistoryStore {
   remove(username: string, id: string): Promise<boolean>;
   /** Remove a pending row only while the owner token remains held. */
   removeOwned(
+    username: string,
+    id: string,
+    owner: HistoryMutationOwner
+  ): Promise<boolean>;
+  /** Mark a pending row applied only while the owner token remains held. */
+  markApplied(
     username: string,
     id: string,
     owner: HistoryMutationOwner
@@ -145,7 +153,8 @@ export interface RedisStringLike {
 export type RedisLeaseTransaction = {
   multi(): Promise<void>;
   del(...keys: string[]): Promise<RedisLeaseTransaction>;
-  zRem?: (key: string, members: string[]) => Promise<RedisLeaseTransaction>;
+  zRem(key: string, members: string[]): Promise<RedisLeaseTransaction>;
+  zAdd(key: string, ...members: RedisZMember[]): Promise<RedisLeaseTransaction>;
   discard(): Promise<void>;
 } & Record<'exec', () => Promise<unknown[] | undefined>>;
 
@@ -184,7 +193,8 @@ function isModActionRecord(value: unknown): value is ModActionRecord {
     record.rule <= 12 &&
     typeof record.label === 'string' &&
     typeof record.modUser === 'string' &&
-    typeof record.targetThingId === 'string'
+    typeof record.targetThingId === 'string' &&
+    (record.state === undefined || record.state === 'pending')
   );
 }
 
@@ -260,8 +270,8 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
       try {
         return await readSummary(username);
       } catch (error) {
-        // Punishment deliberately degrades a failed read to a warning path.
-        // Exact/destructive callers must use summaryStrict instead.
+        // Non-strict summary is retained for callers that explicitly accept
+        // degraded reads. Punishment and exact tooling use strict methods.
         console.error(`[history] summary ${key} failed: ${failureDetail(error)}`);
         return { total: 0, latestAt: undefined };
       }
@@ -350,39 +360,79 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
       }
     },
 
+    async markApplied(username, id, owner) {
+      try {
+        const key = historyKey(username);
+        const transaction = await owner.redis.watch(owner.key, key);
+        let committed = false;
+        try {
+          const rows = await redis.zRange(key, 0, -1);
+          const match = rows.find((row) => {
+            try {
+              const parsed: unknown = JSON.parse(row.member);
+              return isModActionRecord(parsed) && parsed.id === id && parsed.state === 'pending';
+            } catch {
+              return false;
+            }
+          });
+          if (!match) {
+            await transaction.discard();
+            committed = true;
+            return false;
+          }
+          const current = await owner.redis.get(owner.key);
+          if (current !== owner.token) return false;
+          await transaction.multi();
+          const parsed = JSON.parse(match.member) as ModActionRecord;
+          const { state: _pending, ...applied } = parsed;
+          void _pending;
+          const serialized = JSON.stringify(applied);
+          await transaction.zRem(key, [match.member]);
+          await transaction.zAdd(key, { member: serialized, score: match.score });
+          const commit = transaction as RedisLeaseTransaction & Record<'exec', () => Promise<unknown[] | undefined>>;
+          const result = await commit['exec']();
+          committed = true;
+          return Boolean(result && result.length > 0);
+        } finally {
+          if (!committed) {
+            try { await transaction.discard(); } catch (error) {
+              console.error(`[history] mark-applied discard failed: ${failureDetail(error)}`);
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`[history] mark applied ${historyKey(username)} failed: ${failureDetail(error)}`);
+        return false;
+      }
+    },
+
     async removeOwned(username, id, owner) {
       try {
         const key = historyKey(username);
-        const rows = await redis.zRange(key, 0, -1);
-        const match = rows.find((row) => {
-          try {
-            const parsed: unknown = JSON.parse(row.member);
-            return isModActionRecord(parsed) && parsed.id === id;
-          } catch {
-            return false;
-          }
-        });
-        if (!match) {
-          console.debug(`[history] owned remove miss for ${username}: no record with id=${id}`);
-          return true;
-        }
-
-        const transaction = await owner.redis.watch(owner.key);
+        const transaction = await owner.redis.watch(owner.key, key);
         let committed = false;
         try {
+          const rows = await redis.zRange(key, 0, -1);
+          const match = rows.find((row) => {
+            try {
+              const parsed: unknown = JSON.parse(row.member);
+              return isModActionRecord(parsed) && parsed.id === id;
+            } catch {
+              return false;
+            }
+          });
+          if (!match) {
+            console.debug(`[history] owned remove miss for ${username}: no record with id=${id}`);
+            await transaction.discard();
+            committed = true;
+            return true;
+          }
           const current = await owner.redis.get(owner.key);
           if (current !== owner.token) {
             return false;
           }
           await transaction.multi();
-          const fenced = transaction as RedisLeaseTransaction & {
-            zRem: (key: string, members: string[]) => Promise<RedisLeaseTransaction>;
-          };
-          if (!fenced.zRem) {
-            console.error('[history] ownership-fenced compensation unavailable: transaction lacks zRem');
-            return false;
-          }
-          await fenced.zRem(key, [match.member]);
+          await transaction.zRem(key, [match.member]);
           const commit = transaction as RedisLeaseTransaction & Record<'exec', () => Promise<unknown[] | undefined>>;
           const result = await commit['exec']();
           committed = true;

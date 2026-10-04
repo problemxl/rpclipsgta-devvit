@@ -66,6 +66,7 @@ class FakeRedis implements FakeRedisShape {
     const redis = this;
     let deletion: string[] = [];
     let zrem: Array<{ key: string; members: string[] }> = [];
+    let zadd: Array<{ key: string; members: { member: string; score: number }[] }> = [];
     let multiStarted = false;
     const transaction: RedisLeaseTransaction = {
       async multi() {
@@ -80,6 +81,10 @@ class FakeRedis implements FakeRedisShape {
         zrem.push({ key, members });
         return transaction;
       },
+      async zAdd(key: string, ...members: { member: string; score: number }[]) {
+        zadd.push({ key, members });
+        return transaction;
+      },
       async exec() {
         if (redis.failExec) throw new Error('exec failed');
         if (!multiStarted) throw new Error('multi required');
@@ -88,7 +93,8 @@ class FakeRedis implements FakeRedisShape {
         }
         for (const key of deletion) await redis.del(key);
         for (const operation of zrem) await redis.zRem(operation.key, operation.members);
-        return [...deletion, ...zrem].map(() => 'OK');
+        for (const operation of zadd) await redis.zAdd(operation.key, ...operation.members);
+        return [...deletion, ...zrem, ...zadd].map(() => 'OK');
       },
       async discard() {
         redis.discardCalls += 1;
@@ -256,6 +262,7 @@ describe('punish', () => {
     expect(current.submitComment).toHaveBeenCalled();
     expect(current.banUser).not.toHaveBeenCalled();
     expect(await current.history.load('Target')).toHaveLength(4); // 3 kept + this one
+    expect((await current.history.load('Target')).at(-1)?.state).toBeUndefined();
   });
 
   it('still sees a 400-day-old prior through full retention', async () => {
@@ -295,6 +302,25 @@ describe('punish', () => {
     expect(await history.load('Target')).toEqual([]);
   });
 
+  it('blocks retry while an unresolved pending action exists', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    await history.append('Target', {
+      at: NOW,
+      rule: 2,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'Mod',
+      targetThingId: 't3_post',
+      state: 'pending',
+    });
+    const submitComment = vi.fn(async () => 'unreachable');
+    await expect(punish(deps({ redis, history, submitComment }), input)).rejects.toThrow(
+      'unresolved outcome; reconcile it before retrying'
+    );
+    expect(submitComment).not.toHaveBeenCalled();
+  });
+
   it('continues without a record when ZADD resolves 0', async () => {
     const redis = new FakeRedis();
     redis.zAddResult = 0;
@@ -318,6 +344,7 @@ describe('punish', () => {
       loadStrict: async () => ({ ok: true as const, rows: [] as ModActionRecord[] }),
       remove: async () => false,
       removeOwned: async () => false,
+      markApplied: async () => true,
       clear: async () => false,
     };
     const current = deps({ history: failingHistory });
@@ -540,6 +567,36 @@ describe('punish compensation', () => {
     await releaseUserActionLock(redis, lock, 'test');
   });
 
+  it('does not remove a pending row when ownership changes after WATCH and GET', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const pending = (await history.append('Target', {
+      at: NOW,
+      rule: 2,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'Mod',
+      targetThingId: 't3_post',
+      state: 'pending',
+    })).record;
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+    let replaced = false;
+    redis.onGet = (key) => {
+      if (!replaced && key === lock.key) {
+        replaced = true;
+        redis.values.set(key, 'Other:999:replacement');
+      }
+    };
+
+    await expect(history.removeOwned('Target', pending.id, {
+      redis,
+      key: lock.key,
+      token: lock.token,
+    })).resolves.toBe(false);
+    expect(await history.load('Target')).toEqual([pending]);
+    expect(redis.values.get(lock.key)).toBe('Other:999:replacement');
+  });
+
   it('retains a pending row when ownership is lost before fenced compensation', async () => {
     const redis = new FakeRedis();
     const history = createHistoryStore(redis);
@@ -587,6 +644,24 @@ describe('punish compensation', () => {
     expect(current.submitComment).not.toHaveBeenCalled();
     expect(await history.load('Target')).toHaveLength(1);
     expect(redis.values.get(punishLockKey('Target'))).toBe('Other:999:replacement');
+  });
+
+  it('blocks a retry after an ambiguous Reddit failure', async () => {
+    const redis = new FakeRedis();
+    redis.seedPrior('Target', NOW - 1);
+    const history = createHistoryStore(redis);
+    const first = deps({
+      redis,
+      history,
+      banUser: vi.fn(async () => { throw new Error('timeout'); }),
+    });
+    await expect(punish(first, input)).rejects.toThrow('timeout');
+
+    const retrySubmit = vi.fn(async () => 'should-not-run');
+    await expect(punish(deps({ redis, history, submitComment: retrySubmit }), input)).rejects.toThrow(
+      'unresolved outcome; reconcile it before retrying'
+    );
+    expect(retrySubmit).not.toHaveBeenCalled();
   });
 
   it('retains a pending row when Reddit failure has an unknown external outcome', async () => {

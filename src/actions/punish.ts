@@ -116,6 +116,7 @@ function pendingRecordFor(input: PunishInput, at: number, rung: LadderRung): Omi
     label: rung.label,
     modUser: input.modUser,
     targetThingId: input.targetThingId,
+    state: 'pending',
   };
 }
 
@@ -151,6 +152,13 @@ export async function punish(
       throw new Error('could not read action history; no Reddit action was attempted');
     }
     const summary = strictSummary.summary;
+    const strictRows = await deps.history.loadStrict(input.targetUser);
+    if (!strictRows.ok) {
+      throw new Error('could not verify action history; no Reddit action was attempted');
+    }
+    if (strictRows.rows.some((row) => row.state === 'pending')) {
+      throw new Error('an earlier Reddit action has an unresolved outcome; reconcile it before retrying');
+    }
     const rung = pickRung(summary.total, summary.latestAt, at);
     const effective = effectivePriors(summary.total, summary.latestAt, at);
 
@@ -240,6 +248,17 @@ export async function punish(
         }
       }
       throw error;
+    }
+
+    if (recorded && pendingRecord) {
+      const marked = await deps.history.markApplied(input.targetUser, pendingRecord.id, {
+        redis: deps.redis,
+        key: lock.key,
+        token: lock.token,
+      });
+      if (!marked) {
+        console.error(`[punish] Reddit action applied but pending record ${pendingRecord.id} could not be finalized`);
+      }
     }
 
     return {

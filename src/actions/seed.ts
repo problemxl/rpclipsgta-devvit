@@ -12,7 +12,7 @@
  * authorization, username normalization, Redis locking, or any history access.
  */
 
-import type { HistoryStore, RedisLeaseStore } from '../lib/history.js';
+import type { HistoryStore, ModActionRecord, RedisLeaseStore } from '../lib/history.js';
 import {
   acquireUserActionLock,
   assertUserActionLockHeld,
@@ -254,6 +254,7 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
       // the whole batch, preventing punish/clear from interleaving with a
       // partial seed.
       let landed = 0;
+      const landedRecords: ModActionRecord[] = [];
       for (let k = 1; k <= priors; k += 1) {
         await assertUserActionLockHeld(deps.redis, lock);
         const rowAt = at - (latestAgeDays + (priors - k)) * DAY_MS;
@@ -282,6 +283,7 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
           });
         }
         landed += 1;
+        landedRecords.push(appended.record);
       }
 
       await assertUserActionLockHeld(deps.redis, lock);
@@ -295,14 +297,20 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
       const exactRows =
         verifiedRows.ok &&
         verifiedRows.rows.length === priors &&
-        verifiedRows.rows.every((row, index) =>
-          row.at === expectedTimes[index] &&
-          row.rule === SEED_RECORD_FIELDS.rule &&
-          row.action === SEED_RECORD_FIELDS.action &&
-          row.label === SEED_RECORD_FIELDS.label &&
-          row.modUser === SEED_RECORD_FIELDS.modUser &&
-          row.targetThingId === SEED_RECORD_FIELDS.targetThingId
-        );
+        verifiedRows.rows.every((row, index) => {
+          const expected = landedRecords[index];
+          return Boolean(
+            expected &&
+              row.id === expected.id &&
+              row.at === expected.at &&
+              row.at === expectedTimes[index] &&
+              row.rule === SEED_RECORD_FIELDS.rule &&
+              row.action === SEED_RECORD_FIELDS.action &&
+              row.label === SEED_RECORD_FIELDS.label &&
+              row.modUser === SEED_RECORD_FIELDS.modUser &&
+              row.targetThingId === SEED_RECORD_FIELDS.targetThingId
+          );
+        });
       if (
         !verified.ok ||
         verified.summary.total !== priors ||
