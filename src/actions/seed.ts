@@ -302,6 +302,7 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
           return Boolean(
             expected &&
               row.id === expected.id &&
+              row.state === expected.state &&
               row.at === expected.at &&
               row.at === expectedTimes[index] &&
               row.rule === SEED_RECORD_FIELDS.rule &&

@@ -554,6 +554,7 @@ describe('punish compensation', () => {
       label: 'Warning',
       modUser: 'Mod',
       targetThingId: 't3_post',
+      state: 'pending',
     })).record;
     const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
 
@@ -595,6 +596,7 @@ describe('punish compensation', () => {
     })).resolves.toBe(false);
     expect(await history.load('Target')).toEqual([pending]);
     expect(redis.values.get(lock.key)).toBe('Other:999:replacement');
+    expect(redis.discardCalls).toBe(0);
   });
 
   it('retains a pending row when ownership is lost before fenced compensation', async () => {
@@ -607,6 +609,7 @@ describe('punish compensation', () => {
       label: 'Warning',
       modUser: 'Mod',
       targetThingId: 't3_post',
+      state: 'pending',
     })).record;
     const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
     redis.values.set(lock.key, 'Other:999:replacement');

@@ -278,12 +278,15 @@ place and escalate operationally; do not guess, force-delete, or retry the
 moderation action. This is an operational procedure, not a fencing guarantee.
 
 For a `state: pending` action, inspect Reddit's moderator log and the target
-comment/ban first. If Reddit definitely applied the action, use an administrator
-operation that ownership-fences the exact history member to finalize it; if
-Reddit definitely did not apply it, use the same ownership-fenced operation to
-remove that exact pending member. If the outcome remains uncertain, leave the
-row pending. The app intentionally provides no automatic retry or in-app
-history-repair menu.
+comment/ban first. The app does not provide a reconciliation command or direct
+Redis admin access. If Reddit definitely applied the action, an administrator
+must use separately controlled Redis tooling that ownership-fences the exact
+history member to finalize it; if Reddit definitely did not apply it, use the
+same ownership-fenced tooling to remove that exact pending member. If the
+outcome remains uncertain, leave the row pending. The app intentionally
+provides no automatic retry or in-app history-repair menu. If suitable
+ownership-fenced tooling is unavailable, escalate to the installation owner;
+do not edit the sorted set with an unconditional command.
 
 ## Publish checklist
 

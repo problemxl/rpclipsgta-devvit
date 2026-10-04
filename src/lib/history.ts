@@ -416,7 +416,7 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           const match = rows.find((row) => {
             try {
               const parsed: unknown = JSON.parse(row.member);
-              return isModActionRecord(parsed) && parsed.id === id;
+              return isModActionRecord(parsed) && parsed.id === id && parsed.state === 'pending';
             } catch {
               return false;
             }

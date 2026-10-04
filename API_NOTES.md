@@ -65,9 +65,10 @@ command surface:
 The relevant source is `src/lib/user-lock.ts`, `src/lib/history.ts`, and
 `src/actions/seed.ts`. The transaction mock shipped in the installed package
 is only a test double; the app's deterministic tests model WATCH's
-abort-on-change behavior explicitly. Pending history rows are intentionally
-not auto-repaired: administrators must reconcile the Reddit result and use an
-ownership-fenced history operation.
+abort-on-change behavior explicitly. The app provides no reconciliation
+command or direct Redis admin access. Pending history rows are intentionally
+not auto-repaired: administrators must reconcile the Reddit result using
+separately controlled ownership-fenced tooling.
 
 ---
 

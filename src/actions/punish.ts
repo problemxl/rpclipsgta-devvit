@@ -48,6 +48,8 @@ export interface PunishResult {
   readonly priors: number;
   readonly ruleName: string;
   readonly recorded: boolean;
+  /** True only when a stored pending marker was finalized after Reddit success. */
+  readonly finalized?: boolean;
 }
 
 export interface WarningCommentInput {
@@ -250,13 +252,14 @@ export async function punish(
       throw error;
     }
 
+    let finalized = false;
     if (recorded && pendingRecord) {
-      const marked = await deps.history.markApplied(input.targetUser, pendingRecord.id, {
+      finalized = await deps.history.markApplied(input.targetUser, pendingRecord.id, {
         redis: deps.redis,
         key: lock.key,
         token: lock.token,
       });
-      if (!marked) {
+      if (!finalized) {
         console.error(`[punish] Reddit action applied but pending record ${pendingRecord.id} could not be finalized`);
       }
     }
@@ -269,6 +272,7 @@ export async function punish(
       priors: effective,
       ruleName: rule.name,
       recorded,
+      finalized,
     };
   } finally {
     // A Redis release failure must never throw over an already-applied
