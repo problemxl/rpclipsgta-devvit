@@ -154,7 +154,13 @@ export async function reconcilePending(
       });
     }
 
-    const lock = await acquireUserActionLock(deps.redis, username, actor, deps.now ?? Date.now);
+    let lock;
+    try {
+      lock = await acquireUserActionLock(deps.redis, username, actor, deps.now ?? Date.now);
+    } catch (error) {
+      const detail = detailOf(error);
+      return audit({ status: 'failed', detail: `could not acquire reconciliation lock: ${detail}` });
+    }
     try {
       await assertUserActionLockHeld(deps.redis, lock);
       const loaded = await deps.history.loadStrict(username);
@@ -177,12 +183,11 @@ export async function reconcilePending(
       const changed = input.resolution === 'applied'
         ? await deps.history.markApplied(username, recordId, owner)
         : await deps.history.removeOwned(username, recordId, owner);
-      if (!changed) {
-        return audit({ status: 'failed', detail: 'history transaction was not confirmed; no safe success reported' });
-      }
 
       // Verify the exact post-state while still holding the same lock. This
-      // prevents a malformed EXEC reply from being presented as reconciliation.
+      // also handles a transaction that committed but whose EXEC reply was
+      // lost/malformed: the mutation method returns false, but a verified
+      // desired post-state is still safe to report as reconciled.
       await assertUserActionLockHeld(deps.redis, lock);
       const verified = await deps.history.loadStrict(username);
       if (!verified.ok) {
@@ -196,7 +201,12 @@ export async function reconcilePending(
         return audit({ status: 'failed', detail: 'pending row remains after removal; no retry is safe' });
       }
       if (!correct) {
-        return audit({ status: 'failed', detail: 'post-state did not match the requested reconciliation' });
+        return audit({
+          status: 'failed',
+          detail: changed
+            ? 'post-state did not match the requested reconciliation'
+            : 'history transaction was not confirmed; no safe success reported',
+        });
       }
 
       return audit({ status: 'reconciled', username, recordId, resolution: input.resolution });

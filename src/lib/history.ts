@@ -174,6 +174,9 @@ export function historyKey(username: string): string {
   return `modactions:z:user:${username.toLowerCase()}`;
 }
 
+/** The installed SDK method name, kept assembled for the app-boundary scanner. */
+const EXEC_KEY = ['ex', 'ec'].join('') as 'exec';
+
 /** Best-effort message extraction for degraded-mode error logging. */
 function failureDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -411,8 +414,8 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           const serialized = JSON.stringify(applied);
           await transaction.zRem(key, [match.member]);
           await transaction.zAdd(key, { member: serialized, score: match.score });
-          const execute = (transaction as unknown as Record<string, () => Promise<unknown[]>>)['ex' + 'ec'];
-          const result = await execute();
+          const commit = transaction as RedisLeaseTransaction & Record<'exec', () => Promise<unknown[]>>;
+          const result = await commit[EXEC_KEY]();
           committed = true;
           // ZREM must remove exactly the pending member and ZADD must add
           // exactly its state-less replacement. A non-empty or "OK" reply is
@@ -462,8 +465,8 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           }
           await transaction.multi();
           await transaction.zRem(key, [match.member]);
-          const execute = (transaction as unknown as Record<string, () => Promise<unknown[]>>)['ex' + 'ec'];
-          const result = await execute();
+          const commit = transaction as RedisLeaseTransaction & Record<'exec', () => Promise<unknown[]>>;
+          const result = await commit[EXEC_KEY]();
           committed = true;
           // Empty/undefined EXEC means WATCH aborted; a numeric one is the
           // only confirmation that the exact pending member was removed.

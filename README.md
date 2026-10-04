@@ -292,7 +292,7 @@ old request is still able to call Reddit. If reconciliation reports a held
 lock, stop and escalate; do not assume age or a moderator confirmation proves
 the old request is dead.
 
-**Production is NO-GO for automated recovery/reconciliation.** This repository
+**Production recovery/reconciliation is NO-GO in this app.** This repository
 has no supported production Redis admin command and the Devvit runtime cannot
 fence a Reddit request that already started. For production, the installation
 owner must first stop/drain the relevant worker and prove the old invocation
@@ -353,6 +353,9 @@ npm test        # vitest run — unit tests, no network or Devvit runtime
 - `src/actions/fixture.ts` — fixture targets, URL/title validation, and dedupe.
 - `src/actions/seed.ts` — dev/QA-only history seeding and clearing for ladder
   testing, behind a hard subreddit allowlist.
+- `src/actions/reconcile-pending.ts` — exact-row dev/QA pending-outcome
+  inspection and reconciliation; no Reddit retry or lock deletion.
+- `src/lib/dev-qa.ts` — shared hard dev/QA allowlist for state-mutating tools.
 - `src/actions/autoescalate.ts` — framework-free moderator Remove post and
   Remove & escalate orchestration.
 - `src/lib/detection.ts` — pure R4/R5/R12 detectors and URL normalization.

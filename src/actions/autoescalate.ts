@@ -365,7 +365,10 @@ export function buildRemovalSuccessToast(
   const label = `R${outcome.violation.rule}${ruleName ? ` — ${ruleName}` : ''}`;
   if (!outcome.escalateResult) return `Removed post (${label}); no escalation required.`;
   if (outcome.escalateResult.finalized === false) {
-    return `Removed post (${label}) and escalated [finalized:false]. Reddit action applied; history finalization failed. Do not retry; reconcile the pending record.`;
+    const record = outcome.escalateResult.pending_record_id
+      ? ` Record: ${outcome.escalateResult.pending_record_id}.`
+      : '';
+    return `Removed post (${label}) and escalated [finalized:false]. Reddit action applied; history finalization failed.${record} Do not retry; reconcile the pending record.`;
   }
   return `Removed post (${label}) and escalated.`;
 }

@@ -280,6 +280,21 @@ export async function punish(
             token: lock.token,
           });
           if (finalized) break;
+          await assertUserActionLockHeld(deps.redis, lock);
+
+          // A transaction can commit while its reply is lost or malformed.
+          // Re-read under the still-held lock before retrying so a committed
+          // state-less replacement is recognized as finalized rather than
+          // presented as an impossible-to-reconcile pending row.
+          const verified = await deps.history.loadStrict(input.targetUser);
+          if (
+            verified.ok &&
+            verified.rows.filter((row) => row.id === pendingRecord?.id).length === 1 &&
+            verified.rows.find((row) => row.id === pendingRecord?.id)?.state === undefined
+          ) {
+            finalized = true;
+            break;
+          }
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           console.error(

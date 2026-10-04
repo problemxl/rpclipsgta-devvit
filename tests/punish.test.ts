@@ -66,6 +66,9 @@ class FakeRedis implements FakeRedisShape {
 
   async watch(...keys: string[]): Promise<RedisLeaseTransaction> {
     const snapshot = new Map(keys.map((key) => [key, this.values.get(key)]));
+    const zsetSnapshot = new Map(
+      keys.map((key) => [key, JSON.stringify([...((this.zsets.get(key) ?? new Map()).entries())])])
+    );
     const redis = this;
     let deletion: string[] = [];
     let zrem: Array<{ key: string; members: string[] }> = [];
@@ -92,7 +95,10 @@ class FakeRedis implements FakeRedisShape {
         if (redis.failExec) throw new Error('exec failed');
         if (!multiStarted) throw new Error('multi required');
         for (const key of keys) {
-          if (redis.values.get(key) !== snapshot.get(key)) return [];
+          if (
+            redis.values.get(key) !== snapshot.get(key) ||
+            JSON.stringify([...(redis.zsets.get(key) ?? new Map()).entries()]) !== zsetSnapshot.get(key)
+          ) return [];
         }
         if (redis.execReplyOverrideConfigured) return redis.execReplyOverride ?? [];
         const replies: unknown[] = [];
@@ -186,9 +192,10 @@ class FakeRedis implements FakeRedisShape {
 }
 
 function deps(overrides: Partial<PunishDeps> = {}, redis = new FakeRedis()): PunishDeps {
+  const actualRedis = (overrides.redis ?? redis) as FakeRedisShape;
   return {
-    history: overrides.history ?? createHistoryStore(redis),
-    redis: overrides.redis ?? redis,
+    history: overrides.history ?? createHistoryStore(actualRedis),
+    redis: actualRedis,
     submitComment: vi.fn(async () => 't1_warning'),
     banUser: vi.fn(async () => undefined),
     now: () => NOW,
@@ -377,6 +384,21 @@ describe('punish', () => {
     expect(result).toMatchObject({ recorded: true, finalized: false });
     expect(markApplied).toHaveBeenCalledTimes(3);
     expect(redis.values.has(punishLockKey('Target'))).toBe(false);
+  });
+
+  it('recognizes a committed finalization even when its reply is reported as ambiguous', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const originalMarkApplied = history.markApplied.bind(history);
+    vi.spyOn(history, 'markApplied').mockImplementation(async (...args) => {
+      await originalMarkApplied(...args);
+      return false;
+    });
+    const result = await punish(deps({ redis, history }), input);
+    expect(result).toMatchObject({ recorded: true, finalized: true });
+    const rows = await history.loadStrict('Target');
+    expect(rows.ok).toBe(true);
+    if (rows.ok) expect(rows.rows[0]?.state).toBeUndefined();
   });
 
   it('propagates comment execution failures', async () => {

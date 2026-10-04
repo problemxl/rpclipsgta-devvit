@@ -60,6 +60,9 @@ class FakeRedis implements RedisLike, RedisStringLike {
   }
   async watch(...keys: string[]): Promise<RedisLeaseTransaction> {
     const snapshots = new Map(keys.map((key) => [key, this.values.get(key)]));
+    const zsetSnapshots = new Map(
+      keys.map((key) => [key, JSON.stringify([...(this.sets.get(key) ?? new Map()).entries()])])
+    );
     const redis = this;
     let deletion: string[] = [];
     let zrem: Array<{ key: string; members: string[] }> = [];
@@ -72,7 +75,10 @@ class FakeRedis implements RedisLike, RedisStringLike {
       async zAdd(key, ...members) { zadd.push({ key, members }); return tx; },
       async exec() {
         if (!multi) throw new Error('MULTI required');
-        if (keys.some((key) => redis.values.get(key) !== snapshots.get(key))) return [];
+        if (keys.some((key) =>
+          redis.values.get(key) !== snapshots.get(key) ||
+          JSON.stringify([...(redis.sets.get(key) ?? new Map()).entries()]) !== zsetSnapshots.get(key)
+        )) return [];
         const replies: unknown[] = [];
         for (const key of deletion) {
           await redis.del(key);
