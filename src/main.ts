@@ -6,6 +6,11 @@
  * creation makes a normal link post with the original Twitch/Kick URL; it is
  * moderator-initiated and never creates a comment or crosspost.
  *
+ * A "Seed test history" subreddit menu action (moderators only) seeds or
+ * resets a user's action history to exercise the ladder in the dev/QA
+ * subreddits; the allowlist guard inside seedHistory makes it a no-op
+ * everywhere else.
+ *
  * Escalations are executed entirely in the app: the ladder and decay policy
  * are pure code, action history is in installation Redis, and Reddit receives
  * the warning comment or ban directly.
@@ -42,6 +47,12 @@ import {
   isAuthorizedFixtureActor,
   type FixturePost,
 } from './actions/fixture.js';
+import {
+  buildSeedToast,
+  runSeedSafely,
+  type SeedInput,
+  type SeedOperation,
+} from './actions/seed.js';
 import { actionForRule } from './lib/detection.js';
 import { ruleByNumber, RULES, type Rule } from './lib/rules.js';
 import { createHistoryStore } from './lib/history.js';
@@ -464,6 +475,89 @@ Devvit.addMenuItem({
   },
 });
 
+const seedForm = Devvit.createForm(
+  {
+    title: 'Seed test history',
+    description: 'Dev/QA only: place a user at a ladder position or reset their history.',
+    acceptLabel: 'Apply',
+    fields: [
+      {
+        type: 'string',
+        name: 'username',
+        label: 'Username',
+        required: true,
+        helpText: 'No leading u/',
+      },
+      {
+        type: 'select',
+        name: 'operation',
+        label: 'Operation',
+        required: true,
+        options: [
+          { label: 'Seed priors', value: 'seed' },
+          { label: 'Clear history', value: 'clear' },
+        ],
+      },
+      {
+        type: 'number',
+        name: 'priors',
+        label: 'Priors to seed (1-20)',
+        helpText: 'Seed priors only: rows are spaced one day apart.',
+      },
+      {
+        type: 'number',
+        name: 'latestAgeDays',
+        label: 'Age of newest prior, days (0-3650)',
+        helpText: 'Seed priors only: drives the 90-day decay clock.',
+      },
+    ],
+  },
+  async (event, context) => {
+    // -- Subreddit guard ------------------------------------------------------
+    // A subreddit menu press sets context.subredditName; without it the
+    // allowlist cannot be evaluated, so the press is reported as a denial.
+    // The allowlist itself is enforced (and loudly logged) inside seedHistory.
+    const subredditName = context.subredditName?.trim() ?? '';
+    if (!subredditName) {
+      safeToast(context, buildSeedToast({ status: 'denied' }));
+      return;
+    }
+
+    // -- Form input -----------------------------------------------------------
+    // Number fields arrive as numbers; guard against malformed/NaN replays
+    // before calling seedHistory, which re-validates the bounds anyway.
+    const priors = numericFormValue(event.values.priors);
+    const latestAgeDays = numericFormValue(event.values.latestAgeDays);
+    const operation: SeedOperation = event.values.operation?.[0] === 'clear' ? 'clear' : 'seed';
+
+    try {
+      const seedInput: SeedInput = {
+        subredditName,
+        username: typeof event.values.username === 'string' ? event.values.username : '',
+        operation,
+        ...(operation === 'seed' && priors !== undefined ? { priors } : {}),
+        ...(operation === 'seed' && latestAgeDays !== undefined ? { latestAgeDays } : {}),
+      };
+      const outcome = await runSeedSafely({ history: createHistoryStore(context.redis) }, seedInput);
+      safeToast(context, buildSeedToast(outcome));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[seed] form failed: ${detail}`);
+      safeToast(context, `Seed test history failed: ${detail}`);
+    }
+  }
+);
+
+Devvit.addMenuItem({
+  label: 'Seed test history',
+  description: 'Dev/QA testing tool: seed or reset escalation history',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: (_event, context) => {
+    context.ui.showForm(seedForm);
+  },
+});
+
 function createPunishDeps(context: Devvit.Context): PunishDeps {
   return {
     history: createHistoryStore(context.redis),
@@ -618,6 +712,11 @@ function safeToast(context: Devvit.Context, text: string): void {
   } catch {
     // Swallow: a failed toast must not throw over the handler's result.
   }
+}
+
+/** Pass a form number field through only when it is a usable finite number. */
+function numericFormValue(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 export default Devvit;
