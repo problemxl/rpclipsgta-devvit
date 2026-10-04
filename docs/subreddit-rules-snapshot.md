@@ -129,4 +129,8 @@ design — one sorted-set row per infraction, with no record cap and no TTL —
 because the 90-day decay against the latest action alone governs the ladder. A seen claim is released
 before or during failed removal, but retained after removal; URL duplicate
 claims are made only by otherwise-clean posts and use GET-then-SET in the
-low-concurrency mod path.
+low-concurrency mod path. For testing the ladder itself, a dev/QA-only **Seed
+test history** menu action (subreddit allowlist enforced on every call) writes
+synthetic rule-11 warn rows (`modUser: seed-tool`) into the same per-user
+history the ladder reads, so seeded priors are indistinguishable from real
+ones to rung selection and decay.

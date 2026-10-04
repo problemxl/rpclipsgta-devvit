@@ -12,6 +12,8 @@ A self-contained moderator-actions Devvit app for r/RPClipsGTA. It provides:
   by explicit moderator discretion.
 - **Create clip fixture**: moderator-only creation of an ordinary link post in
   the development or QA subreddit.
+- **Seed test history**: dev/QA-only moderator tool to place a user at any
+  ladder position (or reset them) for testing escalation and decay.
 
 There is no external escalation endpoint, Python runtime, PocketBase dependency,
 network allowlist, or app secret. All execution happens through Devvit's Reddit
@@ -165,6 +167,44 @@ Redis state is installation-scoped and idempotent:
   any removal or punishment; a second press on the same post or comment reports
   "Already processed by this action."
 
+## Testing the ladder
+
+**Seed test history** is a moderator-only menu item shown on the subreddit
+itself. Its form takes a username (no leading `u/`), an operation — **Seed
+priors** or **Clear history** — and, for seeding, the number of priors (1–20)
+and the age of the newest prior in days (0–3650). Seeding writes that many
+warning rows spaced one day apart, with the newest row exactly the requested
+age, so the decay clock starts where the operator wants it.
+
+Two properties matter:
+
+- **Hard dev/QA-only guard.** Every call first checks the subreddit against
+  exactly `S17Cjn21GT` (development) and `rpclipsgta_mod_dev` (QA/staging),
+  case-insensitively. Anywhere else — including production — the tool refuses
+  before any username is normalized or any row is written, and logs the denial
+  loudly. The rows themselves are honest synthetics: rule 11 warnings recorded
+  as `modUser: seed-tool` against `t3_seeded`.
+- **Seeded rows are indistinguishable from real ones to the ladder.** They go
+  through the same `HistoryStore` and per-user sorted set the punish flow
+  reads, so rung selection and 90-day decay behave in a seeded test exactly as
+  they would after months of real actions. Clearing a user (`DEL` of the
+  history key) resets them to a fresh first-offense state.
+
+Throwaway Reddit accounts for end-to-end testing are prepared with
+`scripts/gen-test-accounts.mjs` (credentials + disposable inboxes; signups stay
+manual).
+
+Testing playbook:
+
+1. **Detection:** create a clip fixture from a source post into the dev or QA
+   subreddit, then press **Remove post** on the fixture to confirm the
+   R4/R5/R6/R12 classes and idempotency.
+2. **Ladder:** seed a throwaway account with, say, 2 priors at age 0, then
+   trigger one real violation — the next action must land on the matching rung
+   (2 priors ⇒ 7 day ban). Seed 5 for the permanent-ban rung.
+3. **Decay:** seed 1 prior at age 90 days and trigger a violation — the rung
+   must have decayed back to a warning. Clear the user between scenarios.
+
 ## Publish checklist
 
 1. Run `npm run build && npm test` — both must be green.
@@ -177,7 +217,9 @@ Redis state is installation-scoped and idempotent:
    other source subreddits.
 5. Smoke-test escalation with a test account. Confirm a fresh account gets the
    warning toast (`Warned u/... (R1 — Reddit Rules)`), the warning reply, and a
-   Redis history record. Exercise repeat and decay rungs before production use.
+   Redis history record. Exercise repeat and decay rungs before production use
+   — in the dev/QA subreddits the **Seed test history** tool (see *Testing the
+   ladder*) places any user on any rung in seconds.
 6. Smoke-test fixtures from a source post containing a real-looking Twitch or
    Kick clip URL. Choose each target once, verify the exact URL and title prefix,
    then repeat the action to confirm no second post is created.
@@ -195,10 +237,13 @@ npm test        # vitest run — unit tests, no network or Devvit runtime
   (sorted set, one row per infraction).
 - `src/actions/escalate.ts` — pure target resolution and toast builders.
 - `src/actions/fixture.ts` — fixture targets, URL/title validation, and dedupe.
+- `src/actions/seed.ts` — dev/QA-only history seeding and clearing for ladder
+  testing, behind a hard subreddit allowlist.
 - `src/actions/autoescalate.ts` — framework-free moderator Remove post and
   Remove & escalate orchestration.
 - `src/lib/detection.ts` — pure R4/R5/R12 detectors and URL normalization.
 - `src/lib/rules.ts` — canonical 12 subreddit rules.
 - `src/main.ts` — Devvit wiring for menus, forms, Reddit APIs, and Redis.
-- `tests/ladder.test.ts`, `tests/history.test.ts`, `tests/punish.test.ts` —
-  deterministic engine, storage, and execution coverage.
+- `tests/ladder.test.ts`, `tests/history.test.ts`, `tests/punish.test.ts`,
+  `tests/seed.test.ts` — deterministic engine, storage, execution, and
+  dev/QA-seeding coverage.
