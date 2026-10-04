@@ -85,6 +85,14 @@ class FakeZSetRedis implements RedisLike {
     if (this.fail) throw new Error('redis down');
     return this.zset(key).size;
   }
+
+  async del(key: string): Promise<number> {
+    this.calls.push('del');
+    if (this.fail) throw new Error('redis down');
+    const removed = this.zset(key).size;
+    this.sets.delete(key);
+    return removed;
+  }
 }
 
 function record(at: number): Omit<ModActionRecord, 'id'> {
@@ -368,5 +376,45 @@ describe('history store', () => {
     // the store only ever issues sorted-set commands.
     expect('expire' in redis).toBe(false);
     expect(new Set(redis.calls)).toEqual(new Set(['zAdd', 'zCard', 'zRange', 'zRem']));
+  });
+
+  it('clears an existing history with one DEL and leaves no rows', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(1));
+    await history.append('user', record(2));
+
+    await expect(history.clear('user')).resolves.toBe(true);
+    expect(redis.calls).toEqual(['zAdd', 'zAdd', 'del']); // exactly one DEL
+    expect(await history.load('user')).toEqual([]);
+    expect(await history.summary('user')).toEqual({ total: 0, latestAt: undefined });
+  });
+
+  it('reports success when clearing a user with no history', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+
+    await expect(history.clear('missing')).resolves.toBe(true);
+    expect(redis.calls).toEqual(['del']);
+  });
+
+  it('reports failure and logs when redis fails during clear', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(1));
+    redis.fail = true;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(history.clear('user')).resolves.toBe(false);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] clear modactions:z:user:user failed: redis down'
+      );
+      // A failed DEL means the key must be untouched once redis recovers.
+      redis.fail = false;
+      expect(await history.load('user')).toHaveLength(1);
+    } finally {
+      error.mockRestore();
+    }
   });
 });

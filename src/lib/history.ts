@@ -47,6 +47,11 @@ export interface HistoryStore {
   load(username: string): Promise<ModActionRecord[]>;
   /** Remove one row by id during execution-failure compensation. */
   remove(username: string, id: string): Promise<boolean>;
+  /**
+   * Delete the user's ENTIRE history (dev/QA seed tooling). A missing key is
+   * still a success — the post-state is "no history" either way.
+   */
+  clear(username: string): Promise<boolean>;
 }
 
 /** One sorted-set member, mirroring @devvit/redis ZMember. */
@@ -69,12 +74,14 @@ export interface RedisZRangeOptions {
 
 /**
  * The structural Redis subset the history store actually uses: sorted-set
- * commands only, with signatures matching the installed @devvit/redis client.
- * Appends are a single atomic ZADD — there is no read-modify-write and
- * therefore no lost-update window between concurrent actions.
+ * commands plus the DEL used by clear(), with signatures matching the
+ * installed @devvit/redis client. Appends are a single atomic ZADD — there is
+ * no read-modify-write and therefore no lost-update window between concurrent
+ * actions.
  */
 export interface RedisLike {
   zAdd(key: string, ...members: RedisZMember[]): Promise<number>;
+  del(key: string): Promise<unknown>;
   zRange(
     key: string,
     start: number,
@@ -252,6 +259,20 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
         // Degradation: the compensation caller treats false as "record may
         // still exist", but the failure must show up in the logs.
         console.error(`[history] remove ${historyKey(username)} failed: ${failureDetail(error)}`);
+        return false;
+      }
+    },
+
+    async clear(username) {
+      try {
+        // DEL of a missing key resolves normally and deletes nothing; both
+        // paths leave the user with no history, so both report success.
+        await redis.del(historyKey(username));
+        return true;
+      } catch (error) {
+        // Degradation: the seed caller treats false as "history may still
+        // exist", but the failure must show up in the logs.
+        console.error(`[history] clear ${historyKey(username)} failed: ${failureDetail(error)}`);
         return false;
       }
     },

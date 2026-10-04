@@ -246,6 +246,7 @@ describe('punish', () => {
       },
       load: async () => [] as ModActionRecord[],
       remove: async () => false,
+      clear: async () => false,
     };
     const current = deps({ history: failingHistory });
     await expect(punish(current, input)).resolves.toMatchObject({ recorded: false, action: 'warn' });
