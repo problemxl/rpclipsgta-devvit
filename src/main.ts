@@ -53,6 +53,10 @@ import {
   runSeedSafely,
   type SeedInput,
 } from './actions/seed.js';
+import {
+  buildLockRecoveryToast,
+  recoverUserActionLock,
+} from './actions/recover-lock.js';
 import { actionForRule } from './lib/detection.js';
 import { ruleByNumber, RULES, type Rule } from './lib/rules.js';
 import { createHistoryStore } from './lib/history.js';
@@ -475,6 +479,57 @@ Devvit.addMenuItem({
   },
 });
 
+const lockRecoveryForm = Devvit.createForm(
+  {
+    title: 'Recover stuck action lock',
+    description:
+      'Emergency only: the lock has no automatic expiry. Confirm that no request for this user is running before recovery.',
+    acceptLabel: 'Recover lock',
+    fields: [
+      {
+        type: 'string',
+        name: 'username',
+        label: 'Username',
+        required: true,
+        helpText: 'The affected Reddit username; leading u/ is optional.',
+      },
+      {
+        type: 'boolean',
+        name: 'confirm',
+        label: 'I confirm no action for this user is still running',
+        required: true,
+      },
+    ],
+  },
+  async (event, context) => {
+    const subredditName = context.subredditName?.trim() ?? '';
+    const actor = context.username?.trim() ?? '';
+    const username = typeof event.values.username === 'string' ? event.values.username : '';
+    const confirm = event.values.confirm === true;
+    if (!subredditName || !actor) {
+      safeToast(context, 'Could not determine the subreddit or acting moderator.');
+      return;
+    }
+    try {
+      const outcome = await recoverUserActionLock(
+        {
+          redis: context.redis,
+          authorizeActor: async (name, usernameToCheck) =>
+            (await context.reddit
+              .getModerators({ subredditName: name, username: usernameToCheck, limit: 1, pageSize: 1 })
+              .all()).length > 0,
+        },
+        { subredditName, actor, username, confirm }
+      );
+      safeToast(context, buildLockRecoveryToast(outcome));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[lock-recovery] form failed: ${detail}`);
+      safeToast(context, `Lock recovery failed: ${detail}`);
+    }
+  }
+);
+
 const seedForm = Devvit.createForm(
   {
     title: 'Seed test history',
@@ -494,7 +549,7 @@ const seedForm = Devvit.createForm(
         label: 'Operation',
         required: true,
         options: [
-          { label: 'Seed priors', value: 'seed' },
+          { label: 'Seed priors (history must be empty)', value: 'seed' },
           { label: 'Clear history', value: 'clear' },
         ],
       },
@@ -567,6 +622,16 @@ const seedForm = Devvit.createForm(
     }
   }
 );
+
+Devvit.addMenuItem({
+  label: 'Recover stuck action lock',
+  description: 'Emergency recovery after confirming no action is running for the user',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: (_event, context) => {
+    context.ui.showForm(lockRecoveryForm);
+  },
+});
 
 Devvit.addMenuItem({
   label: 'Seed test history',

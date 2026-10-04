@@ -351,6 +351,19 @@ describe('history store', () => {
     }
   });
 
+  it('offers a strict summary that fails closed instead of treating Redis failure as empty', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(123));
+    await expect(history.summaryStrict('user')).resolves.toEqual({
+      ok: true,
+      summary: { total: 1, latestAt: 123 },
+    });
+
+    redis.fail = true;
+    await expect(history.summaryStrict('user')).resolves.toEqual({ ok: false });
+  });
+
   it('keeps the entire lifetime history — no record cap', async () => {
     const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);

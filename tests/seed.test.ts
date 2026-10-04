@@ -43,6 +43,28 @@ class FakeLockRedis implements RedisStringLike {
   async del(key: string): Promise<void> {
     this.values.delete(key);
   }
+
+  async watch(...keys: string[]): Promise<import('../src/lib/history.js').RedisLeaseTransaction> {
+    const redis = this;
+    const snapshot = new Map(keys.map((key) => [key, this.values.get(key)]));
+    let deletion: string[] = [];
+    const transaction = {
+      async multi() {},
+      async del(...names: string[]) {
+        deletion = names;
+        return transaction;
+      },
+      async exec() {
+        if (keys.some((key) => redis.values.get(key) !== snapshot.get(key))) return [];
+        for (const name of deletion) await redis.del(name);
+        return deletion.map(() => 'OK');
+      },
+      async discard() {
+        deletion = [];
+      },
+    };
+    return transaction;
+  }
 }
 
 const NOW = 1_000_000_000;
@@ -77,8 +99,16 @@ class FakeHistory implements HistoryStore {
   async summary(username: string): Promise<{ total: number; latestAt: number | undefined }> {
     if (this.throwOnEveryCall) throw new Error('summary exploded');
     const rows = this.appends.filter((row) => row.username === username);
-    return { total: rows.length, latestAt: undefined };
+    return { total: rows.length, latestAt: rows.at(-1)?.record.at };
   }
+
+  summaryStrict = async (username: string): Promise<{
+    ok: true;
+    summary: { total: number; latestAt: number | undefined };
+  } | { ok: false }> => {
+    if (this.throwOnEveryCall) return { ok: false };
+    return { ok: true, summary: await this.summary(username) };
+  };
 
   async load(username: string): Promise<ModActionRecord[]> {
     if (this.throwOnEveryCall) throw new Error('load exploded');
@@ -95,6 +125,11 @@ class FakeHistory implements HistoryStore {
   async clear(username: string): Promise<boolean> {
     if (this.throwOnEveryCall) throw new Error('clear exploded');
     this.cleared.push(username);
+    if (this.clearResult) {
+      for (let index = this.appends.length - 1; index >= 0; index -= 1) {
+        if (this.appends[index]?.username === username) this.appends.splice(index, 1);
+      }
+    }
     return this.clearResult;
   }
 }
@@ -196,12 +231,11 @@ describe('seedHistory — allowlist guard', () => {
   });
 
   it('accepts dev/QA subreddit names in any casing after moderator authorization', async () => {
-    const current = deps();
     await expect(
-      seedHistory(current, input({ subredditName: 'S17CJN21GT' }))
+      seedHistory(deps(), input({ subredditName: 'S17CJN21GT' }))
     ).resolves.toMatchObject({ status: 'seeded' });
     await expect(
-      seedHistory(current, input({ subredditName: 'rpclipsgta_mod_dev' }))
+      seedHistory(deps(), input({ subredditName: 'rpclipsgta_mod_dev' }))
     ).resolves.toMatchObject({ status: 'seeded' });
   });
 });
@@ -275,12 +309,11 @@ describe('seedHistory — validation', () => {
   );
 
   it('accepts the inclusive bounds 1/20 priors and 0/3650 days', async () => {
-    const current = deps();
     await expect(
-      seedHistory(current, input({ priors: 1, latestAgeDays: 0 }))
+      seedHistory(deps(), input({ priors: 1, latestAgeDays: 0 }))
     ).resolves.toMatchObject({ status: 'seeded' });
     await expect(
-      seedHistory(current, input({ priors: 20, latestAgeDays: 3650 }))
+      seedHistory(deps(), input({ priors: 20, latestAgeDays: 3650 }))
     ).resolves.toMatchObject({ status: 'seeded' });
   });
 });
@@ -323,7 +356,33 @@ describe('seedHistory — seeding', () => {
     expect(current.history.appends[0]?.username).toBe('ladder_user');
   });
 
-  it('places the user on the matching ladder rung and lets decay work', async () => {
+  it('rejects a seed when history already exists and requires an explicit clear first', async () => {
+    const current = deps();
+    await expect(seedHistory(current, input({ priors: 2, latestAgeDays: 7 }))).resolves.toMatchObject({
+      status: 'seeded',
+    });
+    await expect(seedHistory(current, input({ priors: 5, latestAgeDays: 0 }))).resolves.toEqual({
+      status: 'failed',
+      detail: 'history is not empty; clear u/ladder_user and retry',
+    });
+    expect(current.history.appends).toHaveLength(2);
+    expect(current.history.cleared).toEqual([]);
+  });
+
+  it('rejects a repeated seed instead of silently changing the requested prior count or age', async () => {
+    const current = deps();
+    await expect(seedHistory(current, input({ priors: 3, latestAgeDays: 12 }))).resolves.toMatchObject({
+      status: 'seeded',
+    });
+    const original = current.history.appends.map(({ record }) => record.at);
+    await expect(seedHistory(current, input({ priors: 3, latestAgeDays: 0 }))).resolves.toMatchObject({
+      status: 'failed',
+      detail: 'history is not empty; clear u/ladder_user and retry',
+    });
+    expect(current.history.appends.map(({ record }) => record.at)).toEqual(original);
+  });
+
+  it('places the user on the matching ladder rung and lets decay work after an explicit clear', async () => {
     const current = deps();
     await seedHistory(current, input({ priors: 1, latestAgeDays: 0 }));
     // One fresh prior ⇒ next violation is a 3 day ban.
@@ -332,7 +391,12 @@ describe('seedHistory — seeding', () => {
     // The same single prior, 90 days old, has decayed back to a warning.
     expect(effectivePriors(1, NOW - 90 * DAY, NOW)).toBe(0);
 
-    await seedHistory(current, input({ priors: 5, latestAgeDays: 0 }));
+    await expect(seedHistory(current, input({ operation: 'clear' }))).resolves.toMatchObject({
+      status: 'cleared',
+    });
+    await expect(seedHistory(current, input({ priors: 5, latestAgeDays: 0 }))).resolves.toMatchObject({
+      status: 'seeded',
+    });
     expect(pickRung(5, NOW, NOW).label).toBe('Permanent ban');
   });
 
@@ -348,6 +412,11 @@ describe('seedHistory — seeding', () => {
       // Exactly the failed count was attempted-and-kept; the operator clears.
       expect(current.history.appends).toHaveLength(2);
       expect(current.history.cleared).toEqual([]);
+      // A retry cannot report success over the partial batch. Clear is explicit.
+      await expect(seedHistory(current, input({ priors: 4 }))).resolves.toEqual({
+        status: 'failed',
+        detail: 'history is not empty; clear u/ladder_user and retry',
+      });
     } finally {
       log.mockRestore();
     }
@@ -396,10 +465,20 @@ describe('seedHistory — never throws', () => {
       await expect(seedHistory(current, input({ operation: 'clear' }))).resolves.toMatchObject({
         status: 'failed',
       });
-      expect(error).toHaveBeenCalledTimes(2);
+      expect(error).toHaveBeenCalled();
     } finally {
       error.mockRestore();
     }
+  });
+
+  it('fails closed when it cannot verify whether history is empty', async () => {
+    const current = deps();
+    current.history.summaryStrict = async () => ({ ok: false });
+    await expect(seedHistory(current, input())).resolves.toEqual({
+      status: 'failed',
+      detail: 'could not verify existing history; clear u/ladder_user and retry',
+    });
+    expect(current.history.appends).toEqual([]);
   });
 
   it('includes the landed count when an append throws mid-way', async () => {
@@ -544,6 +623,7 @@ describe('seedHistory — never throws', () => {
             history: {
               append: () => Promise.reject(new Error('impossible')),
               summary: () => Promise.reject(new Error('impossible')),
+              summaryStrict: () => Promise.reject(new Error('impossible')),
               load: () => Promise.reject(new Error('impossible')),
               remove: () => Promise.reject(new Error('impossible')),
               clear: () => Promise.reject(new Error('impossible')),
@@ -564,7 +644,7 @@ describe('buildSeedToast', () => {
   it('describes seeded priors with the username and newest age', () => {
     expect(
       buildSeedToast({ status: 'seeded', username: 'ladder_user', priors: 3, latestAgeDays: 5 })
-    ).toBe('Seeded 3 priors for u/ladder_user (latest 5 days ago)');
+    ).toBe('Seeded 3 priors for u/ladder_user (latest 5 days ago; history was empty)');
   });
 
   it('describes a cleared user', () => {

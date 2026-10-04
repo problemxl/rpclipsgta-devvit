@@ -35,9 +35,16 @@ details.
 A moderator presses **Escalate** on any post or comment, picks one of the 12
 rules, and optionally supplies a reason. The app resolves the target and then:
 
-1. Acquires `punish:lock:{lowercased username}` in Redis with NX and a ~30s
-   TTL, so overlapping actions for one user serialize; a second concurrent
-   action fails fast with an "already in progress" error.
+1. Acquires `punish:lock:{lowercased username}` in Redis with atomic NX, so
+   overlapping actions for one user serialize; a second concurrent action
+   fails fast with an "already in progress" error. The lock has no automatic
+   expiry: a Reddit call can outlive any practical lease, and expiry would
+   permit a stale request to overlap a takeover. Release uses Redis
+   WATCH/MULTI/EXEC to compare the owner token and delete only if the key did
+   not change. If a request crashes, a moderator must use the separate
+   **Recover stuck action lock** tool after confirming that no request is still
+   running; this is deliberately an explicit operational recovery, not a
+   silent or unsafe takeover.
 2. Reads an O(1)-ish summary of `modactions:z:user:{lowercased username}`: a
    Redis sorted set holding one row per infraction — the record JSON, which
    includes a unique id — scored by its epoch-ms timestamp. The summary is the
@@ -67,7 +74,9 @@ rules, and optionally supplies a reason. The app resolves the target and then:
    sees no phantom prior. Reddit execution is still attempted even if recording
    fails; the success toast then includes `(not recorded)`. Bans are refused
    outright when the resolved subreddit name is empty.
-6. Releases the lock in a `finally` block — only when it was acquired.
+6. Releases the lock in a `finally` block — only when it was acquired. The
+   flow also checks ownership immediately before the history append and before
+   the Reddit call, and fails closed if explicit recovery changed the token.
 
 The warning comment links the rules wiki, explains the current violation and
 next ladder consequence, and points appeals to modmail. Reddit's comment API
@@ -156,6 +165,10 @@ Redis state is installation-scoped and idempotent:
   otherwise-clean post.
 - `modactions:z:user:{username}` — lifetime in-app action history, one
   sorted-set row per infraction.
+- `punish:lock:{username}` — non-expiring owner-token lock. It is released
+  with WATCH/MULTI/EXEC, never with an unsafe GET-then-DEL sequence. A stuck
+  lock requires explicit moderator recovery after checking that no action is
+  running.
 
 ## Remove & escalate action
 
@@ -185,7 +198,12 @@ itself. Its form takes a username (no leading `u/`), an operation — **Seed
 priors** or **Clear history** — and, for seeding, the number of priors (1–20)
 and the age of the newest prior in days (0–3650). Seeding writes that many
 warning rows spaced one day apart, with the newest row exactly the requested
-age, so the decay clock starts where the operator wants it.
+age, so the decay clock starts where the operator wants it. Because the
+installed Redis API has no atomic replace operation for this sorted-set
+history, **Seed priors requires a verified empty history**. It refuses any
+pre-existing rows (including a previous partial seed); press **Clear history**
+explicitly and retry. A partial batch is reported as failed and is never
+reported as a successful exact seed.
 
 Two properties matter:
 
@@ -202,12 +220,15 @@ Two properties matter:
   through the same `HistoryStore` and per-user sorted set the punish flow
   reads, so rung selection and 90-day decay behave in a seeded test exactly as
   they would after months of real actions. Seed and clear share the exact
-  per-user Redis lease used by punishment, so they cannot interleave with a
-  punish/clear operation while the lease is valid. Clearing a user (`DEL` of
-  the history key) resets them to a fresh first-offense state. If a batch write
+  per-user non-expiring owner-token lock used by punishment, so they cannot
+  interleave with a punish/clear operation. A crashed request can leave this
+  lock until a moderator uses **Recover stuck action lock** after confirming
+  that no action is running. Clearing a user (`DEL` of the
+  history key) resets them to a fresh first-offense state. If a batch write
   fails part-way through, the tool reports the landed count and deliberately
   does not auto-clear existing or partial history; clear explicitly before
-  retrying.
+  retrying. The success toast says that the history was empty when the exact
+  seed was started.
 
 Throwaway Reddit accounts for end-to-end testing are prepared only outside
 Devvit with the standalone Python helper `scripts/gen-test-accounts.py`.
@@ -269,7 +290,12 @@ npm test        # vitest run — unit tests, no network or Devvit runtime
 - `src/actions/punish.ts` — pure in-app ladder execution seam and warning text.
 - `src/lib/ladder.ts` — wiki ladder and three-month decay policy.
 - `src/lib/history.ts` — Redis-backed lifetime per-user action history
-  (sorted set, one row per infraction).
+  (sorted set, one row per infraction), including strict fail-closed summaries
+  for exact seeding.
+- `src/lib/user-lock.ts` — shared non-expiring owner-token lock with
+  WATCH/MULTI/EXEC compare-delete and explicit recovery.
+- `src/actions/recover-lock.ts` — authenticated, confirmation-gated stuck-lock
+  recovery.
 - `src/actions/escalate.ts` — pure target resolution and toast builders.
 - `src/actions/fixture.ts` — fixture targets, URL/title validation, and dedupe.
 - `src/actions/seed.ts` — dev/QA-only history seeding and clearing for ladder

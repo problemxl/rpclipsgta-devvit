@@ -20,6 +20,11 @@ export interface HistorySummary {
   readonly latestAt: number | undefined;
 }
 
+/** A strict read used by destructive test tooling that must fail closed. */
+export type StrictHistorySummary =
+  | { readonly ok: true; readonly summary: HistorySummary }
+  | { readonly ok: false };
+
 /** The stored record (including its generated id) and whether the write landed. */
 export interface AppendOutcome {
   readonly ok: boolean;
@@ -43,6 +48,11 @@ export interface HistoryStore {
    * no more.
    */
   summary(username: string): Promise<HistorySummary>;
+  /**
+   * Read a summary without converting Redis failures into an empty history.
+   * Callers that make exact or destructive decisions must use this method.
+   */
+  summaryStrict(username: string): Promise<StrictHistorySummary>;
   /** All retained records, oldest first. Corrupt members are dropped silently. */
   load(username: string): Promise<ModActionRecord[]>;
   /** Remove one row by id during execution-failure compensation. */
@@ -101,12 +111,25 @@ export interface RedisSetOptions {
 
 /**
  * The string-command subset shared by the punish lock and the removal flow.
- * SET resolves to a string on success and to undefined when NX/XX fails.
+ * The installed Devvit client returns `OK` on success and an empty string
+ * when NX/XX rejects the write.
  */
 export interface RedisStringLike {
   get(key: string): Promise<string | undefined>;
   set(key: string, value: string, options?: RedisSetOptions): Promise<string | undefined>;
   del(key: string): Promise<unknown>;
+}
+
+/** The transaction subset used for compare-and-delete lock operations. */
+export type RedisLeaseTransaction = {
+  multi(): Promise<void>;
+  del(...keys: string[]): Promise<RedisLeaseTransaction>;
+  discard(): Promise<void>;
+} & Record<'exec', () => Promise<unknown[] | undefined>>;
+
+/** RedisStringLike plus the installed Devvit WATCH transaction API. */
+export interface RedisLeaseStore extends RedisStringLike {
+  watch(...keys: string[]): Promise<RedisLeaseTransaction>;
 }
 
 /**
@@ -168,6 +191,28 @@ function newRecordId(at: number): string {
  * trail without changing the rung a long-quiet user receives.
  */
 export function createHistoryStore(redis: RedisLike): HistoryStore {
+  async function readSummary(
+    username: string,
+    clampFuture = true
+  ): Promise<HistorySummary> {
+    const key = historyKey(username);
+    // ZCARD counts raw members, corrupt payloads included.
+    const total = await redis.zCard(key);
+    // Rank -1 is the highest-score member. The score is structural, so no
+    // member payload is parsed and corrupt rows cannot break the summary.
+    const [latest] = await redis.zRange(key, -1, -1);
+    // Freeze guard: a corrupt member with a future epoch-ms score would
+    // otherwise pin latestAt in the future indefinitely, keeping the
+    // ladder's quiet time at zero and freezing decay for as long as the
+    // score lies ahead. Clamp to now + 60s.
+    const latestAt = latest
+      ? clampFuture
+        ? Math.min(latest.score, Date.now() + 60_000)
+        : latest.score
+      : undefined;
+    return { total, latestAt };
+  }
+
   return {
     async append(username, record) {
       // Mint the id here so the persisted member and the returned record are
@@ -191,24 +236,24 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
     async summary(username) {
       const key = historyKey(username);
       try {
-        // ZCARD counts raw members, corrupt payloads included.
-        const total = await redis.zCard(key);
-        // Rank -1 is the highest-score member. The score is structural, so no
-        // member payload is parsed and corrupt rows cannot break the summary.
-        const [latest] = await redis.zRange(key, -1, -1);
-        // Freeze guard: a corrupt member with a future epoch-ms score would
-        // otherwise pin latestAt in the future indefinitely, keeping the
-        // ladder's quiet time at zero and freezing decay for as long as the
-        // score lies ahead. Clamp to now + 60s — enough allowance for modest
-        // clock skew between the app host and Redis, while guaranteeing decay
-        // resumes accruing almost immediately (src/lib/ladder.ts).
-        const latestAt = latest ? Math.min(latest.score, Date.now() + 60_000) : undefined;
-        return { total, latestAt };
+        return await readSummary(username);
       } catch (error) {
-        // Degradation: an unreadable summary is treated as a fresh user, but
-        // the failure must show up in the logs.
+        // Punishment deliberately degrades a failed read to a warning path.
+        // Exact/destructive callers must use summaryStrict instead.
         console.error(`[history] summary ${key} failed: ${failureDetail(error)}`);
         return { total: 0, latestAt: undefined };
+      }
+    },
+
+    async summaryStrict(username) {
+      const key = historyKey(username);
+      try {
+        // Exact tooling uses the stored score so a deterministic injected
+        // clock can verify the requested age without a host-clock clamp.
+        return { ok: true, summary: await readSummary(username, false) };
+      } catch (error) {
+        console.error(`[history] strict summary ${key} failed: ${failureDetail(error)}`);
+        return { ok: false };
       }
     },
 

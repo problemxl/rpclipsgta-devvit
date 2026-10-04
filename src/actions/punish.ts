@@ -1,8 +1,9 @@
 import { effectivePriors, LADDER, pickRung, type LadderRung } from '../lib/ladder.js';
 import { ruleByNumber } from '../lib/rules.js';
-import type { HistoryStore, ModActionRecord, RedisStringLike } from '../lib/history.js';
+import type { HistoryStore, ModActionRecord, RedisLeaseStore } from '../lib/history.js';
 import {
   acquireUserActionLock,
+  assertUserActionLockHeld,
   releaseUserActionLock,
   userActionLockKey,
 } from '../lib/user-lock.js';
@@ -13,8 +14,8 @@ const MODMAIL_APPEAL =
 
 export interface PunishDeps {
   readonly history: HistoryStore;
-  /** Shared Redis (string commands) used to serialize the punishment flow. */
-  readonly redis: RedisStringLike;
+  /** Shared Redis string + WATCH transaction API used to serialize the punishment flow. */
+  readonly redis: RedisLeaseStore;
   readonly submitComment: (options: {
     text: string;
     replyTargetThingId: string;
@@ -149,6 +150,9 @@ export async function punish(
   const lock = await acquireUserActionLock(deps.redis, input.targetUser, input.modUser, now);
 
   try {
+    // Refuse to continue if an explicit recovery changed ownership before a
+    // history mutation. Redis read failures are also fail-closed here.
+    await assertUserActionLockHeld(deps.redis, lock);
     const at = now();
     // history.summary() intentionally degrades redis read failures to a fresh
     // history (total 0): an unreadable summary presents as no priors, so the
@@ -166,6 +170,9 @@ export async function punish(
     let recorded = false;
     let pendingRecord: ModActionRecord | undefined;
     try {
+      // Re-check immediately before the first history mutation. This is the
+      // fail-closed boundary if explicit lock recovery raced this request.
+      await assertUserActionLockHeld(deps.redis, lock);
       // Append is a single atomic ZADD that mints the unique row id and
       // returns the stored record — that record is the compensation identity.
       const appended = await deps.history.append(
@@ -185,6 +192,10 @@ export async function punish(
 
     let commentId = '';
     try {
+      // A Reddit call cannot be rolled back once started. Check ownership at
+      // the last safe point so a recovered/stale request never starts a new
+      // external action after losing the shared lock.
+      await assertUserActionLockHeld(deps.redis, lock);
       if (rung.action === 'warn') {
         commentId = await deps.submitComment({
           text: buildWarningComment({

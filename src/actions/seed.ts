@@ -12,9 +12,10 @@
  * authorization, username normalization, Redis locking, or any history access.
  */
 
-import type { HistoryStore, RedisStringLike } from '../lib/history.js';
+import type { HistoryStore, RedisLeaseStore } from '../lib/history.js';
 import {
   acquireUserActionLock,
+  assertUserActionLockHeld,
   releaseUserActionLock,
 } from '../lib/user-lock.js';
 
@@ -53,7 +54,7 @@ const SEED_RECORD_FIELDS = {
 export interface SeedDeps {
   readonly history: HistoryStore;
   /** The same installation Redis used by punish(), for shared user locking. */
-  readonly redis: RedisStringLike;
+  readonly redis: RedisLeaseStore;
   /** Verify the current actor against Reddit's moderator listing. */
   readonly authorizeActor: (subredditName: string, actor: string) => Promise<boolean>;
   readonly now?: () => number;
@@ -138,7 +139,8 @@ function isValidSeedUsername(username: string): boolean {
  * `latestAgeDays` old and drives the ladder's decay clock.
  *
  * Never throws: every failure path degrades to a terminal outcome and logs.
- * Partial batches are intentionally retained and reported; use clear before retrying.
+ * Seeding is only allowed against an already-verified empty history. Partial
+ * batches are intentionally retained and reported; use clear before retrying.
  */
 export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<SeedOutcome> {
   // -- Allowlist guard FIRST: production history must never be touched. -----
@@ -212,7 +214,10 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
     const now = deps.now ?? Date.now;
     const lock = await acquireUserActionLock(deps.redis, username, actor, now);
     try {
+      await assertUserActionLockHeld(deps.redis, lock);
+
       if (input.operation === 'clear') {
+        await assertUserActionLockHeld(deps.redis, lock);
         const cleared = await deps.history.clear(username);
         if (!cleared) {
           return audit({
@@ -227,11 +232,30 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
       const latestAgeDays: number = input.latestAgeDays as number;
       const at = now();
 
+      // This operation has no atomic replace primitive in the installed
+      // public API. Refuse non-empty histories rather than appending onto real
+      // or previously seeded rows and falsely claiming an exact result.
+      const existing = await deps.history.summaryStrict(username);
+      if (!existing.ok) {
+        return audit({
+          status: 'failed',
+          detail: `could not verify existing history; clear u/${username} and retry`,
+        });
+      }
+      if (existing.summary.total !== 0) {
+        return audit({
+          status: 'failed',
+          detail: `history is not empty; clear u/${username} and retry`,
+        });
+      }
+
       // Append is what mints the row ids, so writes go one-by-one through the
-      // same HistoryStore the punish flow uses. The lock covers the whole
-      // batch, preventing punish/clear from interleaving with a partial seed.
+      // same HistoryStore the punish flow uses. The non-expiring lock covers
+      // the whole batch, preventing punish/clear from interleaving with a
+      // partial seed.
       let landed = 0;
       for (let k = 1; k <= priors; k += 1) {
+        await assertUserActionLockHeld(deps.redis, lock);
         const rowAt = at - (latestAgeDays + (priors - k)) * DAY_MS;
         let appended: Awaited<ReturnType<HistoryStore['append']>>;
         try {
@@ -260,6 +284,20 @@ export async function seedHistory(deps: SeedDeps, input: SeedInput): Promise<See
         landed += 1;
       }
 
+      await assertUserActionLockHeld(deps.redis, lock);
+      const verified = await deps.history.summaryStrict(username);
+      const expectedLatestAt = at - latestAgeDays * DAY_MS;
+      if (
+        !verified.ok ||
+        verified.summary.total !== priors ||
+        verified.summary.latestAt !== expectedLatestAt
+      ) {
+        return audit({
+          status: 'failed',
+          detail: `seed verification failed; clear u/${username} and retry`,
+        });
+      }
+
       return audit({ status: 'seeded', username, priors, latestAgeDays });
     } finally {
       await releaseUserActionLock(deps.redis, lock, 'seed');
@@ -286,7 +324,7 @@ export async function runSeedSafely(deps: SeedDeps, input: SeedInput): Promise<S
 export function buildSeedToast(outcome: SeedSafeOutcome): string {
   switch (outcome.status) {
     case 'seeded':
-      return `Seeded ${outcome.priors} priors for u/${outcome.username} (latest ${outcome.latestAgeDays} days ago)`;
+      return `Seeded ${outcome.priors} priors for u/${outcome.username} (latest ${outcome.latestAgeDays} days ago; history was empty)`;
     case 'cleared':
       return `Cleared history for u/${outcome.username}`;
     case 'denied':

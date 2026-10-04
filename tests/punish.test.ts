@@ -2,9 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { punish, punishLockKey, buildWarningComment, type PunishDeps } from '../src/actions/punish.js';
 import {
+  acquireUserActionLock,
+  releaseUserActionLock,
+} from '../src/lib/user-lock.js';
+import {
   createHistoryStore,
   historyKey,
   type ModActionRecord,
+  type RedisLeaseTransaction,
   type RedisLike,
   type RedisSetOptions,
   type RedisStringLike,
@@ -15,7 +20,9 @@ const DAY = 24 * 60 * 60 * 1000;
 const MONTH = 30 * DAY;
 
 /** String commands for the lock plus sorted sets for history, like context.redis. */
-type FakeRedisShape = RedisStringLike & RedisLike;
+type FakeRedisShape = RedisStringLike & RedisLike & {
+  watch(...keys: string[]): Promise<RedisLeaseTransaction>;
+};
 
 /** Structural Redis double: real NX/XX strings, a real sorted set, call recording. */
 class FakeRedis implements FakeRedisShape {
@@ -23,11 +30,14 @@ class FakeRedis implements FakeRedisShape {
   readonly zsets = new Map<string, Map<string, number>>();
   readonly setCalls: Array<{ key: string; value: string; options?: RedisSetOptions }> = [];
   readonly delCalls: string[] = [];
+  onGet?: (key: string) => void;
   /** Overrides the ZADD resolution; 0 simulates a write that did not land. */
   zAddResult: number | undefined;
 
   async get(key: string): Promise<string | undefined> {
-    return this.values.get(key);
+    const value = this.values.get(key);
+    this.onGet?.(key);
+    return value;
   }
 
   async set(
@@ -45,6 +55,34 @@ class FakeRedis implements FakeRedisShape {
   async del(key: string): Promise<void> {
     this.delCalls.push(key);
     this.values.delete(key);
+  }
+
+  async watch(...keys: string[]): Promise<RedisLeaseTransaction> {
+    const snapshot = new Map(keys.map((key) => [key, this.values.get(key)]));
+    const redis = this;
+    let deletion: string[] = [];
+    let multiStarted = false;
+    const transaction: RedisLeaseTransaction = {
+      async multi() {
+        multiStarted = true;
+      },
+      async del(...names: string[]) {
+        deletion = names;
+        return transaction;
+      },
+      async exec() {
+        if (!multiStarted) throw new Error('multi required');
+        for (const key of keys) {
+          if (redis.values.get(key) !== snapshot.get(key)) return [];
+        }
+        for (const key of deletion) await redis.del(key);
+        return deletion.map(() => 'OK');
+      },
+      async discard() {
+        deletion = [];
+      },
+    };
+    return transaction;
   }
 
   async zAdd(
@@ -241,6 +279,10 @@ describe('punish', () => {
   it('continues without a record when the history append throws', async () => {
     const failingHistory = {
       summary: async () => ({ total: 0, latestAt: undefined as number | undefined }),
+      summaryStrict: async () => ({
+        ok: true as const,
+        summary: { total: 0, latestAt: undefined as number | undefined },
+      }),
       append: async () => {
         throw new Error('append failed');
       },
@@ -320,7 +362,7 @@ describe('punish lock', () => {
     expect(redis.delCalls).toEqual([]); // never releases a lock it did not acquire
   });
 
-  it('acquires a lowercased lock with a ~30s TTL, an owner token value, and releases it on success', async () => {
+  it('acquires a lowercased non-expiring lock with an owner token value, and releases it on success', async () => {
     const redis = new FakeRedis();
     const current = deps({ redis });
 
@@ -333,9 +375,7 @@ describe('punish lock', () => {
     // not a constant — release only deletes when the stored value matches it.
     expect(lockCalls[0].value).toMatch(/^Mod:\d+:[a-z0-9]+$/);
     expect(lockCalls[0].options?.nx).toBe(true);
-    const ttlMs = lockCalls[0].options?.expiration?.getTime();
-    expect(ttlMs).toBeGreaterThan(Date.now() + 25 * 1000);
-    expect(ttlMs).toBeLessThanOrEqual(Date.now() + 30 * 1000);
+    expect(lockCalls[0].options?.expiration).toBeUndefined();
     expect(redis.delCalls).toEqual(['punish:lock:target']);
   });
 
@@ -351,66 +391,63 @@ describe('punish lock', () => {
     expect(redis.delCalls).toEqual(['punish:lock:target']);
   });
 
-  it('does not delete the lock when another owner acquired it after our TTL expired', async () => {
+  it('fails closed when explicit recovery changes ownership before the Reddit call', async () => {
     const redis = new FakeRedis();
     const lockKey = punishLockKey('Target');
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
+    const submitComment = vi.fn(async () => {
+      await gate;
+      return 't1_warning';
+    });
     const current = deps({
       redis,
-      submitComment: async () => {
-        await gate;
-        return 't1_warning';
-      },
+      submitComment,
     });
 
     const pending = punish(current, input);
     await vi.waitFor(() => expect(redis.values.has(lockKey)).toBe(true));
 
-    // Simulate the ~30s TTL lapsing mid-execution: a second caller acquires
-    // the expired lock with its own token before this call releases.
+    // Explicit recovery changes the owner before the Reddit call. The stale
+    // request must not execute or mutate history after losing its lock.
     redis.values.set(lockKey, 'Other:999:secondcaller');
 
     release();
-    await expect(pending).resolves.toMatchObject({ action: 'warn', commentId: 't1_warning' });
-
-    // The second caller's lock survived this call's release attempt.
+    await expect(pending).rejects.toThrow('punishment lock was lost');
+    expect(submitComment).not.toHaveBeenCalled();
     expect(redis.values.get(lockKey)).toBe('Other:999:secondcaller');
+  });
+
+  it('does not delete a replacement owner when takeover happens between GET and EXEC', async () => {
+    const redis = new FakeRedis();
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+    let replaced = false;
+    redis.onGet = (key) => {
+      if (!replaced && key === lock.key) {
+        replaced = true;
+        redis.values.set(key, 'Other:999:replacement');
+      }
+    };
+
+    await releaseUserActionLock(redis, lock, 'test');
+
+    expect(redis.values.get(lock.key)).toBe('Other:999:replacement');
     expect(redis.delCalls).toEqual([]);
   });
 
-  it('resolves with the real result when the release GET or DEL rejects', async () => {
+  it('does not mask a completed action when the conditional release transaction fails', async () => {
     class FailingReleaseRedis extends FakeRedis {
-      constructor(private readonly failingMethod: 'get' | 'del') {
-        super();
-      }
-
-      override async get(key: string): Promise<string | undefined> {
-        if (this.failingMethod === 'get' && key.startsWith('punish:lock:')) {
-          throw new Error('redis down on get');
+      override async watch(...keys: string[]): Promise<RedisLeaseTransaction> {
+        if (keys.some((key) => key.startsWith('punish:lock:'))) {
+          throw new Error('redis down on watch');
         }
-        return super.get(key);
-      }
-
-      override async del(key: string): Promise<void> {
-        if (this.failingMethod === 'del' && key.startsWith('punish:lock:')) {
-          throw new Error('redis down on del');
-        }
-        return super.del(key);
+        return super.watch(...keys);
       }
     }
 
-    for (const failingMethod of ['get', 'del'] as const) {
-      const redis = new FailingReleaseRedis(failingMethod);
-      const current = deps({ redis });
-      // A release failure is logged and swallowed; the punishment result and
-      // any original execution error are unaffected.
-      await expect(punish(current, input)).resolves.toMatchObject({
-        action: 'warn',
-        label: 'Warning',
-        commentId: 't1_warning',
-      });
-    }
+    const redis = new FailingReleaseRedis();
+    const current = deps({ redis });
+    await expect(punish(current, input)).resolves.toMatchObject({ action: 'warn' });
   });
 
   it('releases the lock when execution fails', async () => {

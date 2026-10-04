@@ -126,7 +126,12 @@ are no service settings or manual service fallback. Implementation notes: the
 policy's "three months" decay interval is represented deterministically as 90
 days, and action history is retained for the lifetime of the installation by
 design — one sorted-set row per infraction, with no record cap and no TTL —
-because the 90-day decay against the latest action alone governs the ladder. A seen claim is released
+because the 90-day decay against the latest action alone governs the ladder. The
+shared per-user action lock is a non-expiring owner-token lock: Devvit's
+installed Redis API exposes WATCH/MULTI/EXEC, so release compares the token in
+an optimistic transaction rather than using GET followed by DEL. A crashed
+request requires explicit, moderator-authorized recovery after confirming that
+no request is still running; automatic expiry would permit stale overlap. A seen claim is released
 before or during failed removal, but retained after removal; URL duplicate
 claims are made only by otherwise-clean posts and use GET-then-SET in the
 low-concurrency mod path. For testing the ladder itself, a dev/QA-only **Seed
