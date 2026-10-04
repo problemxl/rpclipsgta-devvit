@@ -1,5 +1,14 @@
 # API Notes — @devvit/public-api 0.14.2
 
+> **Historical reference only.** This file contains examples from the retired
+> PocketBase-backed implementation, including generic Devvit HTTP/fetch
+> permissions and settings for that old service. The current app does **not**
+> configure `http`, call `fetch`, use PocketBase, or declare email/password
+> settings. Do not apply those retired examples to the current app. The only
+> network/email helper in this repository is the explicitly local
+> `scripts/gen-test-accounts.py` CLI, which is outside the Devvit bundle and is
+> not imported by the app.
+
 All signatures below are quoted/verified from the installed typings under
 `node_modules/@devvit/public-api` (and its `@devvit/*` dependencies). Import
 path for everything app-facing is `@devvit/public-api`.
@@ -14,6 +23,58 @@ path for everything app-facing is `@devvit/public-api`.
 - Settings client: `node_modules/@devvit/settings/SettingsClient.d.ts`
 - Context: `node_modules/@devvit/public-api/types/context.d.ts`
 - UI client: `node_modules/@devvit/public-api/types/ui-client.d.ts`
+- Redis public API/types/runtime: `node_modules/@devvit/public-api/types/redis.d.ts`,
+  `node_modules/@devvit/redis/RedisClient.d.ts`,
+  `node_modules/@devvit/redis/RedisClient.js`, and
+  `node_modules/@devvit/protos/schema/devvit/plugin/redis/redisapi.proto`
+
+---
+
+## Current Redis concurrency notes (installed 0.14.6)
+
+The current app uses the installed Devvit Redis API, not an assumed Redis
+command surface:
+
+- `set(key, value, { nx: true })` is atomic acquisition. The installed
+  `RedisClient.set` returns `"OK"` for success and the runtime's empty string
+  value when NX declines the write; it does not expose Lua or an atomic
+  compare-delete helper.
+- The installed client exposes `watch(...keys)`, returning a transaction with
+  `multi()`, queued `del()`/`zRem()`, `discard()`, and `exec()`. The app reads
+  the owner token after WATCH, queues destructive work only when it matches,
+  and commits the transaction. A changed watched key aborts the transaction,
+  so release and ownership-fenced compensation never perform an unsafe
+  GET-then-DEL or stale history mutation.
+- Redis has expiry support, but a 30-second lease is not sound for this flow:
+  a Reddit request can run longer and then mutate history or perform an
+  external action after a new owner takes over. The shared action lock is
+  therefore non-expiring. The app intentionally exposes no recovery menu:
+  Redis cannot fence an already-started Reddit call, and an unconditional DEL
+  could delete a replacement owner. Operators must obtain external quiescence
+  and use a separate administrative compare-and-delete procedure documented in
+  README.md; if either guarantee is unavailable, leave the lock in place.
+- The Redis client has no atomic sorted-set replace operation. Seed therefore
+  performs a strict summary read, rejects any non-empty history, appends the
+  requested rows, and verifies count/newest score before reporting success.
+  A partial batch remains visible and must be explicitly cleared before retry.
+  Punishment also uses strict summary reads; a Redis read failure never becomes
+  a fresh-user warning path. A started Reddit request that times out or throws
+  leaves an explicit pending row that blocks retry until manual reconciliation
+  finalizes or removes it, because the external result is ambiguous.
+
+The relevant source is `src/lib/user-lock.ts`, `src/lib/history.ts`, and
+`src/actions/seed.ts`. The transaction mock shipped in the installed package
+is only a test double; the app's deterministic tests model WATCH's
+abort-on-change behavior explicitly. The app provides a dev/QA-only reconciliation form for one exact pending row;
+its hardcoded environment guard runs before authorization, locking, or history
+access. The operator must inspect `context.reddit.getModerationLog()` and the
+target comment/ban and choose only a definite applied/not-applied result.
+Unknown outcomes remain pending; the tool never retries Reddit and never
+unlocks a user. Production is NO-GO for app-local recovery: pending rows and
+stuck locks require installation-owner-controlled tooling only after process
+quiescence, exact member identity, atomic WATCH fencing, and post-state
+verification. Never use an unconditional lock DEL or blindly resolve an
+ambiguous Reddit outcome.
 
 ---
 

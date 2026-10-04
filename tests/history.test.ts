@@ -19,6 +19,7 @@ class FakeZSetRedis implements RedisLike {
   fail = false;
   /** When set, ZADD resolves with this value without mutating (simulates a rejected write). */
   zAddResult: number | undefined;
+  deleteNoOp = false;
 
   private zset(key: string): Map<string, number> {
     let zset = this.sets.get(key);
@@ -84,6 +85,14 @@ class FakeZSetRedis implements RedisLike {
     this.calls.push('zCard');
     if (this.fail) throw new Error('redis down');
     return this.zset(key).size;
+  }
+
+  async del(key: string): Promise<number> {
+    this.calls.push('del');
+    if (this.fail) throw new Error('redis down');
+    const removed = this.zset(key).size;
+    if (!this.deleteNoOp) this.sets.delete(key);
+    return removed;
   }
 }
 
@@ -343,6 +352,37 @@ describe('history store', () => {
     }
   });
 
+  it('clamps a future-dated score in strict summary for destructive rung selection', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    const future = 1_000_000 + 365 * 24 * 60 * 60 * 1000;
+    const later = future + 90 * 24 * 60 * 60 * 1000 + 1;
+    redis.seed(historyKey('user'), 'future-member', future);
+
+    await expect(history.summaryStrict('user', 1_000_000)).resolves.toEqual({
+      ok: true,
+      summary: { total: 1, latestAt: 1_000_000 },
+    });
+    await expect(history.summaryStrict('user', later)).resolves.toEqual({
+      ok: true,
+      summary: { total: 1, latestAt: future },
+    });
+    expect(effectivePriors(1, future, later)).toBe(0);
+  });
+
+  it('offers a strict summary that fails closed instead of treating Redis failure as empty', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(123));
+    await expect(history.summaryStrict('user')).resolves.toEqual({
+      ok: true,
+      summary: { total: 1, latestAt: 123 },
+    });
+
+    redis.fail = true;
+    await expect(history.summaryStrict('user')).resolves.toEqual({ ok: false });
+  });
+
   it('keeps the entire lifetime history — no record cap', async () => {
     const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
@@ -368,5 +408,55 @@ describe('history store', () => {
     // the store only ever issues sorted-set commands.
     expect('expire' in redis).toBe(false);
     expect(new Set(redis.calls)).toEqual(new Set(['zAdd', 'zCard', 'zRange', 'zRem']));
+  });
+
+  it('clears an existing history with one DEL and leaves no rows', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(1));
+    await history.append('user', record(2));
+
+    await expect(history.clear('user')).resolves.toBe(true);
+    expect(redis.calls).toEqual(['zAdd', 'zAdd', 'del', 'zRange']); // DEL plus strict post-state verification
+    expect(await history.load('user')).toEqual([]);
+    expect(await history.summary('user')).toEqual({ total: 0, latestAt: undefined });
+  });
+
+  it('reports success when clearing a user with no history', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+
+    await expect(history.clear('missing')).resolves.toBe(true);
+    expect(redis.calls).toEqual(['del', 'zRange']);
+  });
+
+  it('does not report clear success when DEL resolves but leaves the key intact', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(1));
+    redis.deleteNoOp = true;
+
+    await expect(history.clear('user')).resolves.toBe(false);
+    expect(await history.load('user')).toHaveLength(1);
+  });
+
+  it('reports failure and logs when redis fails during clear', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(1));
+    redis.fail = true;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(history.clear('user')).resolves.toBe(false);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain(
+        '[history] clear modactions:z:user:user failed: redis down'
+      );
+      // A failed DEL means the key must be untouched once redis recovers.
+      redis.fail = false;
+      expect(await history.load('user')).toHaveLength(1);
+    } finally {
+      error.mockRestore();
+    }
   });
 });

@@ -88,6 +88,14 @@ describe('fixture target and input validation', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('fails closed when moderator lookup errors', async () => {
+    const reddit = {
+      getModerators: () => ({ all: async () => { throw new Error('lookup failed'); } }),
+      getUserByUsername: async () => undefined,
+    };
+    await expect(isAuthorizedFixtureActor(reddit, 'rpclipsgta', 'mod')).resolves.toBe(false);
+  });
+
   it('accepts an explicitly returned moderator', async () => {
     const reddit = {
       getModerators: () => ({ all: async () => [{}] }),
@@ -191,6 +199,28 @@ describe('createFixture', () => {
       true
     );
     expect(submitted).toHaveLength(1);
+  });
+
+  it('fails closed for a malformed SET NX reply before submitting', async () => {
+    const store = makeStore();
+    store.set = async () => 'YES' as never;
+    const submitted: unknown[] = [];
+
+    const result = await createFixture({
+      source: SOURCE,
+      target: FIXTURE_TARGETS[0],
+      actor: 'ModUser',
+      reddit: {
+        async submitPost(options: unknown) {
+          submitted.push(options);
+          return { id: 't3_never' };
+        },
+      },
+      dedupe: store,
+    });
+
+    expect(result).toMatchObject({ created: false, duplicate: true });
+    expect(submitted).toEqual([]);
   });
 
   it('releases the dedupe claim when Reddit submission fails', async () => {

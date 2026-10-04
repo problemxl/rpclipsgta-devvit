@@ -38,6 +38,8 @@ export interface EscalateResult {
   readonly priors: number;
   readonly rule_name: string;
   readonly recorded: boolean;
+  readonly finalized: boolean;
+  readonly pending_record_id?: string;
 }
 
 export type EscalateFn = (payload: EscalatePayload) => Promise<EscalateResult>;
@@ -145,7 +147,9 @@ async function claimSeen(
     nx: true,
     expiration: new Date(now() + SEEN_TTL_DAYS * DAY_MS),
   });
-  return { key, claimed: Boolean(result) };
+  // SET NX succeeds only with the exact Redis `OK` reply. A truthy but
+  // malformed reply is ambiguous and must never authorize a removal.
+  return { key, claimed: result === 'OK' };
 }
 
 async function applyViolation(
@@ -304,7 +308,9 @@ export async function applyManualRuleRemoval(
         nx: true,
         expiration: new Date(now() + SEEN_TTL_DAYS * DAY_MS),
       });
-      if (!consumed) return audit({ status: 'already-processed' }, input.postId);
+      // As above, only the exact SET NX success reply proves that this
+      // invocation consumed the clean claim.
+      if (consumed !== 'OK') return audit({ status: 'already-processed' }, input.postId);
     }
     claimed = true;
     if (!validRule(rule)) {
@@ -361,9 +367,14 @@ export function buildRemovalSuccessToast(
   ruleName?: string
 ): string {
   const label = `R${outcome.violation.rule}${ruleName ? ` — ${ruleName}` : ''}`;
-  return outcome.escalateResult
-    ? `Removed post (${label}) and escalated.`
-    : `Removed post (${label}); no escalation required.`;
+  if (!outcome.escalateResult) return `Removed post (${label}); no escalation required.`;
+  if (outcome.escalateResult.finalized === false) {
+    const record = outcome.escalateResult.pending_record_id
+      ? ` Record: ${outcome.escalateResult.pending_record_id}.`
+      : '';
+    return `Removed post (${label}) and escalated [finalized:false]. Reddit action applied; history finalization failed.${record} Do not retry; reconcile the pending record.`;
+  }
+  return `Removed post (${label}) and escalated.`;
 }
 
 /** Pure failure text used by the Devvit menu and unit tests. */
@@ -509,7 +520,9 @@ export async function runRemoveAndEscalate(
       nx: true,
       expiration: new Date(now() + REMOVE_ESCALATE_TTL_DAYS * DAY_MS),
     });
-    if (!claim) return removeEscalateAudit({ status: 'already-processed' }, thingId);
+    // Only an exact SET NX `OK` reply proves that this invocation owns the
+    // removal claim; malformed truthy replies fail closed.
+    if (claim !== 'OK') return removeEscalateAudit({ status: 'already-processed' }, thingId);
 
     // -- Removal first: no punishment without a successful removal -----------
     try {
@@ -574,6 +587,10 @@ export function buildRemoveEscalateSuccessToast(params: {
     result.action === 'warn'
       ? `Removed & warned u/${targetUser} (${ruleLabel(rule)})`
       : `Removed & banned u/${targetUser} — ${result.label}`;
+  if (result.finalized === false) {
+    const record = result.pendingRecordId ? ` Record: ${result.pendingRecordId}.` : '';
+    return `${summary} [finalized:false] Reddit action applied; history finalization failed.${record} Do not retry; reconcile the pending record.`;
+  }
   return result.recorded ? summary : `${summary} (not recorded)`;
 }
 

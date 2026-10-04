@@ -6,6 +6,11 @@
  * creation makes a normal link post with the original Twitch/Kick URL; it is
  * moderator-initiated and never creates a comment or crosspost.
  *
+ * A "Seed test history" subreddit menu action (moderators only) seeds or
+ * resets a user's action history to exercise the ladder in the dev/QA
+ * subreddits; the allowlist guard inside seedHistory makes it a no-op
+ * everywhere else.
+ *
  * Escalations are executed entirely in the app: the ladder and decay policy
  * are pure code, action history is in installation Redis, and Reddit receives
  * the warning comment or ban directly.
@@ -42,7 +47,20 @@ import {
   isAuthorizedFixtureActor,
   type FixturePost,
 } from './actions/fixture.js';
+import {
+  buildSeedToast,
+  parseSeedOperation,
+  runSeedSafely,
+  type SeedInput,
+} from './actions/seed.js';
+import {
+  buildReconcilePendingToast,
+  parsePendingResolution,
+  runReconcilePendingSafely,
+  type ReconcilePendingInput,
+} from './actions/reconcile-pending.js';
 import { actionForRule } from './lib/detection.js';
+import { runAuthorizedModeratorAction } from './actions/moderator-boundary.js';
 import { ruleByNumber, RULES, type Rule } from './lib/rules.js';
 import { createHistoryStore } from './lib/history.js';
 import {
@@ -115,22 +133,32 @@ const escalateForm = Devvit.createForm(
         ? targetFromComment(await context.reddit.getCommentById(targetId))
         : targetFromPost(await context.reddit.getPostById(targetId));
 
-      const result = await punish(
-        createPunishDeps(context),
-        {
-          targetUser: target.authorName,
-          targetThingId: target.thingId,
-          // The resolved target's subreddit; never a context fallback that
-          // could diverge from where the comment/ban is applied.
-          subredditName: target.subredditName || context.subredditName || '',
-          rule: rule.number,
-          reason,
-          modUser: modUsername,
-        }
+      const authorized = await runAuthorizedModeratorAction(
+        context.reddit,
+        target.subredditName,
+        modUsername,
+        () => punish(
+          createPunishDeps(context),
+          {
+            targetUser: target.authorName,
+            targetThingId: target.thingId,
+            // The resolved target's subreddit; never a context fallback that
+            // could diverge from where the comment/ban is applied.
+            subredditName: target.subredditName,
+            rule: rule.number,
+            reason,
+            modUser: modUsername,
+          }
+        )
       );
+      if (!authorized.authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+      const result = authorized.result;
       console.log(
         `[escalate] app executed ${result.label} on u/${target.authorName} ` +
-          `(priors: ${result.priors}, recorded: ${result.recorded})`
+          `(priors: ${result.priors}, recorded: ${result.recorded}, finalized:${result.finalized})`
       );
       safeToast(context, buildSuccessToast({ result, targetUser: target.authorName, rule }));
     } catch (err) {
@@ -146,10 +174,35 @@ Devvit.addMenuItem({
   description: 'Warn or ban the author per the escalation ladder',
   location: ['post', 'comment'],
   forUserType: 'moderator',
-  onPress: (event, context) => {
-    // The `showForm(formKey, data)` payload is NOT readable in onSubmit in
-    // 0.14.2 — the submit handler re-derives the target from the context ids.
-    context.ui.showForm(escalateForm, { targetId: event.targetId });
+  onPress: async (event, context) => {
+    // Resolve and authorize at menu invocation before the form is offered;
+    // submission performs the same live check again.
+    const targetId = resolveTargetIdFromContext(context.commentId, context.postId) ?? event.targetId;
+    const modUser = context.username?.trim();
+    if (!targetId || !modUser) {
+      safeToast(context, 'Could not determine the acting moderator or target. Action aborted.');
+      return;
+    }
+    try {
+      const target = targetId.startsWith('t1_')
+        ? targetFromComment(await context.reddit.getCommentById(targetId))
+        : targetFromPost(await context.reddit.getPostById(targetId));
+      const authorized = await runAuthorizedModeratorAction(
+        context.reddit,
+        target.subredditName,
+        modUser,
+        async () => undefined
+      );
+      if (!authorized.authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+      context.ui.showForm(escalateForm, { targetId });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[escalate] menu authorization failed: ${detail}`);
+      safeToast(context, 'Moderator access could not be verified. Action aborted.');
+    }
   },
 });
 
@@ -295,18 +348,27 @@ const removePostForm = Devvit.createForm(
 
     try {
       const post = await context.reddit.getPostById(postId);
-      const outcome = await applyManualRuleRemovalSafely(
-        {
-          postId: post.id,
-          authorName: post.authorName,
-          modUser,
-          subredditName: post.subredditName,
-        },
-        rule,
-        typeof event.values.reason === 'string' ? event.values.reason : '',
-        createModRemovalDeps(context)
+      const authorized = await runAuthorizedModeratorAction(
+        context.reddit,
+        post.subredditName,
+        modUser,
+        () => applyManualRuleRemovalSafely(
+          {
+            postId: post.id,
+            authorName: post.authorName,
+            modUser,
+            subredditName: post.subredditName,
+          },
+          rule,
+          typeof event.values.reason === 'string' ? event.values.reason : '',
+          createModRemovalDeps(context)
+        )
       );
-      showRemovalOutcome(context, outcome);
+      if (!authorized.authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+      showRemovalOutcome(context, authorized.result);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error(`[mod-remove] form failed: ${detail}`);
@@ -321,7 +383,8 @@ Devvit.addMenuItem({
   location: 'post',
   forUserType: 'moderator',
   onPress: async (_event, context) => {
-    // No subreddit guard: this moderator action intentionally matches Escalate.
+    // Resolve and authorize before the automatic path can claim Redis state or
+    // call Reddit. Form submission repeats this check after the form opens.
     const postId = context.postId;
     const modUser = context.username?.trim();
     if (!postId || !modUser) {
@@ -336,19 +399,29 @@ Devvit.addMenuItem({
 
     try {
       const post = await context.reddit.getPostById(postId);
-      const outcome = await runModRemovalSafely(
-        {
-          postId: post.id,
-          authorName: post.authorName,
-          title: post.title,
-          url: post.url,
-          body: post.body ?? '',
-          isTextPost: post.body !== undefined,
-          modUser,
-          subredditName: post.subredditName,
-        },
-        createModRemovalDeps(context)
+      const authorized = await runAuthorizedModeratorAction(
+        context.reddit,
+        post.subredditName,
+        modUser,
+        () => runModRemovalSafely(
+          {
+            postId: post.id,
+            authorName: post.authorName,
+            title: post.title,
+            url: post.url,
+            body: post.body ?? '',
+            isTextPost: post.body !== undefined,
+            modUser,
+            subredditName: post.subredditName,
+          },
+          createModRemovalDeps(context)
+        )
       );
+      if (!authorized.authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+      const outcome = authorized.result;
       if (outcome.status === 'clean') {
         context.ui.showForm(removePostForm, { targetId: post.id });
         return;
@@ -418,20 +491,29 @@ const removeEscalateForm = Devvit.createForm(
         ? targetFromComment(await context.reddit.getCommentById(targetId))
         : targetFromPost(await context.reddit.getPostById(targetId));
 
-      const outcome = await runRemoveAndEscalateSafely(
-        {
-          thingId: target.thingId,
-          authorName: target.authorName,
-          // The resolved target's subreddit; never a context fallback that
-          // could diverge from where the removal and ban are applied.
-          subredditName: target.subredditName || context.subredditName || '',
-          rule: rule.number,
-          reason,
-          modUser: modUsername,
-        },
-        createRemoveEscalateDeps(context)
+      const authorized = await runAuthorizedModeratorAction(
+        context.reddit,
+        target.subredditName,
+        modUsername,
+        () => runRemoveAndEscalateSafely(
+          {
+            thingId: target.thingId,
+            authorName: target.authorName,
+            // The resolved target's subreddit; never a context fallback that
+            // could diverge from where the removal and ban are applied.
+            subredditName: target.subredditName,
+            rule: rule.number,
+            reason,
+            modUser: modUsername,
+          },
+          createRemoveEscalateDeps(context)
+        )
       );
-      showRemoveEscalateOutcome(context, outcome, target.authorName, rule);
+      if (!authorized.authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+      showRemoveEscalateOutcome(context, authorized.result, target.authorName, rule);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       console.error(`[remove-escalate] form failed: ${detail}`);
@@ -445,10 +527,35 @@ Devvit.addMenuItem({
   description: 'Remove this post/comment and warn or ban the author per the escalation ladder',
   location: ['post', 'comment'],
   forUserType: 'moderator',
-  onPress: (event, context) => {
-    // The menu is moderator-only; the target id is re-derived from the form
-    // submit context because showForm pass-through data is opaque in 0.14.2.
-    context.ui.showForm(removeEscalateForm, { targetId: event.targetId });
+  onPress: async (event, context) => {
+    // Resolve and authorize at menu invocation before the form is offered;
+    // submission performs the same live check again.
+    const targetId = resolveTargetIdFromContext(context.commentId, context.postId) ?? event.targetId;
+    const modUser = context.username?.trim();
+    if (!targetId || !modUser) {
+      safeToast(context, 'Could not determine the acting moderator or target. Action aborted.');
+      return;
+    }
+    try {
+      const target = targetId.startsWith('t1_')
+        ? targetFromComment(await context.reddit.getCommentById(targetId))
+        : targetFromPost(await context.reddit.getPostById(targetId));
+      const authorized = await runAuthorizedModeratorAction(
+        context.reddit,
+        target.subredditName,
+        modUser,
+        async () => undefined
+      );
+      if (!authorized.authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+      context.ui.showForm(removeEscalateForm, { targetId });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[remove-escalate] menu authorization failed: ${detail}`);
+      safeToast(context, 'Moderator access could not be verified. Action aborted.');
+    }
   },
 });
 
@@ -457,10 +564,213 @@ Devvit.addMenuItem({
   description: 'Copy this clip URL to the development or QA subreddit for testing',
   location: 'post',
   forUserType: 'moderator',
-  onPress: (event, context) => {
-    // The menu is moderator-only; the source id is re-derived from the form
-    // submit context because showForm pass-through data is opaque in 0.14.2.
-    context.ui.showForm(fixtureForm, { sourceId: event.targetId });
+  onPress: async (event, context) => {
+    // Resolve the source and verify current membership before opening the
+    // form. The form repeats this check because it may be replayed later.
+    const sourceId = context.postId ?? event.targetId;
+    const actor = context.username?.trim();
+    if (!sourceId || !actor) {
+      safeToast(context, 'Could not determine the source or acting moderator. Action aborted.');
+      return;
+    }
+    try {
+      const source = await context.reddit.getPostById(sourceId);
+      if (!isAllowedFixtureSourceSubreddit(source.subredditName)) {
+        safeToast(context, `Fixtures may only be created from r/${FIXTURE_SOURCE_SUBREDDIT}.`);
+        return;
+      }
+      if (!(await isAuthorizedFixtureActor(context.reddit, source.subredditName, actor))) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+      context.ui.showForm(fixtureForm, { sourceId });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[fixture] menu authorization failed: ${detail}`);
+      safeToast(context, 'Moderator access could not be verified. Action aborted.');
+    }
+  },
+});
+
+const seedForm = Devvit.createForm(
+  {
+    title: 'Seed test history',
+    description: 'Dev/QA only: place a user at a ladder position or reset their history.',
+    acceptLabel: 'Apply',
+    fields: [
+      {
+        type: 'string',
+        name: 'username',
+        label: 'Username',
+        required: true,
+        helpText: 'No leading u/',
+      },
+      {
+        type: 'select',
+        name: 'operation',
+        label: 'Operation',
+        required: true,
+        options: [
+          { label: 'Seed priors (history must be empty)', value: 'seed' },
+          { label: 'Clear history', value: 'clear' },
+        ],
+      },
+      {
+        type: 'number',
+        name: 'priors',
+        label: 'Priors to seed (1-20)',
+        helpText: 'Seed priors only: rows are spaced one day apart.',
+      },
+      {
+        type: 'number',
+        name: 'latestAgeDays',
+        label: 'Age of newest prior, days (0-3650)',
+        helpText: 'Seed priors only: drives the 90-day decay clock.',
+      },
+    ],
+  },
+  async (event, context) => {
+    // -- Subreddit guard ------------------------------------------------------
+    // A subreddit menu press sets context.subredditName; without it the
+    // allowlist cannot be evaluated, so the press is reported as a denial.
+    // The allowlist itself is enforced (and loudly logged) inside seedHistory.
+    const subredditName = context.subredditName?.trim() ?? '';
+    if (!subredditName) {
+      safeToast(context, buildSeedToast({ status: 'denied' }));
+      return;
+    }
+
+    // -- Form input -----------------------------------------------------------
+    // Number fields arrive as numbers; guard against malformed/NaN replays
+    // before calling seedHistory, which re-validates the bounds anyway.
+    const priors = numericFormValue(event.values.priors);
+    const latestAgeDays = numericFormValue(event.values.latestAgeDays);
+    const operation = parseSeedOperation(event.values.operation);
+    const actor = context.username?.trim();
+    if (!operation) {
+      safeToast(context, 'No valid operation selected — action aborted.');
+      return;
+    }
+    if (!actor) {
+      safeToast(context, 'Could not determine the acting moderator. Action aborted.');
+      return;
+    }
+
+    try {
+      const seedInput: SeedInput = {
+        subredditName,
+        actor,
+        username: typeof event.values.username === 'string' ? event.values.username : '',
+        operation,
+        ...(operation === 'seed' && priors !== undefined ? { priors } : {}),
+        ...(operation === 'seed' && latestAgeDays !== undefined ? { latestAgeDays } : {}),
+      };
+      const outcome = await runSeedSafely(
+        {
+          history: createHistoryStore(context.redis),
+          redis: context.redis,
+          authorizeActor: async (name, username) =>
+            (await context.reddit
+              .getModerators({ subredditName: name, username, limit: 1, pageSize: 1 })
+              .all()).length > 0,
+        },
+        seedInput
+      );
+      safeToast(context, buildSeedToast(outcome));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[seed] form failed: ${detail}`);
+      safeToast(context, `Seed test history failed: ${detail}`);
+    }
+  }
+);
+
+Devvit.addMenuItem({
+  label: 'Seed test history',
+  description: 'Dev/QA testing tool: seed or reset escalation history',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: (_event, context) => {
+    context.ui.showForm(seedForm);
+  },
+});
+
+const reconcilePendingForm = Devvit.createForm(
+  {
+    title: 'Dev/QA reconcile pending action',
+    description:
+      'Inspect Reddit moderator log and the target comment/ban first. Unknown outcomes stay pending. ' +
+      'This tool never retries Reddit and never unlocks a user.',
+    acceptLabel: 'Reconcile',
+    fields: [
+      {
+        type: 'string',
+        name: 'username',
+        label: 'Target username',
+        required: true,
+        helpText: 'The username whose exact pending row is shown in the app logs/toast.',
+      },
+      {
+        type: 'string',
+        name: 'recordId',
+        label: 'Exact pending record id',
+        required: true,
+      },
+      {
+        type: 'select',
+        name: 'resolution',
+        label: 'Resolution',
+        required: true,
+        options: [
+          { label: 'Inspect only', value: 'inspect' },
+          { label: 'Reddit definitely applied — mark applied', value: 'applied' },
+          { label: 'Reddit definitely did not apply — remove pending row', value: 'not-applied' },
+        ],
+      },
+      {
+        type: 'boolean',
+        name: 'confirmExternalOutcome',
+        label: 'I inspected Reddit and the selected outcome is definite (not unknown)',
+      },
+    ],
+  },
+  async (event, context) => {
+    const actor = context.username?.trim() ?? '';
+    const resolution = parsePendingResolution(event.values.resolution);
+    if (!resolution) {
+      safeToast(context, 'No valid reconciliation resolution selected — action aborted.');
+      return;
+    }
+    const input: ReconcilePendingInput = {
+      subredditName: context.subredditName?.trim() ?? '',
+      actor,
+      username: typeof event.values.username === 'string' ? event.values.username : '',
+      recordId: typeof event.values.recordId === 'string' ? event.values.recordId : '',
+      resolution,
+      confirmExternalOutcome: event.values.confirmExternalOutcome === true,
+    };
+    const outcome = await runReconcilePendingSafely(
+      {
+        history: createHistoryStore(context.redis),
+        redis: context.redis,
+        authorizeActor: async (name, username) =>
+          (await context.reddit
+            .getModerators({ subredditName: name, username, limit: 1, pageSize: 1 })
+            .all()).length > 0,
+      },
+      input
+    );
+    safeToast(context, buildReconcilePendingToast(outcome));
+  }
+);
+
+Devvit.addMenuItem({
+  label: 'Reconcile pending action (dev/QA)',
+  description: 'Inspect and resolve one known pending Reddit outcome; never retries or unlocks',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: (_event, context) => {
+    context.ui.showForm(reconcilePendingForm);
   },
 });
 
@@ -521,6 +831,8 @@ function createEscalateFn(context: Devvit.Context): EscalateFn {
       priors: result.priors,
       rule_name: result.ruleName,
       recorded: result.recorded,
+      finalized: result.finalized,
+      ...(result.pendingRecordId ? { pending_record_id: result.pendingRecordId } : {}),
     };
   };
 }
@@ -618,6 +930,11 @@ function safeToast(context: Devvit.Context, text: string): void {
   } catch {
     // Swallow: a failed toast must not throw over the handler's result.
   }
+}
+
+/** Pass a form number field through only when it is a usable finite number. */
+function numericFormValue(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 export default Devvit;

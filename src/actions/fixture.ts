@@ -128,15 +128,21 @@ export async function isAuthorizedFixtureActor(
   subredditName: string,
   actor: string
 ): Promise<boolean> {
-  const moderators = await reddit
-    .getModerators({
-      subredditName,
-      username: actor,
-      limit: 1,
-      pageSize: 1,
-    })
-    .all();
-  return moderators.length > 0;
+  try {
+    const moderators = await reddit
+      .getModerators({
+        subredditName,
+        username: actor,
+        limit: 1,
+        pageSize: 1,
+      })
+      .all();
+    return Array.isArray(moderators) && moderators.length > 0;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`[fixture] moderator authorization failed: ${detail}`);
+    return false;
+  }
 }
 
 /** Resolve one select value; arbitrary subreddit names are never accepted. */
@@ -328,7 +334,9 @@ export async function createFixture(
     nx: true,
     expiration: new Date(Date.now() + 10 * 60 * 1000),
   });
-  if (!claim) {
+  // SET NX succeeds only with the exact Redis `OK` reply. Any other
+  // response is ambiguous and must not cross the Reddit submission boundary.
+  if (claim !== 'OK') {
     return {
       created: false,
       duplicate: true,

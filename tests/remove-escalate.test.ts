@@ -23,6 +23,7 @@ const WARN: PunishResult = {
   priors: 0,
   ruleName: 'Toxicity',
   recorded: true,
+  finalized: true,
 };
 const BAN: PunishResult = {
   action: 'ban',
@@ -32,6 +33,7 @@ const BAN: PunishResult = {
   priors: 1,
   ruleName: 'Toxicity',
   recorded: true,
+  finalized: true,
 };
 
 function input(overrides: Partial<RemoveEscalateInput> = {}): RemoveEscalateInput {
@@ -135,11 +137,24 @@ describe('remove & escalate toast builders', () => {
   it('marks actions whose history was not recorded', () => {
     expect(
       buildRemoveEscalateSuccessToast({
-        result: { ...WARN, recorded: false },
+        result: { ...WARN, recorded: false, finalized: true },
         targetUser: 'poster',
         rule: TOXICITY,
       })
     ).toBe('Removed & warned u/poster (R2 — Toxicity) (not recorded)');
+  });
+
+  it('marks Reddit success with an unfinalized pending record prominently', () => {
+    expect(buildRemoveEscalateSuccessToast({
+      result: { ...WARN, finalized: false },
+      targetUser: 'poster',
+      rule: TOXICITY,
+    })).toContain('[finalized:false]');
+    expect(buildRemoveEscalateSuccessToast({
+      result: { ...WARN, finalized: false },
+      targetUser: 'poster',
+      rule: TOXICITY,
+    })).toContain('Do not retry');
   });
 
   it('reports already-processed presses', () => {
@@ -207,6 +222,18 @@ describe('runRemoveAndEscalate', () => {
     expect(current.removed).toEqual(['t1_xyz789']);
     expect(current.punished[0]?.targetThingId).toBe('t1_xyz789');
     expect(current.redis.values.get('removeescalate:seen:t1_xyz789')).toBe('1');
+  });
+
+  it('fails closed for a malformed SET NX reply before removing', async () => {
+    const redis = new FakeRedis();
+    vi.spyOn(redis, 'set').mockResolvedValue('YES' as never);
+    const current = state({}, redis);
+
+    await expect(runRemoveAndEscalate(input(), current.deps)).resolves.toEqual({
+      status: 'already-processed',
+    });
+    expect(current.removed).toEqual([]);
+    expect(current.punished).toEqual([]);
   });
 
   it('keeps the seen claim when punish fails and the thing stays removed', async () => {

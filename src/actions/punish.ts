@@ -1,21 +1,25 @@
 import { effectivePriors, LADDER, pickRung, type LadderRung } from '../lib/ladder.js';
 import { ruleByNumber } from '../lib/rules.js';
-import type { HistoryStore, ModActionRecord, RedisStringLike } from '../lib/history.js';
+import type { HistoryStore, ModActionRecord, RedisLeaseStore } from '../lib/history.js';
+import {
+  acquireUserActionLock,
+  assertUserActionLockHeld,
+  releaseUserActionLock,
+  userActionLockKey,
+} from '../lib/user-lock.js';
 
 const RULES_WIKI = 'https://www.reddit.com/r/RPClipsGTA/wiki/subreddit/rules/';
 const MODMAIL_APPEAL =
   'If you would like to appeal, please contact the moderators via modmail.';
 
-const LOCK_TTL_MS = 30 * 1000;
-
 export interface PunishDeps {
   readonly history: HistoryStore;
-  /** Shared Redis (string commands) used to serialize the punishment flow. */
-  readonly redis: RedisStringLike;
+  /** Shared Redis string + WATCH transaction API used to serialize the punishment flow. */
+  readonly redis: RedisLeaseStore;
   readonly submitComment: (options: {
     text: string;
     replyTargetThingId: string;
-  }) => Promise<string>;
+  }) => Promise<unknown>;
   readonly banUser: (options: {
     username: string;
     subredditName: string;
@@ -44,6 +48,10 @@ export interface PunishResult {
   readonly priors: number;
   readonly ruleName: string;
   readonly recorded: boolean;
+  /** True only when a stored pending marker was finalized after Reddit success. */
+  readonly finalized: boolean;
+  /** Exact row id to give the dev/QA reconciliation operator when needed. */
+  readonly pendingRecordId?: string;
 }
 
 export interface WarningCommentInput {
@@ -56,6 +64,11 @@ export interface WarningCommentInput {
 
 function rungLabel(rung: WarningCommentInput['rung']): string {
   return typeof rung === 'string' ? rung : rung.label;
+}
+
+/** Reddit comment submissions must return an exact non-empty t1_ fullname. */
+export function isValidCommentFullname(value: unknown): value is `t1_${string}` {
+  return typeof value === 'string' && /^t1_[A-Za-z0-9]+$/.test(value);
 }
 
 /** Build the next-rung text used in a first-offense warning comment. */
@@ -101,9 +114,7 @@ function banMessage(input: PunishInput, rung: LadderRung, ruleName: string): str
 }
 
 /** Redis key used to serialize every action for one normalized username. */
-export function punishLockKey(username: string): string {
-  return `punish:lock:${username.toLowerCase()}`;
-}
+export const punishLockKey = userActionLockKey;
 
 /** The pending row shape handed to append(), which mints the unique id. */
 function pendingRecordFor(input: PunishInput, at: number, rung: LadderRung): Omit<ModActionRecord, 'id'> {
@@ -114,27 +125,19 @@ function pendingRecordFor(input: PunishInput, at: number, rung: LadderRung): Omi
     label: rung.label,
     modUser: input.modUser,
     targetThingId: input.targetThingId,
+    state: 'pending',
   };
 }
 
-async function compensateRecord(
-  history: HistoryStore,
-  username: string,
-  record: ModActionRecord
-): Promise<void> {
-  try {
-    // Compensation is by the row's unique id, never by field comparison.
-    const removed = await history.remove(username, record.id);
-    if (!removed) {
-      console.error('[punish] execution failed; compensation could not remove the pending record');
-    }
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    console.error(`[punish] execution failed; history compensation failed: ${detail}`);
-  }
-}
-
-/** Execute the ladder under a per-user lock and record before Reddit execution. */
+/**
+ * Execute the ladder under a per-user lock and record before Reddit execution.
+ *
+ * The history row is a pending action marker. Once a Reddit request has been
+ * started, an exception or timeout has an ambiguous external outcome; the row
+ * is retained and reconciliation is manual. Removing it would make an
+ * already-applied warning/ban look like it never happened and could cause an
+ * unsafe automatic retry.
+ */
 export async function punish(
   deps: PunishDeps,
   input: PunishInput
@@ -142,28 +145,29 @@ export async function punish(
   const rule = ruleByNumber(input.rule);
   if (!rule) throw new Error(`Unknown rule: ${input.rule}`);
 
-  const lockKey = punishLockKey(input.targetUser);
-  // Owner token guarding the release: if execution outlives the TTL below and
-  // a second caller acquires the expired lock, this call's release must not
-  // delete the other caller's lock. Only a GET that still returns this exact
-  // token is followed by a DEL.
+  // This is the same lock key and lease used by seed/clear. A seed can never
+  // interleave with a punishment's summary/append/execution sequence.
   const now = deps.now ?? Date.now;
-  const lockToken = `${input.modUser}:${now()}:${Math.random().toString(36).slice(2)}`;
-  const lockResult = await deps.redis.set(lockKey, lockToken, {
-    nx: true,
-    expiration: new Date(Date.now() + LOCK_TTL_MS),
-  });
-  const acquired = typeof lockResult === 'string';
-  if (!acquired) throw new Error('punishment already in progress for this user');
+  const lock = await acquireUserActionLock(deps.redis, input.targetUser, input.modUser, now);
 
   try {
+    // Refuse to continue if an explicit operational recovery changed
+    // ownership before a history mutation. Redis read failures are fail-closed
+    // here: unknown history must never be treated as a fresh user.
+    await assertUserActionLockHeld(deps.redis, lock);
     const at = now();
-    // history.summary() intentionally degrades redis read failures to a fresh
-    // history (total 0): an unreadable summary presents as no priors, so the
-    // action degrades to a warning rung — contained, rather than failing. Rung
-    // selection needs only that O(1)-ish summary (ZCARD + newest score); the
-    // full history is never loaded here.
-    const summary = await deps.history.summary(input.targetUser);
+    const strictSummary = await deps.history.summaryStrict(input.targetUser, at);
+    if (!strictSummary.ok) {
+      throw new Error('could not read action history; no Reddit action was attempted');
+    }
+    const summary = strictSummary.summary;
+    const strictRows = await deps.history.loadStrict(input.targetUser);
+    if (!strictRows.ok) {
+      throw new Error('could not verify action history; no Reddit action was attempted');
+    }
+    if (strictRows.rows.some((row) => row.state === 'pending')) {
+      throw new Error('an earlier Reddit action has an unresolved outcome; reconcile it before retrying');
+    }
     const rung = pickRung(summary.total, summary.latestAt, at);
     const effective = effectivePriors(summary.total, summary.latestAt, at);
 
@@ -174,6 +178,9 @@ export async function punish(
     let recorded = false;
     let pendingRecord: ModActionRecord | undefined;
     try {
+      // Re-check immediately before the first history mutation. This is the
+      // fail-closed boundary if explicit lock recovery raced this request.
+      await assertUserActionLockHeld(deps.redis, lock);
       // Append is a single atomic ZADD that mints the unique row id and
       // returns the stored record — that record is the compensation identity.
       const appended = await deps.history.append(
@@ -188,13 +195,27 @@ export async function punish(
       recorded = false;
     }
     if (!recorded) {
-      console.error(`[punish] proceeding without a history record for ${input.targetUser}`);
+      // A Reddit action without a positively confirmed pending marker cannot
+      // be safely retried or reconciled. Fail closed before crossing the
+      // external side-effect boundary. If the append may have landed despite
+      // an ambiguous Redis reply, the returned id remains useful to an
+      // administrator inspecting the history; never guess by deleting it.
+      const id = pendingRecord?.id ? ` (${pendingRecord.id})` : '';
+      throw new Error(
+        `could not confirm pending history record${id}; no Reddit action was attempted`
+      );
     }
 
     let commentId = '';
+    let redditCallStarted = false;
     try {
+      // A Reddit call cannot be rolled back once started. Check ownership at
+      // the last safe point so an operationally recovered request never starts
+      // a new external action after losing the shared lock.
+      await assertUserActionLockHeld(deps.redis, lock);
+      redditCallStarted = true;
       if (rung.action === 'warn') {
-        commentId = await deps.submitComment({
+        const receipt = await deps.submitComment({
           text: buildWarningComment({
             targetUser: input.targetUser,
             rule: input.rule,
@@ -204,6 +225,13 @@ export async function punish(
           }),
           replyTargetThingId: input.targetThingId,
         });
+        if (!isValidCommentFullname(receipt)) {
+          // The Reddit request has already started. An absent, malformed, or
+          // wrong-kind receipt is ambiguous: retain the pending row and never
+          // finalize or retry it automatically.
+          throw new Error('Reddit warning receipt was invalid or ambiguous; pending record retained');
+        }
+        commentId = receipt;
       } else {
         await deps.banUser({
           username: input.targetUser,
@@ -215,12 +243,84 @@ export async function punish(
         });
       }
     } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
       if (recorded && pendingRecord) {
-        // There is a tiny crash window between the Reddit action and this
-        // compensation; pending-first makes a failed action visible otherwise.
-        await compensateRecord(deps.history, input.targetUser, pendingRecord);
+        if (redditCallStarted) {
+          // Timeout/exception is not proof that Reddit rejected the request.
+          // Keep the marker and require an operator to reconcile Reddit before
+          // any retry; never auto-remove or auto-retry an ambiguous outcome.
+          console.error(
+            `[punish] Reddit outcome unknown for ${input.targetUser}; ` +
+              `pending record ${pendingRecord.id} retained for manual reconciliation: ${detail}`
+          );
+          throw new Error(
+            `Reddit outcome unknown; pending record ${pendingRecord.id} retained. ` +
+              `Inspect Reddit before reconciliation; do not retry. Original error: ${detail}`
+          );
+        } else {
+          // A pre-call ownership failure proves this invocation did not start
+          // Reddit work. Compensation is still conditional: removeOwned()
+          // watches the lock and refuses to mutate history after ownership is
+          // lost or changes during the transaction.
+          const removed = await deps.history.removeOwned(input.targetUser, pendingRecord.id, {
+            redis: deps.redis,
+            key: lock.key,
+            token: lock.token,
+          });
+          if (!removed) {
+            console.error(
+              `[punish] pre-call failure for ${input.targetUser}; pending record ` +
+                `${pendingRecord.id} retained because ownership was not proven: ${detail}`
+            );
+          }
+        }
       }
       throw error;
+    }
+
+    let finalized = false;
+    if (recorded && pendingRecord) {
+      // The lock is deliberately held through every bounded retry. Each
+      // attempt re-proves ownership; a lost lock stops retries rather than
+      // mutating history under a replacement owner.
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          await assertUserActionLockHeld(deps.redis, lock);
+          finalized = await deps.history.markApplied(input.targetUser, pendingRecord.id, {
+            redis: deps.redis,
+            key: lock.key,
+            token: lock.token,
+          });
+          if (finalized) break;
+          await assertUserActionLockHeld(deps.redis, lock);
+
+          // A transaction can commit while its reply is lost or malformed.
+          // Re-read under the still-held lock before retrying so a committed
+          // state-less replacement is recognized as finalized rather than
+          // presented as an impossible-to-reconcile pending row.
+          const verified = await deps.history.loadStrict(input.targetUser);
+          if (
+            verified.ok &&
+            verified.rows.filter((row) => row.id === pendingRecord?.id).length === 1 &&
+            verified.rows.find((row) => row.id === pendingRecord?.id)?.state === undefined
+          ) {
+            finalized = true;
+            break;
+          }
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          console.error(
+            `[punish] finalization attempt ${attempt}/3 for ${pendingRecord.id} stopped: ${detail}`
+          );
+          break;
+        }
+      }
+      if (!finalized) {
+        console.error(
+          `[punish] Reddit action applied but pending record ${pendingRecord.id} ` +
+            'could not be finalized after 3 safe attempts'
+        );
+      }
     }
 
     return {
@@ -231,23 +331,12 @@ export async function punish(
       priors: effective,
       ruleName: rule.name,
       recorded,
+      finalized,
+      ...(pendingRecord ? { pendingRecordId: pendingRecord.id } : {}),
     };
   } finally {
-    // Release only when this call acquired the lock, and only while the key
-    // still holds this call's owner token. The GET→DEL pair is not atomic —
-    // Devvit redis has no compare-and-delete — so a lock expiring exactly
-    // between GET and DEL can still be deleted after a second caller acquires
-    // it; that tiny race is accepted as unavoidable with this API.
-    // A redis failure here must never throw over an already-applied punishment
-    // result or mask the original execution error.
-    if (acquired) {
-      try {
-        const current = await deps.redis.get(lockKey);
-        if (current === lockToken) await deps.redis.del(lockKey);
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        console.error(`[punish] failed to release punishment lock ${lockKey}: ${detail}`);
-      }
-    }
+    // A Redis release failure must never throw over an already-applied
+    // punishment result or mask the original execution error.
+    await releaseUserActionLock(deps.redis, lock, 'punish');
   }
 }

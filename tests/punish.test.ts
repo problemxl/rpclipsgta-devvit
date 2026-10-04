@@ -2,9 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { punish, punishLockKey, buildWarningComment, type PunishDeps } from '../src/actions/punish.js';
 import {
+  acquireUserActionLock,
+  releaseUserActionLock,
+} from '../src/lib/user-lock.js';
+import {
   createHistoryStore,
   historyKey,
   type ModActionRecord,
+  type RedisLeaseTransaction,
   type RedisLike,
   type RedisSetOptions,
   type RedisStringLike,
@@ -15,7 +20,9 @@ const DAY = 24 * 60 * 60 * 1000;
 const MONTH = 30 * DAY;
 
 /** String commands for the lock plus sorted sets for history, like context.redis. */
-type FakeRedisShape = RedisStringLike & RedisLike;
+type FakeRedisShape = RedisStringLike & RedisLike & {
+  watch(...keys: string[]): Promise<RedisLeaseTransaction>;
+};
 
 /** Structural Redis double: real NX/XX strings, a real sorted set, call recording. */
 class FakeRedis implements FakeRedisShape {
@@ -23,11 +30,21 @@ class FakeRedis implements FakeRedisShape {
   readonly zsets = new Map<string, Map<string, number>>();
   readonly setCalls: Array<{ key: string; value: string; options?: RedisSetOptions }> = [];
   readonly delCalls: string[] = [];
+  discardCalls = 0;
+  failMulti = false;
+  failExec = false;
+  failDiscard = false;
+  /** Override an EXEC reply to exercise fail-closed reply validation. */
+  execReplyOverride: unknown[] | undefined = undefined;
+  execReplyOverrideConfigured = false;
+  onGet?: (key: string) => void;
   /** Overrides the ZADD resolution; 0 simulates a write that did not land. */
   zAddResult: number | undefined;
 
   async get(key: string): Promise<string | undefined> {
-    return this.values.get(key);
+    const value = this.values.get(key);
+    this.onGet?.(key);
+    return value;
   }
 
   async set(
@@ -45,6 +62,65 @@ class FakeRedis implements FakeRedisShape {
   async del(key: string): Promise<void> {
     this.delCalls.push(key);
     this.values.delete(key);
+  }
+
+  async watch(...keys: string[]): Promise<RedisLeaseTransaction> {
+    const snapshot = new Map(keys.map((key) => [key, this.values.get(key)]));
+    const zsetSnapshot = new Map(
+      keys.map((key) => [key, JSON.stringify([...((this.zsets.get(key) ?? new Map()).entries())])])
+    );
+    const redis = this;
+    let deletion: string[] = [];
+    let zrem: Array<{ key: string; members: string[] }> = [];
+    let zadd: Array<{ key: string; members: { member: string; score: number }[] }> = [];
+    let multiStarted = false;
+    const transaction: RedisLeaseTransaction = {
+      async multi() {
+        if (redis.failMulti) throw new Error('multi failed');
+        multiStarted = true;
+      },
+      async del(...names: string[]) {
+        deletion = names;
+        return transaction;
+      },
+      async zRem(key: string, members: string[]) {
+        zrem.push({ key, members });
+        return transaction;
+      },
+      async zAdd(key: string, ...members: { member: string; score: number }[]) {
+        zadd.push({ key, members });
+        return transaction;
+      },
+      async exec(): Promise<unknown[]> {
+        if (redis.failExec) throw new Error('exec failed');
+        if (!multiStarted) throw new Error('multi required');
+        for (const key of keys) {
+          if (
+            redis.values.get(key) !== snapshot.get(key) ||
+            JSON.stringify([...(redis.zsets.get(key) ?? new Map()).entries()]) !== zsetSnapshot.get(key)
+          ) return [];
+        }
+        if (redis.execReplyOverrideConfigured) return redis.execReplyOverride ?? [];
+        const replies: unknown[] = [];
+        for (const key of deletion) {
+          await redis.del(key);
+          replies.push(1);
+        }
+        for (const operation of zrem) {
+          replies.push(await redis.zRem(operation.key, operation.members));
+        }
+        for (const operation of zadd) {
+          replies.push(await redis.zAdd(operation.key, ...operation.members));
+        }
+        return replies;
+      },
+      async discard() {
+        redis.discardCalls += 1;
+        if (redis.failDiscard) throw new Error('discard failed');
+        deletion = [];
+      },
+    };
+    return transaction;
   }
 
   async zAdd(
@@ -116,9 +192,10 @@ class FakeRedis implements FakeRedisShape {
 }
 
 function deps(overrides: Partial<PunishDeps> = {}, redis = new FakeRedis()): PunishDeps {
+  const actualRedis = (overrides.redis ?? redis) as FakeRedisShape;
   return {
-    history: createHistoryStore(redis),
-    redis,
+    history: overrides.history ?? createHistoryStore(actualRedis),
+    redis: actualRedis,
     submitComment: vi.fn(async () => 't1_warning'),
     banUser: vi.fn(async () => undefined),
     now: () => NOW,
@@ -204,6 +281,7 @@ describe('punish', () => {
     expect(current.submitComment).toHaveBeenCalled();
     expect(current.banUser).not.toHaveBeenCalled();
     expect(await current.history.load('Target')).toHaveLength(4); // 3 kept + this one
+    expect((await current.history.load('Target')).at(-1)?.state).toBeUndefined();
   });
 
   it('still sees a 400-day-old prior through full retention', async () => {
@@ -229,27 +307,129 @@ describe('punish', () => {
     expect(current.submitComment).toHaveBeenCalled();
   });
 
-  it('continues without a record when ZADD resolves 0', async () => {
+  it('fails closed when strict history cannot be read', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    vi.spyOn(history, 'summaryStrict').mockResolvedValue({ ok: false });
+    const submitComment = vi.fn(async () => 'unreachable');
+    const current = deps({ redis, history, submitComment });
+
+    await expect(punish(current, input)).rejects.toThrow(
+      'could not read action history; no Reddit action was attempted'
+    );
+    expect(submitComment).not.toHaveBeenCalled();
+    expect(await history.load('Target')).toEqual([]);
+  });
+
+  it('blocks retry while an unresolved pending action exists', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    await history.append('Target', {
+      at: NOW,
+      rule: 2,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'Mod',
+      targetThingId: 't3_post',
+      state: 'pending',
+    });
+    const submitComment = vi.fn(async () => 'unreachable');
+    await expect(punish(deps({ redis, history, submitComment }), input)).rejects.toThrow(
+      'unresolved outcome; reconcile it before retrying'
+    );
+    expect(submitComment).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when ZADD does not confirm the pending row', async () => {
     const redis = new FakeRedis();
     redis.zAddResult = 0;
     const current = deps({}, redis);
-    await expect(punish(current, input)).resolves.toMatchObject({ recorded: false, action: 'warn' });
-    expect(current.submitComment).toHaveBeenCalled();
+    await expect(punish(current, input)).rejects.toThrow(
+      'could not confirm pending history record'
+    );
+    expect(current.submitComment).not.toHaveBeenCalled();
     expect(await current.history.load('Target')).toEqual([]);
   });
 
-  it('continues without a record when the history append throws', async () => {
+  it('fails closed when the history append throws', async () => {
     const failingHistory = {
       summary: async () => ({ total: 0, latestAt: undefined as number | undefined }),
+      summaryStrict: async () => ({
+        ok: true as const,
+        summary: { total: 0, latestAt: undefined as number | undefined },
+      }),
       append: async () => {
         throw new Error('append failed');
       },
       load: async () => [] as ModActionRecord[],
+      loadStrict: async () => ({ ok: true as const, rows: [] as ModActionRecord[] }),
       remove: async () => false,
+      removeOwned: async () => false,
+      markApplied: async () => true,
+      clear: async () => false,
     };
     const current = deps({ history: failingHistory });
-    await expect(punish(current, input)).resolves.toMatchObject({ recorded: false, action: 'warn' });
-    expect(current.submitComment).toHaveBeenCalled();
+    await expect(punish(current, input)).rejects.toThrow(
+      'could not confirm pending history record'
+    );
+    expect(current.submitComment).not.toHaveBeenCalled();
+  });
+
+  it('retries finalization at most three times while retaining the owner lock', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const markApplied = vi.spyOn(history, 'markApplied').mockResolvedValue(false);
+    const current = deps({ redis, history });
+    const result = await punish(current, input);
+    expect(result).toMatchObject({ recorded: true, finalized: false });
+    expect(markApplied).toHaveBeenCalledTimes(3);
+    expect(redis.values.has(punishLockKey('Target'))).toBe(false);
+  });
+
+  it('recognizes a committed finalization even when its reply is reported as ambiguous', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const originalMarkApplied = history.markApplied.bind(history);
+    vi.spyOn(history, 'markApplied').mockImplementation(async (...args) => {
+      await originalMarkApplied(...args);
+      return false;
+    });
+    const result = await punish(deps({ redis, history }), input);
+    expect(result).toMatchObject({ recorded: true, finalized: true });
+    const rows = await history.loadStrict('Target');
+    expect(rows.ok).toBe(true);
+    if (rows.ok) expect(rows.rows[0]?.state).toBeUndefined();
+  });
+
+  it('retains the pending row for every invalid warning receipt', async () => {
+    for (const receipt of [undefined, '', 't3_', 't3_wrong', 'not-a-fullname', 't1_'] as const) {
+      const redis = new FakeRedis();
+      const current = deps({
+        redis,
+        submitComment: vi.fn(async () => receipt),
+      });
+
+      await expect(punish(current, input)).rejects.toThrow('receipt was invalid or ambiguous');
+      expect(current.submitComment).toHaveBeenCalledTimes(1);
+      expect(await current.history.loadStrict('Target')).toMatchObject({
+        ok: true,
+        rows: [{ state: 'pending' }],
+      });
+    }
+  });
+
+  it('does not auto-finalize or retry after an invalid warning receipt', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const submitComment = vi.fn(async () => 'malformed receipt');
+    const current = deps({ redis, history, submitComment });
+
+    await expect(punish(current, input)).rejects.toThrow('pending record retained');
+    expect(submitComment).toHaveBeenCalledTimes(1);
+    expect(await history.loadStrict('Target')).toMatchObject({
+      ok: true,
+      rows: [{ state: 'pending' }],
+    });
   });
 
   it('propagates comment execution failures', async () => {
@@ -304,6 +484,18 @@ describe('punish lock', () => {
     expect(await history.load('Target')).toHaveLength(2);
   });
 
+  it('fails closed when SET NX returns a malformed truthy reply', async () => {
+    const redis = new FakeRedis();
+    vi.spyOn(redis, 'set').mockResolvedValue('YES' as never);
+    const history = createHistoryStore(redis);
+    const append = vi.spyOn(history, 'append');
+
+    await expect(punish(deps({ redis, history }), input)).rejects.toThrow(
+      'punishment already in progress'
+    );
+    expect(append).not.toHaveBeenCalled();
+  });
+
   it('throws in progress without any writes when the lock is already held', async () => {
     const redis = new FakeRedis();
     redis.values.set(punishLockKey('Target'), '1');
@@ -319,7 +511,7 @@ describe('punish lock', () => {
     expect(redis.delCalls).toEqual([]); // never releases a lock it did not acquire
   });
 
-  it('acquires a lowercased lock with a ~30s TTL, an owner token value, and releases it on success', async () => {
+  it('acquires a lowercased non-expiring lock with an owner token value, and releases it on success', async () => {
     const redis = new FakeRedis();
     const current = deps({ redis });
 
@@ -332,9 +524,7 @@ describe('punish lock', () => {
     // not a constant — release only deletes when the stored value matches it.
     expect(lockCalls[0].value).toMatch(/^Mod:\d+:[a-z0-9]+$/);
     expect(lockCalls[0].options?.nx).toBe(true);
-    const ttlMs = lockCalls[0].options?.expiration?.getTime();
-    expect(ttlMs).toBeGreaterThan(Date.now() + 25 * 1000);
-    expect(ttlMs).toBeLessThanOrEqual(Date.now() + 30 * 1000);
+    expect(lockCalls[0].options?.expiration).toBeUndefined();
     expect(redis.delCalls).toEqual(['punish:lock:target']);
   });
 
@@ -350,65 +540,101 @@ describe('punish lock', () => {
     expect(redis.delCalls).toEqual(['punish:lock:target']);
   });
 
-  it('does not delete the lock when another owner acquired it after our TTL expired', async () => {
+  it('fails closed when explicit recovery changes ownership before the Reddit call', async () => {
     const redis = new FakeRedis();
     const lockKey = punishLockKey('Target');
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
+    const submitComment = vi.fn(async () => {
+      await gate;
+      return 't1_warning';
+    });
     const current = deps({
       redis,
-      submitComment: async () => {
-        await gate;
-        return 't1_warning';
-      },
+      submitComment,
     });
 
     const pending = punish(current, input);
     await vi.waitFor(() => expect(redis.values.has(lockKey)).toBe(true));
 
-    // Simulate the ~30s TTL lapsing mid-execution: a second caller acquires
-    // the expired lock with its own token before this call releases.
+    // Explicit recovery changes the owner before the Reddit call. The stale
+    // request must not execute or mutate history after losing its lock.
     redis.values.set(lockKey, 'Other:999:secondcaller');
 
     release();
-    await expect(pending).resolves.toMatchObject({ action: 'warn', commentId: 't1_warning' });
-
-    // The second caller's lock survived this call's release attempt.
+    await expect(pending).rejects.toThrow('punishment lock was lost');
+    expect(submitComment).not.toHaveBeenCalled();
     expect(redis.values.get(lockKey)).toBe('Other:999:secondcaller');
+  });
+
+  it('does not delete a replacement owner when takeover happens between GET and EXEC', async () => {
+    const redis = new FakeRedis();
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+    let replaced = false;
+    redis.onGet = (key) => {
+      if (!replaced && key === lock.key) {
+        replaced = true;
+        redis.values.set(key, 'Other:999:replacement');
+      }
+    };
+
+    await releaseUserActionLock(redis, lock, 'test');
+
+    expect(redis.values.get(lock.key)).toBe('Other:999:replacement');
     expect(redis.delCalls).toEqual([]);
   });
 
-  it('resolves with the real result when the release GET or DEL rejects', async () => {
+  it('best-effort discards a watched transaction when MULTI fails', async () => {
+    const redis = new FakeRedis();
+    redis.failMulti = true;
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+
+    await releaseUserActionLock(redis, lock, 'test');
+
+    expect(redis.discardCalls).toBe(1);
+    expect(redis.values.get(lock.key)).toBe(lock.token);
+  });
+
+  it('best-effort discards when EXEC fails', async () => {
+    const redis = new FakeRedis();
+    redis.failExec = true;
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+
+    await expect(releaseUserActionLock(redis, lock, 'test')).resolves.toBeUndefined();
+
+    expect(redis.discardCalls).toBe(1);
+    expect(redis.values.get(lock.key)).toBe(lock.token);
+  });
+
+  it('does not mask a completed action when the conditional release transaction fails', async () => {
     class FailingReleaseRedis extends FakeRedis {
-      constructor(private readonly failingMethod: 'get' | 'del') {
-        super();
-      }
-
-      override async get(key: string): Promise<string | undefined> {
-        if (this.failingMethod === 'get' && key.startsWith('punish:lock:')) {
-          throw new Error('redis down on get');
+      override async watch(...keys: string[]): Promise<RedisLeaseTransaction> {
+        if (keys.some((key) => key.startsWith('punish:lock:'))) {
+          throw new Error('redis down on watch');
         }
-        return super.get(key);
-      }
-
-      override async del(key: string): Promise<void> {
-        if (this.failingMethod === 'del' && key.startsWith('punish:lock:')) {
-          throw new Error('redis down on del');
-        }
-        return super.del(key);
+        return super.watch(...keys);
       }
     }
 
-    for (const failingMethod of ['get', 'del'] as const) {
-      const redis = new FailingReleaseRedis(failingMethod);
-      const current = deps({ redis });
-      // A release failure is logged and swallowed; the punishment result and
-      // any original execution error are unaffected.
-      await expect(punish(current, input)).resolves.toMatchObject({
-        action: 'warn',
-        label: 'Warning',
-        commentId: 't1_warning',
-      });
+    const redis = new FailingReleaseRedis();
+    const current = deps({ redis });
+    await expect(punish(current, input)).resolves.toMatchObject({ action: 'warn' });
+  });
+
+  it('requires an exact numeric DEL reply when releasing the lock', async () => {
+    for (const reply of [[0], ['OK'], [1, 1]] as const) {
+      const redis = new FakeRedis();
+      const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+      redis.execReplyOverride = [...reply];
+      redis.execReplyOverrideConfigured = true;
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        await releaseUserActionLock(redis, lock, 'test');
+        expect(error.mock.calls.flat().join('\n')).toContain('lock release reply was not exact');
+        expect(redis.values.get(lock.key)).toBe(lock.token);
+      } finally {
+        error.mockRestore();
+      }
     }
   });
 
@@ -427,7 +653,194 @@ describe('punish lock', () => {
 });
 
 describe('punish compensation', () => {
-  it('removes the pending row by id on execution failure so the retry sees no phantom prior', async () => {
+  it('fails closed when markApplied EXEC replies are not exact numeric successes', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const pending = (await history.append('Target', {
+      at: NOW,
+      rule: 2,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'Mod',
+      targetThingId: 't3_post',
+      state: 'pending',
+    })).record;
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+    for (const reply of [[0, 0], [1, 0], ['OK', 'OK'], [1], undefined] as const) {
+      redis.execReplyOverride = reply ? [...reply] : undefined;
+      redis.execReplyOverrideConfigured = true;
+      await expect(history.markApplied('Target', pending.id, {
+        redis,
+        key: lock.key,
+        token: lock.token,
+      })).resolves.toBe(false);
+      expect(await history.load('Target')).toEqual([pending]);
+    }
+    await releaseUserActionLock(redis, lock, 'test');
+  });
+
+  it('removes a pending row only while the owner token is still held', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const pending = (await history.append('Target', {
+      at: NOW,
+      rule: 2,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'Mod',
+      targetThingId: 't3_post',
+      state: 'pending',
+    })).record;
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+
+    await expect(history.removeOwned('Target', pending.id, {
+      redis,
+      key: lock.key,
+      token: lock.token,
+    })).resolves.toBe(true);
+    expect(await history.load('Target')).toEqual([]);
+    expect(redis.discardCalls).toBe(0);
+    await releaseUserActionLock(redis, lock, 'test');
+  });
+
+  it('requires an exact numeric ZREM reply for owned compensation', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const pending = (await history.append('Target', {
+      at: NOW,
+      rule: 2,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'Mod',
+      targetThingId: 't3_post',
+      state: 'pending',
+    })).record;
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+    for (const reply of [[0], ['OK'], [1, 1]] as const) {
+      redis.execReplyOverride = [...reply];
+      redis.execReplyOverrideConfigured = true;
+      await expect(history.removeOwned('Target', pending.id, {
+        redis,
+        key: lock.key,
+        token: lock.token,
+      })).resolves.toBe(false);
+      expect(await history.load('Target')).toEqual([pending]);
+    }
+    await releaseUserActionLock(redis, lock, 'test');
+  });
+
+  it('does not report success when owned compensation cannot find the exact row', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+    await expect(history.removeOwned('Target', 'missing', {
+      redis,
+      key: lock.key,
+      token: lock.token,
+    })).resolves.toBe(false);
+    await releaseUserActionLock(redis, lock, 'test');
+  });
+
+  it('does not remove a pending row when ownership changes after WATCH and GET', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const pending = (await history.append('Target', {
+      at: NOW,
+      rule: 2,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'Mod',
+      targetThingId: 't3_post',
+      state: 'pending',
+    })).record;
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+    let replaced = false;
+    redis.onGet = (key) => {
+      if (!replaced && key === lock.key) {
+        replaced = true;
+        redis.values.set(key, 'Other:999:replacement');
+      }
+    };
+
+    await expect(history.removeOwned('Target', pending.id, {
+      redis,
+      key: lock.key,
+      token: lock.token,
+    })).resolves.toBe(false);
+    expect(await history.load('Target')).toEqual([pending]);
+    expect(redis.values.get(lock.key)).toBe('Other:999:replacement');
+    expect(redis.discardCalls).toBe(0);
+  });
+
+  it('retains a pending row when ownership is lost before fenced compensation', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const pending = (await history.append('Target', {
+      at: NOW,
+      rule: 2,
+      action: 'warn',
+      label: 'Warning',
+      modUser: 'Mod',
+      targetThingId: 't3_post',
+      state: 'pending',
+    })).record;
+    const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+    redis.values.set(lock.key, 'Other:999:replacement');
+
+    await expect(history.removeOwned('Target', pending.id, {
+      redis,
+      key: lock.key,
+      token: lock.token,
+    })).resolves.toBe(false);
+    expect(await history.load('Target')).toEqual([pending]);
+    expect(redis.discardCalls).toBe(1);
+  });
+
+  it('does not remove a pending row after ownership is lost before the Reddit call', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const current = deps({
+      redis,
+      history,
+      submitComment: vi.fn(async () => 'unreachable'),
+    });
+    const originalGet = redis.get.bind(redis);
+    let gets = 0;
+    redis.get = async (key: string) => {
+      gets += 1;
+      const value = await originalGet(key);
+      // Replace the owner immediately after the final pre-call assertion.
+      if (key === punishLockKey('Target') && gets === 2) {
+        redis.values.set(key, 'Other:999:replacement');
+      }
+      return value;
+    };
+
+    await expect(punish(current, input)).rejects.toThrow('punishment lock was lost');
+    expect(current.submitComment).not.toHaveBeenCalled();
+    expect(await history.load('Target')).toHaveLength(1);
+    expect(redis.values.get(punishLockKey('Target'))).toBe('Other:999:replacement');
+  });
+
+  it('blocks a retry after an ambiguous Reddit failure', async () => {
+    const redis = new FakeRedis();
+    redis.seedPrior('Target', NOW - 1);
+    const history = createHistoryStore(redis);
+    const first = deps({
+      redis,
+      history,
+      banUser: vi.fn(async () => { throw new Error('timeout'); }),
+    });
+    await expect(punish(first, input)).rejects.toThrow('timeout');
+
+    const retrySubmit = vi.fn(async () => 'should-not-run');
+    await expect(punish(deps({ redis, history, submitComment: retrySubmit }), input)).rejects.toThrow(
+      'unresolved outcome; reconcile it before retrying'
+    );
+    expect(retrySubmit).not.toHaveBeenCalled();
+  });
+
+  it('retains a pending row when Reddit failure has an unknown external outcome', async () => {
     const redis = new FakeRedis();
     const prior = redis.seedPrior('Target', NOW - DAY);
     const history = createHistoryStore(redis);
@@ -439,20 +852,16 @@ describe('punish compensation', () => {
       }),
     });
 
-    // One prior ⇒ 3 day ban rung; the pending row is written first, then
-    // compensated when the ban fails.
+    // One prior ⇒ 3 day ban rung. Once the Reddit request starts, a failure
+    // is ambiguous, so the pending row remains for manual reconciliation.
     await expect(punish(failing, input)).rejects.toThrow('ban failed');
-    expect(await history.load('Target')).toEqual([prior]);
-
-    const retry = deps({ redis, history });
-    await expect(punish(retry, input)).resolves.toMatchObject({
-      action: 'ban',
-      durationDays: 3,
-      priors: 1,
-    });
+    expect(await history.load('Target')).toHaveLength(2);
+    expect(await history.load('Target')).toEqual(
+      expect.arrayContaining([prior, expect.objectContaining({ action: 'ban', label: '3 day ban' })])
+    );
   });
 
-  it('compensates only its own row when an older row has identical fields', async () => {
+  it('retains the pending row rather than mutating an identical older row', async () => {
     const redis = new FakeRedis();
     // Same at/rule/action/label/modUser/target as the pending row will get;
     // only the id differs. Field-matching compensation would remove it.
@@ -472,7 +881,8 @@ describe('punish compensation', () => {
 
     await expect(punish(current, input)).rejects.toThrow('ban failed');
     const rows = await current.history.load('Target');
-    expect(rows.map((row) => row.id)).toEqual(['stale']);
+    expect(rows.map((row) => row.id)).toEqual(expect.arrayContaining(['stale']));
+    expect(rows).toHaveLength(2);
   });
 
   it('persists no record when banUser fails', async () => {
@@ -489,8 +899,11 @@ describe('punish compensation', () => {
 
     await expect(punish(current, input)).rejects.toThrow('ban refused');
     const rows = await history.load('Target');
-    // The same two rows remain (order is score-ascending, not seed order).
-    expect([...rows.map((row) => row.id)].sort()).toEqual(priors.map((prior) => prior.id).sort());
+    // Both original rows and the ambiguous pending marker remain.
+    expect(rows).toHaveLength(3);
+    expect(rows.map((row) => row.id)).toEqual(
+      expect.arrayContaining(priors.map((prior) => prior.id))
+    );
   });
 });
 
