@@ -19,7 +19,7 @@ export interface PunishDeps {
   readonly submitComment: (options: {
     text: string;
     replyTargetThingId: string;
-  }) => Promise<string>;
+  }) => Promise<unknown>;
   readonly banUser: (options: {
     username: string;
     subredditName: string;
@@ -64,6 +64,11 @@ export interface WarningCommentInput {
 
 function rungLabel(rung: WarningCommentInput['rung']): string {
   return typeof rung === 'string' ? rung : rung.label;
+}
+
+/** Reddit comment submissions must return an exact non-empty t1_ fullname. */
+export function isValidCommentFullname(value: unknown): value is `t1_${string}` {
+  return typeof value === 'string' && /^t1_[A-Za-z0-9]+$/.test(value);
 }
 
 /** Build the next-rung text used in a first-offense warning comment. */
@@ -151,7 +156,7 @@ export async function punish(
     // here: unknown history must never be treated as a fresh user.
     await assertUserActionLockHeld(deps.redis, lock);
     const at = now();
-    const strictSummary = await deps.history.summaryStrict(input.targetUser);
+    const strictSummary = await deps.history.summaryStrict(input.targetUser, at);
     if (!strictSummary.ok) {
       throw new Error('could not read action history; no Reddit action was attempted');
     }
@@ -210,7 +215,7 @@ export async function punish(
       await assertUserActionLockHeld(deps.redis, lock);
       redditCallStarted = true;
       if (rung.action === 'warn') {
-        commentId = await deps.submitComment({
+        const receipt = await deps.submitComment({
           text: buildWarningComment({
             targetUser: input.targetUser,
             rule: input.rule,
@@ -220,6 +225,13 @@ export async function punish(
           }),
           replyTargetThingId: input.targetThingId,
         });
+        if (!isValidCommentFullname(receipt)) {
+          // The Reddit request has already started. An absent, malformed, or
+          // wrong-kind receipt is ambiguous: retain the pending row and never
+          // finalize or retry it automatically.
+          throw new Error('Reddit warning receipt was invalid or ambiguous; pending record retained');
+        }
+        commentId = receipt;
       } else {
         await deps.banUser({
           username: input.targetUser,

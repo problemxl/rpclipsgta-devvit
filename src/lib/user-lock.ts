@@ -89,10 +89,13 @@ export async function releaseUserActionLock(
     const commit = transaction as typeof transaction & { [key: string]: () => Promise<unknown[] | undefined> };
     const result = await commit[['ex', 'ec'].join('')]();
     finished = true;
-    // A successful one-command transaction returns one reply. WATCH aborts
-    // return no replies (the exact wrapper representation is runtime-specific).
+    // A successful one-command DEL transaction must return exactly numeric
+    // [1]. WATCH aborts return no replies; every other reply is ambiguous and
+    // is treated as an unconfirmed release.
     if (!result || result.length === 0) {
       console.warn(`[${logPrefix}] lock changed before release ${lock.key}`);
+    } else if (result.length !== 1 || result[0] !== 1) {
+      console.error(`[${logPrefix}] lock release reply was not exact for ${lock.key}`);
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

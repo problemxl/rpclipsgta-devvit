@@ -401,6 +401,37 @@ describe('punish', () => {
     if (rows.ok) expect(rows.rows[0]?.state).toBeUndefined();
   });
 
+  it('retains the pending row for every invalid warning receipt', async () => {
+    for (const receipt of [undefined, '', 't3_', 't3_wrong', 'not-a-fullname', 't1_'] as const) {
+      const redis = new FakeRedis();
+      const current = deps({
+        redis,
+        submitComment: vi.fn(async () => receipt),
+      });
+
+      await expect(punish(current, input)).rejects.toThrow('receipt was invalid or ambiguous');
+      expect(current.submitComment).toHaveBeenCalledTimes(1);
+      expect(await current.history.loadStrict('Target')).toMatchObject({
+        ok: true,
+        rows: [{ state: 'pending' }],
+      });
+    }
+  });
+
+  it('does not auto-finalize or retry after an invalid warning receipt', async () => {
+    const redis = new FakeRedis();
+    const history = createHistoryStore(redis);
+    const submitComment = vi.fn(async () => 'malformed receipt');
+    const current = deps({ redis, history, submitComment });
+
+    await expect(punish(current, input)).rejects.toThrow('pending record retained');
+    expect(submitComment).toHaveBeenCalledTimes(1);
+    expect(await history.loadStrict('Target')).toMatchObject({
+      ok: true,
+      rows: [{ state: 'pending' }],
+    });
+  });
+
   it('propagates comment execution failures', async () => {
     const current = deps({ submitComment: vi.fn(async () => { throw new Error('comment failed'); }) });
     await expect(punish(current, input)).rejects.toThrow('comment failed');
@@ -451,6 +482,18 @@ describe('punish lock', () => {
       priors: 1,
     });
     expect(await history.load('Target')).toHaveLength(2);
+  });
+
+  it('fails closed when SET NX returns a malformed truthy reply', async () => {
+    const redis = new FakeRedis();
+    vi.spyOn(redis, 'set').mockResolvedValue('YES' as never);
+    const history = createHistoryStore(redis);
+    const append = vi.spyOn(history, 'append');
+
+    await expect(punish(deps({ redis, history }), input)).rejects.toThrow(
+      'punishment already in progress'
+    );
+    expect(append).not.toHaveBeenCalled();
   });
 
   it('throws in progress without any writes when the lock is already held', async () => {
@@ -576,6 +619,23 @@ describe('punish lock', () => {
     const redis = new FailingReleaseRedis();
     const current = deps({ redis });
     await expect(punish(current, input)).resolves.toMatchObject({ action: 'warn' });
+  });
+
+  it('requires an exact numeric DEL reply when releasing the lock', async () => {
+    for (const reply of [[0], ['OK'], [1, 1]] as const) {
+      const redis = new FakeRedis();
+      const lock = await acquireUserActionLock(redis, 'Target', 'Mod', () => NOW);
+      redis.execReplyOverride = [...reply];
+      redis.execReplyOverrideConfigured = true;
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        await releaseUserActionLock(redis, lock, 'test');
+        expect(error.mock.calls.flat().join('\n')).toContain('lock release reply was not exact');
+        expect(redis.values.get(lock.key)).toBe(lock.token);
+      } finally {
+        error.mockRestore();
+      }
+    }
   });
 
   it('releases the lock when execution fails', async () => {

@@ -67,7 +67,7 @@ export interface HistoryStore {
    * Read a summary without converting Redis failures into an empty history.
    * Callers that make exact or destructive decisions must use this method.
    */
-  summaryStrict(username: string): Promise<StrictHistorySummary>;
+  summaryStrict(username: string, now?: number): Promise<StrictHistorySummary>;
   /** All retained records, oldest first. Corrupt members are dropped silently. */
   load(username: string): Promise<ModActionRecord[]>;
   /** Read every member strictly; corruption or Redis failure returns ok:false. */
@@ -267,7 +267,7 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
     return { total, latestAt };
   }
 
-  return {
+  const store: HistoryStore = {
     async append(username, record) {
       // Mint the id here so the persisted member and the returned record are
       // the same source of truth for compensation identity.
@@ -302,12 +302,28 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
       }
     },
 
-    async summaryStrict(username) {
+    async summaryStrict(username, now = Date.now()) {
       const key = historyKey(username);
       try {
-        // Exact tooling uses the stored score so a deterministic injected
-        // clock can verify the requested age without a host-clock clamp.
-        return { ok: true, summary: await readSummary(username, false) };
+        const summary = await readSummary(username, false);
+        // A future score is corrupt/ambiguous input for ladder selection.
+        // Clamp it to the decision time, not to a moving wall clock. A moving
+        // clamp would keep reclamping the same corrupt member into the future
+        // and could freeze decay indefinitely across later actions.
+        if (summary.latestAt !== undefined && !Number.isFinite(summary.latestAt)) {
+          console.error(`[history] strict summary ${key} found a non-finite score`);
+          return { ok: false };
+        }
+        return {
+          ok: true,
+          summary: {
+            ...summary,
+            latestAt:
+              summary.latestAt === undefined
+                ? undefined
+                : Math.min(summary.latestAt, now),
+          },
+        };
       } catch (error) {
         console.error(`[history] strict summary ${key} failed: ${failureDetail(error)}`);
         return { ok: false };
@@ -370,8 +386,8 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
           try {
             const parsed: unknown = JSON.parse(row.member);
             if (isModActionRecord(parsed) && parsed.id === id) {
-              await redis.zRem(key, [row.member]);
-              return true;
+              const removed = await redis.zRem(key, [row.member]);
+              return removed === 1;
             }
           } catch {
             // Unparseable members can never match an id; skip them.
@@ -488,10 +504,13 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
 
     async clear(username) {
       try {
-        // DEL of a missing key resolves normally and deletes nothing; both
-        // paths leave the user with no history, so both report success.
+        // DEL is exposed by the SDK as a void/unknown result. A fulfilled
+        // command is not proof that the key disappeared, so verify the exact
+        // empty post-state before reporting success. The caller holds the
+        // per-user lock around this operation.
         await redis.del(historyKey(username));
-        return true;
+        const verified = await store.loadStrict(username);
+        return verified.ok && verified.rows.length === 0;
       } catch (error) {
         // Degradation: the seed caller treats false as "history may still
         // exist", but the failure must show up in the logs.
@@ -500,4 +519,5 @@ export function createHistoryStore(redis: RedisLike): HistoryStore {
       }
     },
   };
+  return store;
 }

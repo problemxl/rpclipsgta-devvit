@@ -19,6 +19,7 @@ class FakeZSetRedis implements RedisLike {
   fail = false;
   /** When set, ZADD resolves with this value without mutating (simulates a rejected write). */
   zAddResult: number | undefined;
+  deleteNoOp = false;
 
   private zset(key: string): Map<string, number> {
     let zset = this.sets.get(key);
@@ -90,7 +91,7 @@ class FakeZSetRedis implements RedisLike {
     this.calls.push('del');
     if (this.fail) throw new Error('redis down');
     const removed = this.zset(key).size;
-    this.sets.delete(key);
+    if (!this.deleteNoOp) this.sets.delete(key);
     return removed;
   }
 }
@@ -351,6 +352,24 @@ describe('history store', () => {
     }
   });
 
+  it('clamps a future-dated score in strict summary for destructive rung selection', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    const future = 1_000_000 + 365 * 24 * 60 * 60 * 1000;
+    const later = future + 90 * 24 * 60 * 60 * 1000 + 1;
+    redis.seed(historyKey('user'), 'future-member', future);
+
+    await expect(history.summaryStrict('user', 1_000_000)).resolves.toEqual({
+      ok: true,
+      summary: { total: 1, latestAt: 1_000_000 },
+    });
+    await expect(history.summaryStrict('user', later)).resolves.toEqual({
+      ok: true,
+      summary: { total: 1, latestAt: future },
+    });
+    expect(effectivePriors(1, future, later)).toBe(0);
+  });
+
   it('offers a strict summary that fails closed instead of treating Redis failure as empty', async () => {
     const redis = new FakeZSetRedis();
     const history = createHistoryStore(redis);
@@ -398,7 +417,7 @@ describe('history store', () => {
     await history.append('user', record(2));
 
     await expect(history.clear('user')).resolves.toBe(true);
-    expect(redis.calls).toEqual(['zAdd', 'zAdd', 'del']); // exactly one DEL
+    expect(redis.calls).toEqual(['zAdd', 'zAdd', 'del', 'zRange']); // DEL plus strict post-state verification
     expect(await history.load('user')).toEqual([]);
     expect(await history.summary('user')).toEqual({ total: 0, latestAt: undefined });
   });
@@ -408,7 +427,17 @@ describe('history store', () => {
     const history = createHistoryStore(redis);
 
     await expect(history.clear('missing')).resolves.toBe(true);
-    expect(redis.calls).toEqual(['del']);
+    expect(redis.calls).toEqual(['del', 'zRange']);
+  });
+
+  it('does not report clear success when DEL resolves but leaves the key intact', async () => {
+    const redis = new FakeZSetRedis();
+    const history = createHistoryStore(redis);
+    await history.append('user', record(1));
+    redis.deleteNoOp = true;
+
+    await expect(history.clear('user')).resolves.toBe(false);
+    expect(await history.load('user')).toHaveLength(1);
   });
 
   it('reports failure and logs when redis fails during clear', async () => {

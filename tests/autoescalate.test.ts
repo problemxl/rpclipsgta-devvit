@@ -254,6 +254,17 @@ describe('runModRemoval', () => {
     expect(current.removed).toEqual(['t3_abc123']);
   });
 
+  it('fails closed for a malformed SET NX reply before removing', async () => {
+    const redis = new FakeRedis();
+    vi.spyOn(redis, 'set').mockResolvedValue('YES' as never);
+    const current = state({}, redis);
+
+    await expect(runModRemoval(input({ title: '😂 !!!' }), current.deps)).resolves.toEqual({
+      status: 'already-processed',
+    });
+    expect(current.removed).toEqual([]);
+  });
+
   it('releases the seen claim when removal fails and does not escalate', async () => {
     const current = state({
       removePost: async () => {

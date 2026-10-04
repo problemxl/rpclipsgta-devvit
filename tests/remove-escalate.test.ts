@@ -224,6 +224,18 @@ describe('runRemoveAndEscalate', () => {
     expect(current.redis.values.get('removeescalate:seen:t1_xyz789')).toBe('1');
   });
 
+  it('fails closed for a malformed SET NX reply before removing', async () => {
+    const redis = new FakeRedis();
+    vi.spyOn(redis, 'set').mockResolvedValue('YES' as never);
+    const current = state({}, redis);
+
+    await expect(runRemoveAndEscalate(input(), current.deps)).resolves.toEqual({
+      status: 'already-processed',
+    });
+    expect(current.removed).toEqual([]);
+    expect(current.punished).toEqual([]);
+  });
+
   it('keeps the seen claim when punish fails and the thing stays removed', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     try {
