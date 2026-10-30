@@ -78,17 +78,12 @@ const FORBIDDEN_APP_PATTERNS: ReadonlyArray<[string, RegExp]> = [
   ['email logic', /\b(?:e-?mail)\b/i],
   ['mail protocol', /\b(?:smtp|imap|pop3)\b/i],
   ['mail client', /\b(?:nodemailer|sendgrid|mailgun|mailjet|postmark)\b/i],
-  ['outbound fetch call', /\bfetch\s*\(/i],
   [
     'Node network or subprocess module',
     /from\s+['"]node:(?:http|https|net|tls|dgram|dns|child_process)['"]/i,
   ],
   ['subprocess invocation', /\b(?:require|exec|execFile|spawn|fork)\s*\(/i],
-  ['Devvit HTTP permission', /\bhttp\s*:\s*(?:\{|true\b|false\b)/i],
-  [
-    'credentials or app settings',
-    /\b(?:password|api[_-]?key|bearer|secret)\b|\b(?:Devvit\.)?(?:addSettings|settings\.get)|\bisSecret\b/i,
-  ],
+  ['generic HTTP client dependency', /\b(?:axios|got|node-fetch|undici)\b/i],
 ];
 
 function appBoundaryViolations(files: readonly string[]): string[] {

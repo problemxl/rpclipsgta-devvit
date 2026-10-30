@@ -14,12 +14,18 @@ A self-contained moderator-actions Devvit app for r/RPClipsGTA. It provides:
   the development or QA subreddit.
 - **Seed test history**: dev/QA-only moderator tool to place a user at any
   ladder position (or reset them) for testing escalation and decay.
+- **Top GTA RP streamers sidebar**: every ten minutes, the app fetches the
+  top ten live GTA RP streams from Twitch and refreshes a Markdown textarea
+  widget in the subreddit sidebar. A moderator can also use **Refresh top
+  streamers now** for an immediate update.
 
 There is no external escalation endpoint, Python runtime bundled into the app,
-PocketBase dependency, network allowlist, or app secret. The Devvit entry point
-and its dependency graph never import or invoke anything under `scripts/`, never
-use `fetch` or a mail client, and never connect to Guerrilla Mail or any other
-mail server. All app execution happens through Devvit's Reddit and Redis APIs.
+or PocketBase dependency. The Devvit entry point and its dependency graph never
+import or invoke anything under `scripts/`, never use a mail client, and never
+connect to Guerrilla Mail or any other mail server. The only outbound app
+requests are the allowlisted Twitch Helix requests used by the sidebar widget;
+all other app execution happens through Devvit's Reddit, Redis, scheduler, and
+settings APIs.
 
 The local, manually invoked `scripts/gen-test-accounts.py` helper is a standalone
 Python tool outside Devvit. It is not bundled with or imported by the app, and it
@@ -29,6 +35,30 @@ Account signup remains manual: it never calls Reddit signup APIs, uses a Reddit
 browser/API, bypasses CAPTCHA, or opens verification links automatically. See
 `docs/test-account-helper.md` for its security, session, storage, and testing
 details.
+
+## Top GTA RP streamers sidebar
+
+The app uses Twitch Helix's **Grand Theft Auto V** category (`game_id 32982`)
+so the sidebar shows the most-viewed live GTA RP streams. The refresh runs every
+10 minutes and retains the existing widget text if Twitch or Reddit fails. The
+widget is a textarea widget rather than the subreddit description so the list
+has room for all ten entries. New widgets appear in the sidebar; a moderator
+must use **Edit Widgets** once to move the widget to the preferred position.
+
+Set the two app-scope Twitch credentials from the app directory (the client
+secret is stored as a secret):
+
+```bash
+devvit settings set twitch-client-id
+devvit settings set twitch-client-secret
+```
+
+The optional installation settings are available in the app installation page:
+the textarea widget short name (default `Top GTA RP Live Streams`) and an
+optional Twitch language filter (`en`, for example; blank means all languages).
+The Twitch credentials are app-scope settings, so one CLI configuration serves
+the app's installations. Run `devvit settings set --help` for the exact CLI
+options for the installed Devvit version.
 
 ## In-app escalation engine
 
@@ -311,24 +341,29 @@ resolve an ambiguous Reddit outcome or force-unlock in production.
 ## Publish checklist
 
 1. Run `npm run build && npm test` — both must be green.
-2. Run `python -m unittest discover -s tests -p 'test_*.py'` — local helper tests
+2. Set `twitch-client-id` and `twitch-client-secret` with `devvit settings set`,
+   install the app, and use **Edit Widgets** once to position the new textarea
+   widget in the sidebar.
+3. Run `python -m unittest discover -s tests -p 'test_*.py'` — local helper tests
    are deterministic and do not call Guerrilla Mail.
-3. `devvit login`.
-4. `devvit upload` (or `devvit publish`). No secrets or external URL settings
-   are required.
-5. Install the app to the source and test subreddits via the app installation
+4. `devvit login`.
+5. `devvit upload` (or `devvit publish`). The Twitch credentials remain in
+   app settings and are never committed to the repository.
+6. Install the app to the source and test subreddits via the app installation
    page (`https://developers.reddit.com/r/<subreddit>/apps`). Fixture creation
    is intended only for source posts in `r/rpclipsgta`; the handler rejects
    other source subreddits.
-6. Smoke-test escalation with a test account. Confirm a fresh account gets the
+7. Smoke-test the sidebar refresh and confirm the widget is positioned as
+   intended, then smoke-test escalation with a test account. Confirm a fresh
+   account gets the
    warning toast (`Warned u/... (R1 — Reddit Rules)`), the warning reply, and a
    Redis history record. Exercise repeat and decay rungs before production use
    — in the dev/QA subreddits the **Seed test history** tool (see *Testing the
    ladder*) places any user on any rung in seconds.
-7. Smoke-test fixtures from a source post containing a real-looking Twitch or
+8. Smoke-test fixtures from a source post containing a real-looking Twitch or
    Kick clip URL. Choose each target once, verify the exact URL and title prefix,
    then repeat the action to confirm no second post is created.
-8. In dev/QA, induce an ambiguous Reddit result and run the reconciliation drill:
+9. In dev/QA, induce an ambiguous Reddit result and run the reconciliation drill:
    inspect the moderator log, verify retry is blocked while pending, reconcile
    only a definite result by exact row id, verify the row post-state, and
    confirm retry is possible only after successful reconciliation. Any failure

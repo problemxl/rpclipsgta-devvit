@@ -16,7 +16,7 @@
  * the warning comment or ban directly.
  */
 
-import { Devvit } from '@devvit/public-api';
+import { Devvit, SettingScope } from '@devvit/public-api';
 
 import {
   applyManualRuleRemovalSafely,
@@ -70,10 +70,237 @@ import {
   type PunishResult,
 } from './actions/punish.js';
 import type { EscalateFn, EscalatePayload, EscalateResult } from './actions/autoescalate.js';
+import {
+  DEFAULT_WIDGET_SHORT_NAME,
+  TWITCH_CLIENT_ID_SETTING,
+  TWITCH_CLIENT_SECRET_SETTING,
+  TWITCH_LANGUAGE_SETTING,
+  WIDGET_SHORT_NAME_SETTING,
+  runSidebarRefresh,
+} from './actions/sidebar-refresh.js';
+import type { TwitchToken } from './lib/twitch.js';
 
 Devvit.configure({
   redditAPI: true,
   redis: true,
+  http: true,
+});
+
+const SIDEBAR_REFRESH_JOB = 'refresh-sidebar';
+const SIDEBAR_REFRESH_CRON = '*/10 * * * *';
+const TWITCH_TOKEN_CACHE_KEY = 'sidebar-refresh:twitch-oauth-token';
+
+Devvit.addSettings([
+  {
+    type: 'string',
+    name: TWITCH_CLIENT_ID_SETTING,
+    label: 'Twitch client ID',
+    helpText: 'App-level Twitch Helix client ID. Set with the Devvit CLI.',
+    scope: SettingScope.App,
+  },
+  {
+    type: 'string',
+    name: TWITCH_CLIENT_SECRET_SETTING,
+    label: 'Twitch client secret',
+    helpText: 'App-level Twitch Helix client secret. Set with the Devvit CLI.',
+    scope: SettingScope.App,
+    isSecret: true,
+  },
+  {
+    type: 'group',
+    label: 'Top streamers sidebar',
+    helpText: 'Settings for the installation subreddit sidebar widget.',
+    fields: [
+      {
+        type: 'string',
+        name: WIDGET_SHORT_NAME_SETTING,
+        label: 'Sidebar widget short name',
+        helpText: `Defaults to "${DEFAULT_WIDGET_SHORT_NAME}".`,
+        scope: SettingScope.Installation,
+        defaultValue: DEFAULT_WIDGET_SHORT_NAME,
+      },
+      {
+        type: 'string',
+        name: TWITCH_LANGUAGE_SETTING,
+        label: 'Twitch language filter (optional)',
+        helpText: 'Use a language code such as en, or leave blank for all languages.',
+        scope: SettingScope.Installation,
+        defaultValue: '',
+      },
+    ],
+  },
+]);
+
+Devvit.addSchedulerJob({
+  name: SIDEBAR_REFRESH_JOB,
+  onRun: async (_event, context) => {
+    try {
+      const subredditName = await resolveSubredditName(context);
+      const outcome = await runSidebarRefresh(
+        createSidebarRefreshDeps(context),
+        { subredditName }
+      );
+      if (outcome.status === 'config-missing') {
+        console.error(
+          `[sidebar-refresh] missing Twitch settings: ${outcome.missing.join(', ')}`
+        );
+        return;
+      }
+      console.log(
+        `[sidebar-refresh] ${outcome.status} ${outcome.widgetShortName} (${outcome.streamCount} streams)`
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[sidebar-refresh] scheduled refresh failed: ${detail}`);
+    }
+  },
+});
+
+Devvit.addTrigger({
+  event: 'AppInstall',
+  onEvent: async (_event, context) => {
+    try {
+      await scheduleSidebarRefresh(context.scheduler, false);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[sidebar-refresh] install scheduling failed: ${detail}`);
+    }
+  },
+});
+
+Devvit.addTrigger({
+  event: 'AppUpgrade',
+  onEvent: async (_event, context) => {
+    try {
+      await scheduleSidebarRefresh(context.scheduler, true);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[sidebar-refresh] upgrade scheduling failed: ${detail}`);
+    }
+  },
+});
+
+async function scheduleSidebarRefresh(
+  scheduler: Devvit.Context['scheduler'],
+  replace: boolean
+): Promise<void> {
+  const existing = (await scheduler.listJobs()).filter(
+    (job) => job.name === SIDEBAR_REFRESH_JOB
+  );
+  if (replace) {
+    await Promise.all(existing.map((job) => scheduler.cancelJob(job.id)));
+  } else if (existing.length > 0) {
+    console.log(`[sidebar-refresh] cron already scheduled (${existing[0].id})`);
+    return;
+  }
+  const id = await scheduler.runJob({
+    name: SIDEBAR_REFRESH_JOB,
+    cron: SIDEBAR_REFRESH_CRON,
+  });
+  console.log(`[sidebar-refresh] scheduled cron job ${id}`);
+}
+
+async function resolveSubredditName(
+  context: Pick<Devvit.Context, 'subredditId' | 'subredditName' | 'reddit'>
+): Promise<string> {
+  const configured = context.subredditName?.trim();
+  if (configured) return configured;
+  const subreddit = await context.reddit.getSubredditById(
+    context.subredditId as `t5_${string}`
+  );
+  const name = subreddit?.name?.trim();
+  if (!name) throw new Error(`could not resolve subreddit ${context.subredditId}`);
+  return name;
+}
+
+function fetchAllowedTwitchUrl(
+  input: string,
+  init?: { method?: string; headers?: Record<string, string>; signal?: AbortSignal }
+): Promise<Response> {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new Error('blocked invalid Twitch fetch URL');
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.port !== '' ||
+    (url.hostname !== 'id.twitch.tv' && url.hostname !== 'api.twitch.tv')
+  ) {
+    throw new Error(`blocked Twitch fetch URL: ${url.origin}`);
+  }
+  return globalThis.fetch(input, init);
+}
+
+function createSidebarRefreshDeps(
+  context: Pick<Devvit.Context, 'settings' | 'redis' | 'reddit'>
+) {
+  return {
+    settings: context.settings,
+    fetch: fetchAllowedTwitchUrl,
+    getToken: () => context.redis.get(TWITCH_TOKEN_CACHE_KEY),
+    setToken: async (token: TwitchToken) => {
+      await context.redis.set(TWITCH_TOKEN_CACHE_KEY, token.access_token, {
+        expiration: new Date(Date.now() + (token.expires_in - 300) * 1000),
+      });
+    },
+    clearToken: () => context.redis.del(TWITCH_TOKEN_CACHE_KEY),
+    getWidgets: (subredditName: string) => context.reddit.getWidgets(subredditName),
+    addWidget: (widget: {
+      type: 'textarea';
+      subreddit: string;
+      shortName: string;
+      text: string;
+    }) => context.reddit.addWidget(widget),
+    updateWidget: (widget: {
+      type: 'textarea';
+      subreddit: string;
+      id: string;
+      shortName: string;
+      text: string;
+    }) => context.reddit.updateWidget(widget),
+  };
+}
+
+Devvit.addMenuItem({
+  label: 'Refresh top streamers now',
+  description: 'Update the Twitch GTA RP sidebar widget immediately',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    const subredditName = context.subredditName?.trim();
+    const actor = context.username?.trim();
+    if (!subredditName || !actor) {
+      safeToast(context, 'Could not determine the subreddit or acting moderator. Action aborted.');
+      return;
+    }
+    try {
+      const authorized = await runAuthorizedModeratorAction(
+        context.reddit,
+        subredditName,
+        actor,
+        () => runSidebarRefresh(createSidebarRefreshDeps(context), { subredditName })
+      );
+      if (!authorized.authorized) {
+        safeToast(context, 'Moderator access could not be verified. Action aborted.');
+        return;
+      }
+      const outcome = authorized.result;
+      if (outcome.status === 'config-missing') {
+        safeToast(context, 'Twitch credentials are not configured. Check app settings.');
+        console.error(
+          `[sidebar-refresh] manual refresh missing settings: ${outcome.missing.join(', ')}`
+        );
+        return;
+      }
+      safeToast(context, `Top streamers sidebar ${outcome.status}.`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[sidebar-refresh] manual refresh failed: ${detail}`);
+      safeToast(context, 'Top streamers refresh failed. Check the app logs for details.');
+    }
+  },
 });
 
 const escalateForm = Devvit.createForm(

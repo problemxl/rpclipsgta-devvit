@@ -1,13 +1,12 @@
 # API Notes — @devvit/public-api 0.14.2
 
-> **Historical reference only.** This file contains examples from the retired
-> PocketBase-backed implementation, including generic Devvit HTTP/fetch
-> permissions and settings for that old service. The current app does **not**
-> configure `http`, call `fetch`, use PocketBase, or declare email/password
-> settings. Do not apply those retired examples to the current app. The only
-> network/email helper in this repository is the explicitly local
-> `scripts/gen-test-accounts.py` CLI, which is outside the Devvit bundle and is
-> not imported by the app.
+> **Historical reference only.** Most examples in this file come from the
+> retired PocketBase-backed implementation and must not be applied to the
+> current app. The current app does not use PocketBase or email/password
+> settings. Its only external requests are the allowlisted Twitch Helix calls
+> documented in the dated sidebar-refresh section at the end. The explicitly
+> local `scripts/gen-test-accounts.py` CLI remains outside the Devvit bundle and
+> is not imported by the app.
 
 All signatures below are quoted/verified from the installed typings under
 `node_modules/@devvit/public-api` (and its `@devvit/*` dependencies). Import
@@ -543,3 +542,60 @@ Only `name` is required (`node_modules/@devvit/shared-types/schemas/config-file.
 `"required": ["name"]`). Permissions shown in `AppPermissionConfigJson` are written back into
 the manifest by the CLI from `Devvit.configure()` at upload time, so the local file can stay
 minimal. See `devvit.yaml` in the repo root.
+
+---
+
+## 2026-10-30 — Twitch sidebar refresh on @devvit/public-api 0.14.6
+
+The installed 0.14.6 APIs support the following implementation used by the
+sidebar widget:
+
+- **Scheduling:** 0.14.6 has no `Devvit.addCronJob`. Register a job type with
+  `Devvit.addSchedulerJob<T>({ name, onRun })`, then schedule it at runtime with
+  `context.scheduler.runJob({ name, cron: '*/10 * * * *' })`. The returned value
+  is a job id. `scheduler.listJobs()` returns scheduled jobs with `name` and
+  `id`; cron jobs also expose `cron`; `scheduler.cancelJob(id)` cancels one.
+  Classic `devvit.yaml` cannot declare scheduler configuration, so the app
+  schedules from `AppInstall` and handles `AppUpgrade` by cancelling stale jobs
+  with the same name before scheduling a replacement.
+
+- **Triggers and job context:** `Devvit.addTrigger({ event: 'AppInstall' |
+  'AppUpgrade', onEvent })` receives a trigger context without UI, dimensions,
+  mod log, or UI environment. `JobContext` has the same shape and includes
+  `subredditId`, optional `subredditName`, Reddit, Redis, scheduler, and
+  settings. When `subredditName` is absent, resolve it through
+  `reddit.getSubredditById(context.subredditId)`.
+
+- **HTTP/fetch:** `Devvit.configure({ http: true })` enables global `fetch`.
+  This app only permits `https://id.twitch.tv` and
+  `https://api.twitch.tv`. Twitch token requests use
+  `POST /oauth2/token` with `client_id`, `client_secret`, and
+  `grant_type=client_credentials`; streams use
+  `GET /helix/streams?game_id=32982&first=10` and optional `language`, with
+  `Client-Id` and `Authorization: Bearer ...` headers. Both calls use a
+  10-second `AbortSignal.timeout`. Non-2xx responses and Twitch error JSON are
+  surfaced. A 401 streams response clears the cached token and retries once.
+
+- **Settings:** both Twitch credentials use `SettingScope.App`; the client
+  secret uses `isSecret: true`. The values are set with
+  `devvit settings set <name>`; `devvit settings set --help` documents the
+  installed CLI flags. Installation settings can use the default installation
+  scope. Runtime reads use `context.settings.get<T>(name)`.
+
+- **Redis token cache:** cache the OAuth access token under a fixed key with
+  `redis.set(key, token, { expiration: new Date(Date.now() + (expires_in -
+  300) * 1000) })`; use `redis.get` and `redis.del` for reads and 401
+  invalidation.
+
+- **Widgets:** `reddit.getWidgets(subredditName)` returns base `Widget` objects
+  exposing `id`, `name` (the short name), and `subredditName`. `TextAreaWidget`
+  adds `text` and `styles`; `CustomWidget` also has `text`, plus `css`. App code
+  should not use `instanceof TextAreaWidget` because the public API re-exports
+  those classes type-only. The safe duck type is
+  `typeof widget.text === 'string' && widget.css === undefined`. Update with
+  `reddit.updateWidget({ type: 'textarea', subreddit, id, shortName, text })`,
+  or create with `reddit.addWidget({ type: 'textarea', subreddit, shortName,
+  text })`. The sidebar textarea has room for roughly 10,000 characters and
+  renders Markdown; the subreddit description's 500-character cap is not an
+  alternative for this list. A newly created widget needs one-time moderator
+  positioning in **Edit Widgets**.
