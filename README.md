@@ -41,9 +41,35 @@ details.
 The app uses Twitch Helix's **Grand Theft Auto V** category (`game_id 32982`)
 so the sidebar shows the most-viewed live GTA RP streams. The refresh runs every
 10 minutes and retains the existing widget text if Twitch or Reddit fails. The
-widget is a textarea widget rather than the subreddit description so the list
-has room for all ten entries. New widgets appear in the sidebar; a moderator
+widget is a textarea widget rather than the subreddit description so the two-
+column table (streamer link + viewer count) fits all ten entries. New widgets appear in the sidebar; a moderator
 must use **Edit Widgets** once to move the widget to the preferred position.
+
+### Old Reddit
+
+Old Reddit does not render sidebar widgets; its sidebar is the subreddit
+description. The app additionally maintains a marker-delimited block inside
+the description and replaces only the text between the markers, preserving all
+other moderator-written content byte-for-byte. To enable it once per
+subreddit, add these two invisible anchor lines anywhere in the description
+(**Community Settings → description**, or `old.reddit.com/r/<sub>/about/edit`):
+
+    [](#top-streamers-start)
+    [](#top-streamers-end)
+
+Until both markers exist the app never writes the description (the logs report
+`old-Reddit description markers not found`). Removing the markers stops
+description updates without affecting the widget.
+
+The description block is **not** the widget's Markdown table. Reddit derives
+the mobile/About `public_description` from the description's raw markdown
+and hard-rejects the whole write when that derivation exceeds 500 characters
+(`TOO_LONG: public_description`) — a full `[Name](url)` table is ~600+ chars
+and there is no API field to set the derived text explicitly. The description
+therefore renders as a compact numbered list of bare autolinked URLs —
+`1. https://twitch.tv/name — 12,345` — bounded to 470 characters so the write
+can never trip the cap; with unusually long Twitch logins the tail rows trim
+while the widget still shows all ten. Bare URLs autolink on old Reddit.
 
 Set the two app-scope Twitch credentials from the app directory (the client
 secret is stored as a secret):

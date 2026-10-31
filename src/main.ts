@@ -152,6 +152,14 @@ Devvit.addSchedulerJob({
       console.log(
         `[sidebar-refresh] ${outcome.status} ${outcome.widgetShortName} (${outcome.streamCount} streams)`
       );
+      if (outcome.description === 'missing-markers') {
+        console.log(
+          '[sidebar-refresh] old-Reddit description markers not found — add ' +
+            '[](#top-streamers-start) and [](#top-streamers-end) to the description to enable'
+        );
+      } else if (outcome.description) {
+        console.log(`[sidebar-refresh] old-Reddit description ${outcome.description}`);
+      }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error(`[sidebar-refresh] scheduled refresh failed: ${detail}`);
@@ -263,6 +271,17 @@ function createSidebarRefreshDeps(
       shortName: string;
       text: string;
     }) => context.reddit.updateWidget(widget),
+    // Old-Reddit sidebar: replace only the marker-delimited block in the
+    // subreddit description. refreshDescriptionBlock is a no-op unless a
+    // moderator has added both markers once via Community Settings.
+    description: {
+      getDescription: async (subredditName: string) =>
+        (await context.reddit.getSubredditInfoByName(subredditName)).description?.markdown,
+      setDescription: async (subredditName: string, description: string) => {
+        const subreddit = await context.reddit.getSubredditByName(subredditName);
+        await subreddit.updateSettings({ description });
+      },
+    },
   };
 }
 

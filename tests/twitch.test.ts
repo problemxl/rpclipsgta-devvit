@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   fetchTopStreams,
+  renderSidebarDescriptionBlock,
   renderSidebarMarkdown,
   type TwitchFetch,
   type TwitchResponse,
@@ -148,7 +149,7 @@ describe('fetchTopStreams', () => {
 });
 
 describe('renderSidebarMarkdown', () => {
-  it('renders ranks, login-based links, sanitized capped titles, viewer counts, and a UTC footer', () => {
+  it('renders a two-column table with login-based links, sanitized names, viewer counts, and a UTC footer', () => {
     const text = renderSidebarMarkdown(
       [
         {
@@ -166,22 +167,81 @@ describe('renderSidebarMarkdown', () => {
     );
 
     expect(text).toContain('## Top 10 GTA RP streamers on Twitch');
-    expect(text).toContain('1. [RP Streamer](https://twitch.tv/rp_streamer)');
-    expect(text).toContain('2. [Second Name](https://twitch.tv/second_login)');
-    expect(text).toContain('12,345 viewers');
-    expect(text).toContain('7 viewers');
+    expect(text).toContain('| Streamer | Viewers |');
+    expect(text).toContain('| --- | ---: |');
+    expect(text).toContain('| [RP Streamer](https://twitch.tv/rp_streamer) | 12,345 |');
+    expect(text).toContain('| [Second Name](https://twitch.tv/second_login) | 7 |');
     expect(text).not.toContain('[bad]');
     expect(text).not.toContain('*title*');
     expect(text).toContain('updated 03:04 UTC');
-    const titleLine = text.split('\n').find((line: string) => line.startsWith('1. ')) ?? '';
-    expect(titleLine.length).toBeLessThan(180);
-    const renderedTitle = titleLine.split(' — ').slice(2).join(' — ');
-    expect(renderedTitle).not.toMatch(/[\[\]*_~]/);
+    // Table rows stay short: no titles, no viewer suffixes.
+    const rowLines = text.split('\n').filter((line: string) => line.startsWith('| ['));
+    expect(rowLines).toHaveLength(2);
+    for (const row of rowLines) {
+      expect(row.length).toBeLessThan(120);
+      // Display names are sanitized, so a row contains exactly the two
+      // link brackets of the streamer column and no other markdown
+      // (pipes are the table's own column separators).
+      expect(row.match(/\[/g)?.length ?? 0).toBe(1);
+      expect(row).not.toMatch(/[~`#>]/);
+    }
   });
 
   it('renders a useful empty-list message and footer', () => {
     const text = renderSidebarMarkdown([], { generatedAt: new Date('2024-01-02T03:04:00Z') });
     expect(text).toContain('No GTA RP streams are live right now.');
     expect(text).toContain('updated 03:04 UTC');
+  });
+});
+
+describe('renderSidebarDescriptionBlock', () => {
+  it('renders numbered bare-link rows with viewer counts under the public_description cap', () => {
+    const ten = Array.from({ length: 10 }, (_, i) => ({
+      user_login: `streamer_${i}`,
+      user_name: `Streamer ${i}`,
+      title: 'irrelevant',
+      viewer_count: 1000 + i,
+    }));
+    const block = renderSidebarDescriptionBlock(ten, {
+      generatedAt: new Date('2024-01-02T03:04:00Z'),
+    });
+    expect(block).toContain('**Top 10 GTA RP streamers on Twitch**');
+    expect(block).toContain('1. https://twitch.tv/streamer_0 — 1,000');
+    expect(block).toContain('10. https://twitch.tv/streamer_9 — 1,009');
+    expect(block).toContain('updated 03:04 UTC');
+    // No Markdown table and no [Name](url) pairs: the derived
+    // public_description counts link targets, so bare links only.
+    expect(block).not.toContain('|');
+    expect(block).not.toMatch(/\]\(/);
+    // The whole block must stay under Reddit's hard 500-char cap on the
+    // derived public_description.
+    expect(block.length).toBeLessThan(500);
+  });
+
+  it('trims tail rows but always keeps the top streamer with worst-case logins', () => {
+    const worst = Array.from({ length: 10 }, (_, i) => ({
+      user_login: `averylongstreamerlogin${i}`,
+      user_name: `Streamer ${i}`,
+      title: 'irrelevant',
+      viewer_count: 1234567,
+    }));
+    const block = renderSidebarDescriptionBlock(worst, {
+      generatedAt: new Date('2024-01-02T03:04:00Z'),
+    });
+    expect(block).toContain('1. https://twitch.tv/averylongstreamerlogin0 — 1,234,567');
+    expect(block).toContain('updated 03:04 UTC');
+    expect(block.length).toBeLessThan(500);
+    const rowCount = block.split('\n').filter((l: string) => /^\d+\. https:/.test(l)).length;
+    expect(rowCount).toBeGreaterThanOrEqual(1);
+    expect(rowCount).toBeLessThan(10);
+  });
+
+  it('renders the empty-list message and footer for zero streams', () => {
+    const block = renderSidebarDescriptionBlock([], {
+      generatedAt: new Date('2024-01-02T03:04:00Z'),
+    });
+    expect(block).toContain('No GTA RP streams are live right now.');
+    expect(block).toContain('updated 03:04 UTC');
+    expect(block.length).toBeLessThan(500);
   });
 });

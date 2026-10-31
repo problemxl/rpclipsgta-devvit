@@ -2,6 +2,7 @@
 
 import {
   fetchTopStreams,
+  renderSidebarDescriptionBlock,
   renderSidebarMarkdown,
   type TwitchDeps,
   type TwitchFetch,
@@ -12,6 +13,11 @@ import {
   type SidebarWidgetLike,
   type SidebarWidgetUpdate,
 } from './sidebar.js';
+import {
+  refreshDescriptionBlock,
+  type DescriptionDeps,
+  type DescriptionRefreshStatus,
+} from './description.js';
 
 export const TWITCH_GAME_ID = '32982';
 export const TOP_STREAM_LIMIT = 10;
@@ -36,6 +42,8 @@ export interface SidebarRefreshDeps {
   readonly getWidgets: (subredditName: string) => Promise<readonly SidebarWidgetLike[]>;
   readonly addWidget: (widget: SidebarWidgetAdd) => Promise<unknown>;
   readonly updateWidget: (widget: SidebarWidgetUpdate) => Promise<unknown>;
+  /** Old-Reddit sidebar seam. When omitted, the description is never touched. */
+  readonly description?: DescriptionDeps;
   readonly now?: () => Date;
 }
 
@@ -48,6 +56,8 @@ export interface SidebarRefreshSuccessOutcome {
   readonly status: 'updated' | 'created';
   readonly widgetShortName: string;
   readonly streamCount: number;
+  /** Old-Reddit description block outcome; undefined when the seam is absent. */
+  readonly description?: DescriptionRefreshStatus;
 }
 
 export type SidebarRefreshOutcome =
@@ -102,9 +112,14 @@ export async function runSidebarRefresh(
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Twitch refresh failed for r/${input.subredditName}: ${detail}`);
   }
-  const text = renderSidebarMarkdown(streams, {
-    generatedAt: deps.now?.() ?? new Date(),
-  });
+  const generatedAt = deps.now?.() ?? new Date();
+  const text = renderSidebarMarkdown(streams, { generatedAt });
+  // Old-Reddit description block: compact bare-link rows, not the table.
+  // Reddit derives the hard-500-capped public_description from the first part
+  // of the description including link targets, so a Markdown-table block
+  // (~600+ chars with [Name](url) pairs) is rejected wholesale with
+  // TOO_LONG: public_description.
+  const descriptionBlock = renderSidebarDescriptionBlock(streams, { generatedAt });
   let widget;
   try {
     widget = await refreshSidebarWidget(
@@ -119,9 +134,22 @@ export async function runSidebarRefresh(
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Sidebar widget refresh failed for r/${input.subredditName}: ${detail}`);
   }
+  let description: DescriptionRefreshStatus | undefined;
+  if (deps.description) {
+    try {
+      description = await refreshDescriptionBlock(deps.description, {
+        subredditName: input.subredditName,
+        block: descriptionBlock,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Sidebar description refresh failed for r/${input.subredditName}: ${detail}`);
+    }
+  }
   return {
     status: widget.status,
     widgetShortName,
     streamCount: streams.length,
+    ...(description !== undefined ? { description } : {}),
   };
 }
