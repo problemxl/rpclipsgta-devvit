@@ -83,7 +83,10 @@ import type { TwitchToken } from './lib/twitch.js';
 Devvit.configure({
   redditAPI: true,
   redis: true,
-  http: true,
+  // Explicit fetch-domain allowlist: the 0.14.6 runtime denies all outbound
+  // HTTP unless the destination domain is declared here (http: true alone is
+  // not sufficient). Only the Twitch Helix endpoints this app uses are listed.
+  http: { domains: ['id.twitch.tv', 'api.twitch.tv'] },
 });
 
 const SIDEBAR_REFRESH_JOB = 'refresh-sidebar';

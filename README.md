@@ -60,6 +60,20 @@ The Twitch credentials are app-scope settings, so one CLI configuration serves
 the app's installations. Run `devvit settings set --help` for the exact CLI
 options for the installed Devvit version.
 
+### Fetch-domain approval (required before the first refresh succeeds)
+
+Devvit's HTTP fetch is allow-listed per domain. `id.twitch.tv` and
+`api.twitch.tv` are **not** on Reddit's global fetch allowlist, so every upload
+submits them for Reddit admin review (typically 1–2 business days). Until a
+domain is approved, every scheduled refresh fails with
+`7 PERMISSION_DENIED: … HTTP request to domain: … is not allowed` in the app
+logs and the widget is not created. Track and re-check approval status at
+`https://developers.reddit.com/apps/esclation-bot/developer-settings`; after
+approval, the next scheduled refresh succeeds without a redeploy (re-upload and
+re-install only if denials persist). Reddit policy also requires apps that use
+`fetch` to link Terms & Conditions and a Privacy Policy in the app details
+before publishing.
+
 ## In-app escalation engine
 
 A moderator presses **Escalate** on any post or comment, picks one of the 12
