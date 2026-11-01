@@ -125,10 +125,11 @@ Devvit.addSettings([
       {
         type: 'string',
         name: TWITCH_LANGUAGE_SETTING,
-        label: 'Twitch language filter (optional)',
-        helpText: 'Use a language code such as en, or leave blank for all languages.',
+        label: 'Twitch language filter',
+        helpText:
+          'Twitch language code such as en or fr. Defaults to en (English only); leave blank for all languages.',
         scope: SettingScope.Installation,
-        defaultValue: '',
+        defaultValue: 'en',
       },
     ],
   },
