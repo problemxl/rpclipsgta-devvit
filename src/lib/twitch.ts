@@ -209,19 +209,14 @@ export function renderSidebarMarkdown(
 }
 
 /**
- * Old-Reddit description variant.
+ * Old-Reddit sidebar variant: a Markdown pipe table.
  *
- * Reddit derives the short public_description from the description's raw
- * markdown and rejects the whole write when the derivation exceeds its hard
- * 500-character cap (TOO_LONG: public_description) — there is no API field
- * to set it explicitly. The description therefore gets a compact numbered
- * list of bare autolinked URLs with viewer counts, bounded by a row budget
- * so the block can never push the derivation over the cap even with
- * worst-case 25-character Twitch logins; unusually long names simply trim
- * the tail rows (the new-Reddit widget is unaffected and always shows ten).
+ * The old-Reddit sidebar is written through the v1 `config/sidebar` wiki
+ * page (512 KB limit) — the `updateSettings` 500-char public_description
+ * cap that forced a compact list no longer applies. Old Reddit renders pipe
+ * tables with leading pipes correctly; the leading pipe on every row is
+ * required for old Reddit's parser and harmless on new Reddit.
  */
-const DESCRIPTION_BLOCK_CHAR_BUDGET = 470;
-
 export function renderSidebarDescriptionBlock(
   streams: readonly TwitchStream[],
   options: { readonly generatedAt: Date }
@@ -230,22 +225,18 @@ export function renderSidebarDescriptionBlock(
   const hours = String(options.generatedAt.getUTCHours()).padStart(2, '0');
   const minutes = String(options.generatedAt.getUTCMinutes()).padStart(2, '0');
   const footer = `*updated ${hours}:${minutes} UTC*`;
-  const lines: string[] = [];
+  const lines = [header, ''];
   if (streams.length === 0) {
-    lines.push(header, '', 'No GTA RP streams are live right now.', '', footer);
-  } else {
-    // Build incrementally and stop before the whole block (header + rows +
-    // footer + separators) can exceed the budget. Always keeps at least the
-    // first (highest-viewer) row.
-    let candidate = [header, ''];
-    streams.slice(0, 10).forEach((stream, index) => {
-      const login = encodeURIComponent(stream.user_login);
-      const row = `${index + 1}. https://twitch.tv/${login} — ${stream.viewer_count.toLocaleString('en-US')}`;
-      const next = [...candidate, row, '', footer].join('\n');
-      if (next.length > DESCRIPTION_BLOCK_CHAR_BUDGET && index > 0) return;
-      candidate = [...candidate, row];
-    });
-    lines.push(...candidate, '', footer);
+    lines.push('No GTA RP streams are live right now.', '', footer);
+    return lines.join('\n');
   }
+  lines.push('| Streamer | Viewers |', '| --- | ---: |');
+  streams.slice(0, 10).forEach((stream) => {
+    const login = encodeURIComponent(stream.user_login);
+    lines.push(
+      `| [${displayName(stream)}](https://twitch.tv/${login}) | ${stream.viewer_count.toLocaleString('en-US')} |`
+    );
+  });
+  lines.push('', footer);
   return lines.join('\n');
 }

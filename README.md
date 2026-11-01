@@ -39,11 +39,20 @@ details.
 ## Top GTA RP streamers sidebar
 
 The app uses Twitch Helix's **Grand Theft Auto V** category (`game_id 32982`)
-so the sidebar shows the most-viewed live GTA RP streams. The refresh runs every
-10 minutes and retains the existing widget text if Twitch or Reddit fails. The
-widget is a textarea widget rather than the subreddit description so the two-
-column table (streamer link + viewer count) fits all ten entries. New widgets appear in the sidebar; a moderator
-must use **Edit Widgets** once to move the widget to the preferred position.
+so the sidebar shows the most-viewed live GTA RP streams. Twitch has no
+separate GTA Roleplay category, so the app fetches the 100 most-viewed
+streams in the category and keeps only those whose titles carry a GTA RP
+marker (server or platform names such as NoPixel, FiveM, RAGE MP, GTA World,
+Eclipse RP, plus generic `RP`/`roleplay`/`whitelisted`/`WL` markers — see
+`src/lib/rp-filter.ts`); the top ten by viewers are listed. The policy is a
+strict whitelist: an unmarked title is never shown, so a GTA Online or story
+mode stream cannot appear — at the cost of missing an RP streamer who names
+no server in the title. The refresh runs every 10 minutes and retains the
+existing widget text if Twitch or Reddit fails. The widget is a textarea
+widget rather than the subreddit description so the two-column table
+(streamer link + viewer count) fits all ten entries. New widgets appear in
+the sidebar; a moderator must use **Edit Widgets** once to move the widget to
+the preferred position.
 
 ### Old Reddit
 
@@ -60,10 +69,11 @@ sidebar editor links to this page):
 
 Until both markers exist the app never writes the wiki page (the logs report
 `old-Reddit description markers not found`). Removing the markers stops
-updates without affecting the new-Reddit widget. Wiki pages use Reddit
-Markdown, including tables, but the generated block intentionally remains the
-compact numbered bare-link list — `1. https://twitch.tv/name — 12,345` — so it
-also remains readable in every old-Reddit renderer.
+updates without affecting the new-Reddit widget. The generated block is the
+same two-column Markdown pipe table the widget renders — streamer link and
+viewer count — because old Reddit renders pipe tables with leading pipes on
+every row correctly and the wiki-backed surface has none of the length caps
+that earlier forced a compact list.
 
 The app uses the supported `context.reddit.getWikiPage` /
 `updateWikiPage` API with `wikiVersion: 'v1'`; this avoids the
@@ -80,9 +90,10 @@ devvit settings set twitch-client-id
 devvit settings set twitch-client-secret
 ```
 
-The optional installation settings are available in the app installation page:
-the textarea widget short name (default `Top GTA RP Live Streams`) and an
-optional Twitch language filter (`en`, for example; blank means all languages).
+The optional installation settings are available on the app installation page:
+the textarea widget short name (default `Top GTA RP Live Streams`) and a
+Twitch language filter (default `en` — English streams only; any Twitch
+language code like `fr` or `de` works, and blank means all languages).
 The Twitch credentials are app-scope settings, so one CLI configuration serves
 the app's installations. Run `devvit settings set --help` for the exact CLI
 options for the installed Devvit version.

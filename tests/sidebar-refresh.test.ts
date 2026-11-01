@@ -4,6 +4,7 @@ import {
   runSidebarRefresh,
   TWITCH_CLIENT_ID_SETTING,
   TWITCH_CLIENT_SECRET_SETTING,
+  TWITCH_LANGUAGE_SETTING,
 } from '../src/actions/sidebar-refresh.js';
 import type { DescriptionDeps } from '../src/actions/description.js';
 import type { TwitchResponse } from '../src/lib/twitch.js';
@@ -60,6 +61,61 @@ describe('runSidebarRefresh', () => {
     expect(d.writes).toEqual([]);
   });
 
+  it('filters non-RP titles out of the fetched pool before capping at ten', async () => {
+    const pool = Array.from({ length: 12 }, (_, i) => ({
+      user_login: `s${i}`,
+      user_name: `S${i}`,
+      title: i % 2 === 0 ? `GTA Online grinding #${i}` : `NoPixel V | stream ${i}`,
+      viewer_count: 1000 - i,
+    }));
+    const d = base(
+      {
+        [TWITCH_CLIENT_ID_SETTING]: 'id',
+        [TWITCH_CLIENT_SECRET_SETTING]: 'secret',
+        [TWITCH_LANGUAGE_SETTING]: 'en',
+      },
+      [
+        response(200, { access_token: 'token', expires_in: 3600, token_type: 'bearer' }),
+        response(200, { data: pool }),
+      ]
+    );
+    const outcome = await runSidebarRefresh(d.deps, { subredditName: 'rpclipsgta' });
+    // Six RP-marked streams in the pool, all kept (under the ten cap);
+    // every GTA Online grinder (the higher half of the pool) is dropped.
+    expect(outcome).toMatchObject({ status: 'updated', streamCount: 6 });
+    const written = d.writes[0] as string;
+    // Viewer-sorted odd-index rows survive; the even-indexed (higher-viewer)
+    // GTA Online grinders s0/s2/s4… do not appear.
+    expect(written).toContain('[S1]');
+    expect(written).toContain('[S11]');
+    expect(written).not.toContain('[S0]');
+    expect(written).not.toContain('[S10]');
+  });
+
+  it('applies the configured Twitch language filter to the streams query', async () => {
+    const d = base(
+      {
+        [TWITCH_CLIENT_ID_SETTING]: 'id',
+        [TWITCH_CLIENT_SECRET_SETTING]: 'secret',
+        [TWITCH_LANGUAGE_SETTING]: 'fr',
+      },
+      [
+        response(200, { access_token: 'token', expires_in: 3600, token_type: 'bearer' }),
+        response(200, {
+          data: [
+            { user_login: 'rp', user_name: 'RP', title: 'NoPixel V | Live', viewer_count: 12 },
+          ],
+        }),
+      ]
+    );
+    await expect(runSidebarRefresh(d.deps, { subredditName: 'rpclipsgta' })).resolves.toMatchObject({
+      status: 'updated',
+      streamCount: 1,
+    });
+    const streamsCall = d.calls.find((c: string) => c.includes('api.twitch.tv/helix/streams'));
+    expect(streamsCall).toContain('language=fr');
+  });
+
   it('wires fetch, render, and widget update in order', async () => {
     const d = base(
       { [TWITCH_CLIENT_ID_SETTING]: 'id', [TWITCH_CLIENT_SECRET_SETTING]: 'secret' },
@@ -67,7 +123,7 @@ describe('runSidebarRefresh', () => {
         response(200, { access_token: 'token', expires_in: 3600, token_type: 'bearer' }),
         response(200, {
           data: [
-            { user_login: 'rp', user_name: 'RP', title: 'Live', viewer_count: 12 },
+            { user_login: 'rp', user_name: 'RP', title: 'NoPixel V | Live', viewer_count: 12 },
           ],
         }),
       ]
@@ -102,7 +158,7 @@ describe('runSidebarRefresh', () => {
         response(200, { access_token: 'token', expires_in: 3600, token_type: 'bearer' }),
         response(200, {
           data: [
-            { user_login: 'rp', user_name: 'RP', title: 'Live', viewer_count: 12 },
+            { user_login: 'rp', user_name: 'RP', title: 'NoPixel V | Live', viewer_count: 12 },
           ],
         }),
       ]
@@ -119,10 +175,9 @@ describe('runSidebarRefresh', () => {
     expect(outcome).toMatchObject({ status: 'updated', streamCount: 1, description: 'updated' });
     expect(descriptionWrites).toHaveLength(1);
     expect(descriptionWrites[0]).toContain('[](#top-streamers-start)');
-    // Description block uses compact bare-link rows (the derived
-    // public_description has a hard 500-char cap), not the widget's table.
-    expect(descriptionWrites[0]).toContain('1. https://twitch.tv/rp — 12');
-    expect(descriptionWrites[0]).not.toContain('| [RP](');
+    // The description block is the same pipe table the widget renders —
+    // the wiki-backed surface has no public_description cap.
+    expect(descriptionWrites[0]).toContain('| [RP](https://twitch.tv/rp) | 12 |');
     expect(descriptionWrites[0]).toContain('Welcome.');
     expect(descriptionWrites[0]).toContain('Bye.');
     expect(descriptionWrites[0]).not.toContain('stale');
@@ -135,7 +190,7 @@ describe('runSidebarRefresh', () => {
         response(200, { access_token: 'token', expires_in: 3600, token_type: 'bearer' }),
         response(200, {
           data: [
-            { user_login: 'rp', user_name: 'RP', title: 'Live', viewer_count: 12 },
+            { user_login: 'rp', user_name: 'RP', title: 'NoPixel V | Live', viewer_count: 12 },
           ],
         }),
       ]
@@ -161,7 +216,7 @@ describe('runSidebarRefresh', () => {
         response(200, { access_token: 'token', expires_in: 3600, token_type: 'bearer' }),
         response(200, {
           data: [
-            { user_login: 'rp', user_name: 'RP', title: 'Live', viewer_count: 12 },
+            { user_login: 'rp', user_name: 'RP', title: 'NoPixel V | Live', viewer_count: 12 },
           ],
         }),
       ]

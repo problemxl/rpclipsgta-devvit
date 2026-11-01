@@ -195,7 +195,7 @@ describe('renderSidebarMarkdown', () => {
 });
 
 describe('renderSidebarDescriptionBlock', () => {
-  it('renders numbered bare-link rows with viewer counts under the public_description cap', () => {
+  it('renders the widget-equivalent pipe table with leading pipes on every row', () => {
     const ten = Array.from({ length: 10 }, (_, i) => ({
       user_login: `streamer_${i}`,
       user_name: `Streamer ${i}`,
@@ -206,19 +206,20 @@ describe('renderSidebarDescriptionBlock', () => {
       generatedAt: new Date('2024-01-02T03:04:00Z'),
     });
     expect(block).toContain('**Top 10 GTA RP streamers on Twitch**');
-    expect(block).toContain('1. https://twitch.tv/streamer_0 — 1,000');
-    expect(block).toContain('10. https://twitch.tv/streamer_9 — 1,009');
+    expect(block).toContain('| Streamer | Viewers |');
+    expect(block).toContain('| --- | ---: |');
+    expect(block).toContain('| [Streamer 0](https://twitch.tv/streamer_0) | 1,000 |');
+    expect(block).toContain('| [Streamer 9](https://twitch.tv/streamer_9) | 1,009 |');
     expect(block).toContain('updated 03:04 UTC');
-    // No Markdown table and no [Name](url) pairs: the derived
-    // public_description counts link targets, so bare links only.
-    expect(block).not.toContain('|');
-    expect(block).not.toMatch(/\]\(/);
-    // The whole block must stay under Reddit's hard 500-char cap on the
-    // derived public_description.
-    expect(block.length).toBeLessThan(500);
+    // Every row carries the leading pipe old Reddit's parser needs.
+    const rows = block.split('\n').filter((l: string) => l.startsWith('| ['));
+    expect(rows).toHaveLength(10);
+    // The wiki-backed sidebar has a 512 KB budget; ten rows are tiny. The
+    // 500-char public_description cap no longer applies to this surface.
+    expect(block.length).toBeLessThan(2000);
   });
 
-  it('trims tail rows but always keeps the top streamer with worst-case logins', () => {
+  it('keeps all ten rows even with worst-case logins (no trimming needed on the wiki surface)', () => {
     const worst = Array.from({ length: 10 }, (_, i) => ({
       user_login: `averylongstreamerlogin${i}`,
       user_name: `Streamer ${i}`,
@@ -228,12 +229,11 @@ describe('renderSidebarDescriptionBlock', () => {
     const block = renderSidebarDescriptionBlock(worst, {
       generatedAt: new Date('2024-01-02T03:04:00Z'),
     });
-    expect(block).toContain('1. https://twitch.tv/averylongstreamerlogin0 — 1,234,567');
+    expect(block).toContain('| [Streamer 0](https://twitch.tv/averylongstreamerlogin0) | 1,234,567 |');
+    expect(block).toContain('| [Streamer 9](https://twitch.tv/averylongstreamerlogin9) | 1,234,567 |');
     expect(block).toContain('updated 03:04 UTC');
-    expect(block.length).toBeLessThan(500);
-    const rowCount = block.split('\n').filter((l: string) => /^\d+\. https:/.test(l)).length;
-    expect(rowCount).toBeGreaterThanOrEqual(1);
-    expect(rowCount).toBeLessThan(10);
+    const rowCount = block.split('\n').filter((l: string) => l.startsWith('| [')).length;
+    expect(rowCount).toBe(10);
   });
 
   it('renders the empty-list message and footer for zero streams', () => {
