@@ -18,9 +18,18 @@ import {
   type DescriptionDeps,
   type DescriptionRefreshStatus,
 } from './description.js';
+import { filterRoleplayStreams } from '../lib/rp-filter.js';
 
 export const TWITCH_GAME_ID = '32982';
+/** How many streams the sidebar lists. */
 export const TOP_STREAM_LIMIT = 10;
+/**
+ * How many candidates to fetch before RP-filtering. Twitch's GTA V category
+ * mixes RP with GTA Online/story mode; RP is identified from title markers
+ * (see lib/rp-filter.ts), so the pool must be larger than the list to keep
+ * ten RP streams after filtering. 100 is Helix's `first` maximum.
+ */
+export const RP_FILTER_POOL_SIZE = 100;
 export const DEFAULT_WIDGET_SHORT_NAME = 'Top GTA RP Live Streams';
 export const TWITCH_CLIENT_ID_SETTING = 'twitch-client-id';
 export const TWITCH_CLIENT_SECRET_SETTING = 'twitch-client-secret';
@@ -106,12 +115,15 @@ export async function runSidebarRefresh(
       clientSecret,
       gameId: TWITCH_GAME_ID,
       language,
-      limit: TOP_STREAM_LIMIT,
+      limit: RP_FILTER_POOL_SIZE,
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Twitch refresh failed for r/${input.subredditName}: ${detail}`);
   }
+  // Keep only roleplay streams (title markers), then cap at ten — the fetch
+  // is viewer-sorted, so the first ten RP streams are the top ten by viewers.
+  streams = filterRoleplayStreams(streams).slice(0, TOP_STREAM_LIMIT);
   const generatedAt = deps.now?.() ?? new Date();
   const text = renderSidebarMarkdown(streams, { generatedAt });
   // Old-Reddit description block: compact bare-link rows, not the table.
