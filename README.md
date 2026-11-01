@@ -399,9 +399,14 @@ resolve an ambiguous Reddit outcome or force-unlock in production.
 3. Run `python -m unittest discover -s tests -p 'test_*.py'` — local helper tests
    are deterministic and do not call Guerrilla Mail.
 4. `devvit login`.
-5. `devvit upload` (or `devvit publish`). The Twitch credentials remain in
-   app settings and are never committed to the repository.
-6. Install the app to the source and test subreddits via the app installation
+5. Host the public [Terms & Conditions](docs/terms.md) and [Privacy Policy](docs/privacy-policy.md)
+   source documents (for example, with GitHub Pages or a gist). Paste both
+   public URLs into the app's developer-settings page at
+   `https://developers.reddit.com/apps/esclation-bot/developer-settings`.
+   Reddit requires both links before `devvit publish` will succeed. The Twitch
+   credentials remain in app settings and are never committed to the repository.
+6. `devvit upload` (or `devvit publish`).
+7. Install the app to the source and test subreddits via the app installation
    page (`https://developers.reddit.com/r/<subreddit>/apps`). Fixture creation
    is intended only for source posts in `r/rpclipsgta`; the handler rejects
    other source subreddits.
