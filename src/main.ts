@@ -16,7 +16,6 @@
  * the warning comment or ban directly.
  */
 
-import { context as serverContext } from '@devvit/server';
 import { Devvit, SettingScope } from '@devvit/public-api';
 
 import {
@@ -79,11 +78,6 @@ import {
   WIDGET_SHORT_NAME_SETTING,
   runSidebarRefresh,
 } from './actions/sidebar-refresh.js';
-import {
-  readSubredditDescription,
-  writeSubredditDescription,
-  type RawSubredditsPlugin,
-} from './actions/description-writer.js';
 import type { TwitchToken } from './lib/twitch.js';
 
 Devvit.configure({
@@ -160,11 +154,11 @@ Devvit.addSchedulerJob({
       );
       if (outcome.description === 'missing-markers') {
         console.log(
-          '[sidebar-refresh] old-Reddit description markers not found — add ' +
-            '[](#top-streamers-start) and [](#top-streamers-end) to the description to enable'
+          '[sidebar-refresh] old-Reddit wiki sidebar markers not found — add ' +
+            '[](#top-streamers-start) and [](#top-streamers-end) to the v1 config/sidebar page to enable'
         );
       } else if (outcome.description) {
-        console.log(`[sidebar-refresh] old-Reddit description ${outcome.description}`);
+        console.log(`[sidebar-refresh] old-Reddit wiki sidebar ${outcome.description}`);
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -250,24 +244,8 @@ function fetchAllowedTwitchUrl(
   return globalThis.fetch(input, init);
 }
 
-function rawSubredditsPlugin(): RawSubredditsPlugin {
-  // SAFETY: Devvit.redditAPIPlugins exists at runtime but is @internal and
-  // hidden from the public declarations — the cast only asserts the
-  // Subreddits plugin exposes the proto service methods used below, and the
-  // undefined-guard below turns a missing plugin into a thrown Error.
-  const plugins = (
-    Devvit as unknown as {
-      readonly redditAPIPlugins?: { readonly Subreddits?: RawSubredditsPlugin };
-    }
-  ).redditAPIPlugins;
-  if (!plugins?.Subreddits) {
-    throw new Error('Devvit Reddit API plugins unavailable — is redditAPI enabled?');
-  }
-  return plugins.Subreddits;
-}
-
 function createSidebarRefreshDeps(
-  context: Pick<Devvit.Context, 'settings' | 'redis' | 'reddit' | 'metadata'>
+  context: Pick<Devvit.Context, 'settings' | 'redis' | 'reddit'>
 ) {
   return {
     settings: context.settings,
@@ -293,25 +271,46 @@ function createSidebarRefreshDeps(
       shortName: string;
       text: string;
     }) => context.reddit.updateWidget(widget),
-    // Old-Reddit sidebar: replace only the marker-delimited block in the
-    // subreddit description. refreshDescriptionBlock is a no-op unless a
-    // moderator has added both markers once via Community Settings.
+    // Old-Reddit sidebar: replace only the marker-delimited block in the v1
+    // config/sidebar wiki page. refreshDescriptionBlock is a no-op unless a
+    // moderator has added both markers once via the wiki editor.
     //
-    // Writes go through the raw Subreddits plugin instead of
-    // subreddit.updateSettings: the library copies the full description into
-    // the 500-capped publicDescription field and Reddit rejects the write
-    // (TOO_LONG). description-writer.ts preserves the existing value.
+    // The v1 config/sidebar wiki page is the old-Reddit sidebar's supported
+    // backing store. Unlike subreddit.updateSettings, the wiki API does not
+    // re-submit the derived 500-character publicDescription field, and it is
+    // available from scheduler jobs.
     description: {
-      getDescription: (subredditName: string) =>
-        readSubredditDescription(
-          { subreddits: rawSubredditsPlugin(), metadata: serverContext.metadata },
-          subredditName
-        ),
-      setDescription: (subredditName: string, description: string) =>
-        writeSubredditDescription(
-          { subreddits: rawSubredditsPlugin(), metadata: serverContext.metadata },
-          { subredditName, description }
-        ),
+      getDescription: async (subredditName: string) => {
+        try {
+          const page = await context.reddit.getWikiPage(
+            subredditName,
+            'config/sidebar',
+            { wikiVersion: 'v1' }
+          );
+          return page.content;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `[description-read] wiki config/sidebar failed for r/${subredditName}: ${detail}`
+          );
+        }
+      },
+      setDescription: async (subredditName: string, description: string) => {
+        try {
+          await context.reddit.updateWikiPage({
+            subredditName,
+            page: 'config/sidebar',
+            content: description,
+            reason: 'Refresh Twitch stream sidebar block',
+            wikiVersion: 'v1',
+          });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `[description-write] wiki config/sidebar failed for r/${subredditName}: ${detail}`
+          );
+        }
+      },
     },
   };
 }

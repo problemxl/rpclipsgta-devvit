@@ -15,6 +15,15 @@ const ABOUT: SubredditAboutData = {
   subredditType: 'public',
   over18: false,
   submissionType: 'any',
+  isCrosspostableSubreddit: true,
+  disableContributorRequests: true,
+  freeFormReports: true,
+  headerTitle: 'Header',
+  keyColor: '#123456',
+  originalContentTagEnabled: true,
+  hideAds: true,
+  showMedia: true,
+  showMediaPreview: true,
   description: '[](#top-streamers-start)\n| stale |\n[](#top-streamers-end)',
   publicDescription: 'Existing short blurb under 500 chars.',
   acceptFollowers: true,
@@ -58,6 +67,13 @@ describe('buildDescriptionOnlyRequest', () => {
     expect(request.linkType).toBe('any');
   });
 
+  it.each(['link', 'self', 'other'] as const)(
+    'passes the Reddit submission type %s through verbatim', (submissionType) => {
+      const request = buildDescriptionOnlyRequest({ ...ABOUT, submissionType }, 'd');
+      expect(request.linkType).toBe(submissionType);
+    }
+  );
+
   it('carries About-sourced settings so nothing else changes', () => {
     const request = buildDescriptionOnlyRequest(ABOUT, 'd');
     expect(request.acceptFollowers).toBe(true);
@@ -67,6 +83,15 @@ describe('buildDescriptionOnlyRequest', () => {
     expect(request.spoilersEnabled).toBe(true);
     expect(request.commentScoreHideMins).toBe(7);
     expect(request.collapseDeletedComments).toBe(true);
+    expect(request.allowPostCrossposts).toBe(true);
+    expect(request.disableContributorRequests).toBe(true);
+    expect(request.freeFormReports).toBe(true);
+    expect(request.headerTitle).toBe('Header');
+    expect(request.keyColor).toBe('#123456');
+    expect(request.originalContentTagEnabled).toBe(true);
+    expect(request.hideAds).toBe(true);
+    expect(request.showMedia).toBe(true);
+    expect(request.showMediaPreview).toBe(true);
   });
 
   it('normalizes an unknown submission type instead of passing it through', () => {
@@ -91,12 +116,10 @@ describe('buildDescriptionOnlyRequest', () => {
     ).toThrow('missing id or displayName');
   });
 
-  it('keeps an empty string publicDescription when About has none', () => {
-    const request = buildDescriptionOnlyRequest(
-      { ...ABOUT, publicDescription: undefined },
-      'd'
-    );
-    expect(request.publicDescription).toBe('');
+  it('rejects an About payload with no publicDescription instead of clearing it', () => {
+    expect(() =>
+      buildDescriptionOnlyRequest({ ...ABOUT, publicDescription: undefined }, 'd')
+    ).toThrow('missing publicDescription');
   });
 });
 
@@ -141,7 +164,7 @@ describe('writeSubredditDescription', () => {
     ).rejects.toThrow('About response missing data');
   });
 
-  it('propagates SiteAdmin failures', async () => {
+  it('prefixes SiteAdmin failures as description writes', async () => {
     const plugin: RawSubredditsPlugin = {
       SubredditAbout: async () => ({ data: ABOUT }),
       SiteAdmin: async () => {
@@ -153,6 +176,38 @@ describe('writeSubredditDescription', () => {
         { subreddits: plugin },
         { subredditName: 'testsub', description: 'd' }
       )
-    ).rejects.toThrow('reddit denied');
+    ).rejects.toThrow('[description-write] SiteAdmin failed for r/testsub: reddit denied');
+  });
+
+  it('prefixes About failures as description reads', async () => {
+    const plugin: RawSubredditsPlugin = {
+      SubredditAbout: async () => {
+        throw new Error('reddit read denied');
+      },
+      SiteAdmin: async () => ({}),
+    };
+    await expect(readSubredditDescription({ subreddits: plugin }, 'testsub')).rejects.toThrow(
+      '[description-read] SubredditAbout failed for r/testsub: reddit read denied'
+    );
+  });
+
+  it('forwards the supplied metadata to both raw plugin calls', async () => {
+    const metadata = { actor: 'ambient-request' };
+    const calls: unknown[] = [];
+    const plugin: RawSubredditsPlugin = {
+      SubredditAbout: async (_request, receivedMetadata) => {
+        calls.push(receivedMetadata);
+        return { data: ABOUT };
+      },
+      SiteAdmin: async (_request, receivedMetadata) => {
+        calls.push(receivedMetadata);
+      },
+    };
+    await readSubredditDescription({ subreddits: plugin, metadata }, 'testsub');
+    await writeSubredditDescription(
+      { subreddits: plugin, metadata },
+      { subredditName: 'testsub', description: 'd' }
+    );
+    expect(calls).toEqual([metadata, metadata, metadata]);
   });
 });

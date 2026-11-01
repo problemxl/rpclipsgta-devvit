@@ -47,41 +47,30 @@ must use **Edit Widgets** once to move the widget to the preferred position.
 
 ### Old Reddit
 
-Old Reddit does not render sidebar widgets; its sidebar is the subreddit
-description. The app additionally maintains a marker-delimited block inside
-the description and replaces only the text between the markers, preserving all
-other moderator-written content byte-for-byte. To enable it once per
-subreddit, add these two invisible anchor lines anywhere in the description
-(**Community Settings → description**, or `old.reddit.com/r/<sub>/about/edit`):
+Old Reddit does not render sidebar widgets; its sidebar is backed by the v1
+wiki page `config/sidebar` (the same page exposed by
+`old.reddit.com/r/<sub>/wiki/config/sidebar`). The app reads and updates that
+wiki page every ten minutes, replacing only a marker-delimited block and
+preserving all other moderator-written content byte-for-byte. Add these two
+invisible anchor lines to the **v1 `config/sidebar` page** once (the old Reddit
+sidebar editor links to this page):
 
     [](#top-streamers-start)
     [](#top-streamers-end)
 
-Until both markers exist the app never writes the description (the logs report
+Until both markers exist the app never writes the wiki page (the logs report
 `old-Reddit description markers not found`). Removing the markers stops
-description updates without affecting the widget.
+updates without affecting the new-Reddit widget. Wiki pages use Reddit
+Markdown, including tables, but the generated block intentionally remains the
+compact numbered bare-link list — `1. https://twitch.tv/name — 12,345` — so it
+also remains readable in every old-Reddit renderer.
 
-The description block is **not** the widget's Markdown table. Reddit derives
-the mobile/About `public_description` from the description's raw markdown
-and hard-rejects the whole write when that derivation exceeds 500 characters
-(`TOO_LONG: public_description`) — a full `[Name](url)` table is ~600+ chars
-and there is no API field to set the derived text explicitly. The description
-therefore renders as a compact numbered list of bare autolinked URLs —
-`1. https://twitch.tv/name — 12,345` — bounded to 470 characters so the write
-can never trip the cap; with unusually long Twitch logins the tail rows trim
-while the widget still shows all ten. Bare URLs autolink on old Reddit.
-
-**Implementation note — Devvit library defect.** `Subreddit.updateSettings({
-description })` copies the description verbatim into `publicDescription`
-(`publicDescription: description ?? ''` in `@devvit/reddit` models), so any
-subreddit whose description exceeds 500 chars can never be written that way;
-the bug is present through `@devvit/reddit` 0.15.2-next (verified
-2026-10-31). The app therefore writes descriptions through the raw
-`Subreddits.SiteAdmin` plugin call (`src/actions/description-writer.ts`),
-sourcing every field from a live `SubredditAbout` read and passing the
-existing `publicDescription` through byte-for-byte, so only the description
-changes. If a future Devvit release fixes `updateSettings`, that module can
-be simplified back to the standard API.
+The app uses the supported `context.reddit.getWikiPage` /
+`updateWikiPage` API with `wikiVersion: 'v1'`; this avoids the
+`Subreddit.updateSettings({ description })` defect in @devvit/reddit, which
+copies the description into the 500-character `publicDescription` field and
+caused the original `TOO_LONG` failure. Wiki read and write failures are logged
+with distinct `[description-read]` and `[description-write]` prefixes.
 
 Set the two app-scope Twitch credentials from the app directory (the client
 secret is stored as a secret):

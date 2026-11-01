@@ -24,6 +24,7 @@ export interface SubredditAboutData {
   readonly title?: string | undefined;
   readonly subredditType?: string | undefined;
   readonly over18?: boolean | undefined;
+  readonly originalContentTagEnabled?: boolean | undefined;
   readonly submissionType?: string | undefined;
   readonly description?: string | undefined;
   readonly publicDescription?: string | undefined;
@@ -33,6 +34,11 @@ export interface SubredditAboutData {
   readonly allowDiscovery?: boolean | undefined;
   readonly allowGalleries?: boolean | undefined;
   readonly allowImages?: boolean | undefined;
+  readonly disableContributorRequests?: boolean | undefined;
+  readonly freeFormReports?: boolean | undefined;
+  readonly headerTitle?: string | undefined;
+  readonly hideAds?: boolean | undefined;
+  readonly isCrosspostableSubreddit?: boolean | undefined;
   readonly allowPolls?: boolean | undefined;
   readonly allowPredictionContributors?: boolean | undefined;
   readonly allowPredictions?: boolean | undefined;
@@ -50,6 +56,9 @@ export interface SubredditAboutData {
   readonly submitText?: string | undefined;
   readonly submitTextLabel?: string | undefined;
   readonly suggestedCommentSort?: string | undefined;
+  readonly keyColor?: string | undefined;
+  readonly showMedia?: boolean | undefined;
+  readonly showMediaPreview?: boolean | undefined;
   readonly wikimode?: string | undefined;
   readonly [key: string]: unknown;
 }
@@ -97,6 +106,14 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' ? value : fallback;
 }
 
+function requiredString(data: SubredditAboutData, key: keyof SubredditAboutData): string {
+  const value = data[key];
+  if (typeof value !== 'string') {
+    throw new Error(`subreddit About response missing ${String(key)}`);
+  }
+  return value;
+}
+
 /** The About request every field of the write is sourced from. */
 function aboutRequest(subredditName: string): Record<string, unknown> {
   // BasicSubredditRequest's only field is `subreddit`.
@@ -130,8 +147,9 @@ export function buildDescriptionOnlyRequest(
     type,
     linkType,
     description: nextDescription,
-    publicDescription:
-      typeof data.publicDescription === 'string' ? data.publicDescription : '',
+    // An omitted public description is unknown, not an empty description. Do
+    // not turn an incomplete About response into a destructive write.
+    publicDescription: requiredString(data, 'publicDescription'),
     over18: data.over18 === true,
     acceptFollowers: bool(data, 'acceptFollowers'),
     allOriginalContent: bool(data, 'allOriginalContent'),
@@ -140,6 +158,13 @@ export function buildDescriptionOnlyRequest(
     allowGalleries: bool(data, 'allowGalleries'),
     allowImages: bool(data, 'allowImages'),
     allowPolls: bool(data, 'allowPolls'),
+    allowPostCrossposts: bool(data, 'isCrosspostableSubreddit'),
+    disableContributorRequests: bool(data, 'disableContributorRequests'),
+    freeFormReports: bool(data, 'freeFormReports'),
+    headerTitle: str(data, 'headerTitle'),
+    keyColor: str(data, 'keyColor'),
+    originalContentTagEnabled: bool(data, 'originalContentTagEnabled'),
+    hideAds: bool(data, 'hideAds'),
     allowPredictionContributors: bool(data, 'allowPredictionContributors'),
     allowPredictions: bool(data, 'allowPredictions'),
     allowPredictionsTournament: bool(data, 'allowPredictionsTournament'),
@@ -182,8 +207,8 @@ export function buildDescriptionOnlyRequest(
     modmailHarassmentFilterEnabled: false,
     newPinnedPostPnsEnabled: false,
     predictionLeaderboardEntryType: 0,
-    showMedia: false,
-    showMediaPreview: false,
+    showMedia: bool(data, 'showMedia'),
+    showMediaPreview: bool(data, 'showMediaPreview'),
     toxicityThresholdChatLevel: 0,
     userFlairPnsEnabled: false,
     welcomeMessageEnabled: false,
