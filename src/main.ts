@@ -16,6 +16,7 @@
  * the warning comment or ban directly.
  */
 
+import { context as serverContext } from '@devvit/server';
 import { Devvit, SettingScope } from '@devvit/public-api';
 
 import {
@@ -78,6 +79,11 @@ import {
   WIDGET_SHORT_NAME_SETTING,
   runSidebarRefresh,
 } from './actions/sidebar-refresh.js';
+import {
+  readSubredditDescription,
+  writeSubredditDescription,
+  type RawSubredditsPlugin,
+} from './actions/description-writer.js';
 import type { TwitchToken } from './lib/twitch.js';
 
 Devvit.configure({
@@ -244,8 +250,24 @@ function fetchAllowedTwitchUrl(
   return globalThis.fetch(input, init);
 }
 
+function rawSubredditsPlugin(): RawSubredditsPlugin {
+  // SAFETY: Devvit.redditAPIPlugins exists at runtime but is @internal and
+  // hidden from the public declarations — the cast only asserts the
+  // Subreddits plugin exposes the proto service methods used below, and the
+  // undefined-guard below turns a missing plugin into a thrown Error.
+  const plugins = (
+    Devvit as unknown as {
+      readonly redditAPIPlugins?: { readonly Subreddits?: RawSubredditsPlugin };
+    }
+  ).redditAPIPlugins;
+  if (!plugins?.Subreddits) {
+    throw new Error('Devvit Reddit API plugins unavailable — is redditAPI enabled?');
+  }
+  return plugins.Subreddits;
+}
+
 function createSidebarRefreshDeps(
-  context: Pick<Devvit.Context, 'settings' | 'redis' | 'reddit'>
+  context: Pick<Devvit.Context, 'settings' | 'redis' | 'reddit' | 'metadata'>
 ) {
   return {
     settings: context.settings,
@@ -274,13 +296,22 @@ function createSidebarRefreshDeps(
     // Old-Reddit sidebar: replace only the marker-delimited block in the
     // subreddit description. refreshDescriptionBlock is a no-op unless a
     // moderator has added both markers once via Community Settings.
+    //
+    // Writes go through the raw Subreddits plugin instead of
+    // subreddit.updateSettings: the library copies the full description into
+    // the 500-capped publicDescription field and Reddit rejects the write
+    // (TOO_LONG). description-writer.ts preserves the existing value.
     description: {
-      getDescription: async (subredditName: string) =>
-        (await context.reddit.getSubredditInfoByName(subredditName)).description?.markdown,
-      setDescription: async (subredditName: string, description: string) => {
-        const subreddit = await context.reddit.getSubredditByName(subredditName);
-        await subreddit.updateSettings({ description });
-      },
+      getDescription: (subredditName: string) =>
+        readSubredditDescription(
+          { subreddits: rawSubredditsPlugin(), metadata: serverContext.metadata },
+          subredditName
+        ),
+      setDescription: (subredditName: string, description: string) =>
+        writeSubredditDescription(
+          { subreddits: rawSubredditsPlugin(), metadata: serverContext.metadata },
+          { subredditName, description }
+        ),
     },
   };
 }

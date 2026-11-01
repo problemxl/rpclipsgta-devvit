@@ -71,6 +71,18 @@ therefore renders as a compact numbered list of bare autolinked URLs —
 can never trip the cap; with unusually long Twitch logins the tail rows trim
 while the widget still shows all ten. Bare URLs autolink on old Reddit.
 
+**Implementation note — Devvit library defect.** `Subreddit.updateSettings({
+description })` copies the description verbatim into `publicDescription`
+(`publicDescription: description ?? ''` in `@devvit/reddit` models), so any
+subreddit whose description exceeds 500 chars can never be written that way;
+the bug is present through `@devvit/reddit` 0.15.2-next (verified
+2026-10-31). The app therefore writes descriptions through the raw
+`Subreddits.SiteAdmin` plugin call (`src/actions/description-writer.ts`),
+sourcing every field from a live `SubredditAbout` read and passing the
+existing `publicDescription` through byte-for-byte, so only the description
+changes. If a future Devvit release fixes `updateSettings`, that module can
+be simplified back to the standard API.
+
 Set the two app-scope Twitch credentials from the app directory (the client
 secret is stored as a secret):
 
