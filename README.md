@@ -266,15 +266,17 @@ Redis state is installation-scoped and idempotent:
   with WATCH/MULTI/EXEC, never with an unsafe GET-then-DEL sequence. There is
   no in-app recovery because deletion cannot fence a stale owner.
 - `modactions:wiki:escalation-log:active` and
-  `modactions:wiki:escalation-log:lock` — mirror bookkeeping and a short-lived
-  append lock. Finalized rows are also backed up in private, moderator-only
-  v1 wiki pages named `escalation-log/YYYY-MM` (and rotated pages such as
-  `escalation-log/YYYY-MM-2`) under the Reddit 450 KiB safety threshold; old
-  pages are never edited again. Each page is JSONL: one compact JSON object per
-  line, with the normalized username in `username` followed by the
-  `ModActionRecord` fields (`id`, `at`, `rule`, `action`, `label`, `modUser`,
-  `targetThingId`; finalized lines have no `state`). Redis remains authoritative
-  and the wiki pages are an append-only backup.
+  `modactions:wiki:escalation-log:lock` — mirror bookkeeping and a
+  non-expiring owner-token append lock. Ownership is checked immediately before
+  each wiki or active-pointer mutation; a writer that loses the token aborts
+  without writing, and release uses the same compare-and-delete policy as the
+  user lock. Finalized rows are backed up in private, moderator-only v1 wiki
+  pages named `escalation-log/YYYY-MM` (and rotated pages such as
+  `escalation-log/YYYY-MM-2`). Pages rotate at 450 KiB measured as UTF-8 bytes,
+  and every emitted page is checked against Reddit's 524,288-byte hard limit;
+  after a successful rotation or month transition, the prior page is not edited
+  again by normal appends. Each page is JSONL: one compact JSON object per line.
+  The final line format is `{"username":"<normalized>","id":"<row-id>","at":<epoch-ms>,"rule":<1-12>,"action":"warn"|"ban","label":"<label>","modUser":"<moderator>","targetThingId":"t1_|t3_..."}` followed by `\n`; finalized lines have no `state`. Consumers should parse each line as JSON and deduplicate by `id`: if an append succeeds but the active-pointer update is ambiguous or fails, a retry can duplicate a line. Redis remains authoritative and the wiki pages are an append-only backup.
 
 ## Remove & escalate action
 

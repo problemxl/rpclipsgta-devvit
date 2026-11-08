@@ -7,13 +7,14 @@ import {
 } from './history.js';
 import { releaseUserActionLock, type UserActionLock } from './user-lock.js';
 
-/** Keep a comfortable margin below Reddit's 524,288-byte wiki-page limit. */
+/** Reddit's hard wiki-page content limit, measured in UTF-8 bytes. */
+export const HISTORY_MIRROR_MAX_PAGE_BYTES = 524_288;
+/** Keep a comfortable margin below Reddit's hard wiki-page limit. */
 export const HISTORY_MIRROR_ROTATION_BYTES = 450 * 1024;
 export const HISTORY_MIRROR_PAGE_PREFIX = 'escalation-log';
 export const HISTORY_MIRROR_ACTIVE_PAGE_KEY = 'modactions:wiki:escalation-log:active';
 export const HISTORY_MIRROR_LOCK_KEY = 'modactions:wiki:escalation-log:lock';
 
-const LOCK_TTL_MS = 15_000;
 const LOCK_ATTEMPTS = 10;
 const LOCK_RETRY_MS = 25;
 const PAGE_NAME_PATTERN = new RegExp(`^${HISTORY_MIRROR_PAGE_PREFIX}/(\\d{4}-\\d{2})(?:-(\\d+))?$`);
@@ -31,9 +32,11 @@ export interface HistoryMirrorDeps {
     content: string
   ) => Promise<void>;
   /** Set the page to unlisted and moderator-only before writing its content. */
-  readonly setWikiPageSettings?: (subredditName: string, page: string) => Promise<void>;
+  readonly setWikiPageSettings: (subredditName: string, page: string) => Promise<void>;
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
+  /** Injectable only so lock-ownership races can be deterministic in tests. */
+  readonly tokenGenerator?: () => string;
 }
 
 export interface MirrorAppendInput {
@@ -84,11 +87,12 @@ async function acquireMirrorLock(
   deps: HistoryMirrorDeps,
   now: () => number
 ): Promise<MirrorLock | undefined> {
-  const token = `history-mirror:${now()}:${Math.random().toString(36).slice(2)}`;
-  const options: RedisSetOptions = {
-    nx: true,
-    expiration: new Date(now() + LOCK_TTL_MS),
-  };
+  const token = `history-mirror:${now()}:${(deps.tokenGenerator ?? (() => crypto.randomUUID()))()}`;
+  // This lock intentionally has no expiry. A wiki read or write can outlive
+  // any practical lease, and expiry would let a stale writer overwrite a
+  // newer append. Ownership is checked again immediately before every wiki or
+  // pointer mutation, and releaseUserActionLock compare-deletes the token.
+  const options: RedisSetOptions = { nx: true };
   const sleep = deps.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
     const result = await deps.redis.set(HISTORY_MIRROR_LOCK_KEY, token, options);
@@ -96,6 +100,16 @@ async function acquireMirrorLock(
     if (attempt + 1 < LOCK_ATTEMPTS) await sleep(LOCK_RETRY_MS);
   }
   return undefined;
+}
+
+async function assertMirrorLockHeld(
+  deps: HistoryMirrorDeps,
+  lock: MirrorLock
+): Promise<void> {
+  const current = await deps.redis.get(lock.key);
+  if (current !== lock.token) {
+    throw new Error('wiki append lock was lost before the next mutation');
+  }
 }
 
 function activePageFor(active: string | undefined, recordAt: number): string {
@@ -134,14 +148,17 @@ export async function mirrorAppend(
     }
 
     const active = await deps.redis.get(HISTORY_MIRROR_ACTIVE_PAGE_KEY);
+    await assertMirrorLockHeld(deps, lock);
     let page = activePageFor(active, input.record.at);
     const line = serializeMirrorLine(input.username, input.record);
     let existing = await deps.getWikiPage(input.subredditName, page);
+    await assertMirrorLockHeld(deps, lock);
     let content = existing ?? '';
     let lineToAppend = content !== '' && !content.endsWith('\n') ? `\n${line}` : line;
     while (utf8Bytes(content + lineToAppend) > HISTORY_MIRROR_ROTATION_BYTES) {
       page = nextRotatedPage(page);
       existing = await deps.getWikiPage(input.subredditName, page);
+      await assertMirrorLockHeld(deps, lock);
       content = existing ?? '';
       lineToAppend = content !== '' && !content.endsWith('\n') ? `\n${line}` : line;
       if (content === '' && utf8Bytes(lineToAppend) > HISTORY_MIRROR_ROTATION_BYTES) {
@@ -150,13 +167,17 @@ export async function mirrorAppend(
     }
 
     const next = content + lineToAppend;
-    if (existing !== undefined && deps.setWikiPageSettings) {
-      await deps.setWikiPageSettings(input.subredditName, page);
+    if (utf8Bytes(next) > HISTORY_MIRROR_MAX_PAGE_BYTES) {
+      throw new Error(`serialized record exceeds wiki page limit for ${page}`);
     }
+
+    // updateWikiPage creates a missing page, so configure it first. If the
+    // settings call fails, no real content is written to a public page.
+    await assertMirrorLockHeld(deps, lock);
+    await deps.setWikiPageSettings(input.subredditName, page);
+    await assertMirrorLockHeld(deps, lock);
     await deps.updateWikiPage(input.subredditName, page, next);
-    if (existing === undefined && deps.setWikiPageSettings) {
-      await deps.setWikiPageSettings(input.subredditName, page);
-    }
+    await assertMirrorLockHeld(deps, lock);
     await deps.redis.set(HISTORY_MIRROR_ACTIVE_PAGE_KEY, page);
   } catch (error) {
     console.error(`[history-mirror] append failed: ${detailOf(error)}`);

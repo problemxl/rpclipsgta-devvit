@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { punish, punishLockKey, buildWarningComment, type PunishDeps } from '../src/actions/punish.js';
 import {
@@ -35,6 +35,7 @@ class FakeRedis implements FakeRedisShape {
   failMulti = false;
   failExec = false;
   failDiscard = false;
+  failActivePointerUpdate = false;
   /** Override an EXEC reply to exercise fail-closed reply validation. */
   execReplyOverride: unknown[] | undefined = undefined;
   execReplyOverrideConfigured = false;
@@ -54,6 +55,9 @@ class FakeRedis implements FakeRedisShape {
     options?: RedisSetOptions
   ): Promise<string | undefined> {
     this.setCalls.push({ key, value, options });
+    if (this.failActivePointerUpdate && key === 'modactions:wiki:escalation-log:active') {
+      throw new Error('active pointer unavailable');
+    }
     if (options?.nx && this.values.has(key)) return undefined;
     if (options?.xx && !this.values.has(key)) return undefined;
     this.values.set(key, value);
@@ -192,16 +196,23 @@ class FakeRedis implements FakeRedisShape {
   }
 }
 
-function mirrorDeps(redis: FakeRedis): HistoryMirrorDeps & { update: ReturnType<typeof vi.fn> } {
+function mirrorDeps(
+  redis: FakeRedis,
+  overrides: Partial<Omit<HistoryMirrorDeps, 'redis'>> = {}
+): HistoryMirrorDeps & { update: ReturnType<typeof vi.fn> } {
   const update = vi.fn(async (_subredditName: string, _page: string, _content: string) => undefined);
   return {
     redis,
     getWikiPage: async () => undefined,
-    updateWikiPage: update,
+    setWikiPageSettings: async () => undefined,
     sleep: async () => undefined,
+    ...overrides,
+    updateWikiPage: overrides.updateWikiPage ?? update,
     update,
   };
 }
+
+afterEach(() => vi.restoreAllMocks());
 
 function deps(overrides: Partial<PunishDeps> = {}, redis = new FakeRedis()): PunishDeps {
   const actualRedis = (overrides.redis ?? redis) as FakeRedisShape;
@@ -345,6 +356,50 @@ describe('punish', () => {
     const failedCurrent = deps({ redis: failedRedis, history: failedHistory, historyMirror: failedMirror });
     await expect(punish(failedCurrent, input)).resolves.toMatchObject({ finalized: false });
     expect(failedMirror.update).not.toHaveBeenCalled();
+  });
+
+  it('preserves the moderation result when the wiki mirror fails at any seam', async () => {
+    const cases: Array<{ name: string; make: (redis: FakeRedis) => HistoryMirrorDeps }> = [
+      {
+        name: 'lock acquisition',
+        make: (redis) => {
+          redis.values.set('modactions:wiki:escalation-log:lock', 'another-writer');
+          return mirrorDeps(redis);
+        },
+      },
+      {
+        name: 'wiki read',
+        make: (redis) => mirrorDeps(redis, {
+          getWikiPage: async () => { throw new Error('wiki read unavailable'); },
+        }),
+      },
+      {
+        name: 'wiki write',
+        make: (redis) => mirrorDeps(redis, {
+          updateWikiPage: async () => { throw new Error('wiki write unavailable'); },
+        }),
+      },
+      {
+        name: 'active pointer update',
+        make: (redis) => {
+          redis.failActivePointerUpdate = true;
+          return mirrorDeps(redis);
+        },
+      },
+    ];
+
+    for (const failure of cases) {
+      const redis = new FakeRedis();
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const result = await punish(deps({ redis, historyMirror: failure.make(redis) }), input);
+      expect(result, failure.name).toMatchObject({
+        action: 'warn',
+        recorded: true,
+        finalized: true,
+      });
+      expect(error, failure.name).toHaveBeenCalled();
+      error.mockClear();
+    }
   });
 
   it('fails closed when strict history cannot be read', async () => {
