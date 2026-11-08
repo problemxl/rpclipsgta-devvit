@@ -4,7 +4,7 @@ A self-contained moderator-actions Devvit app for r/RPClipsGTA. It provides:
 
 - **Escalate** on posts and comments: applies the in-app warning/ban ladder,
   replies to the target, bans repeat offenders through Reddit, and records
-  action history in installation Redis.
+  authoritative action history in installation Redis, with a private Reddit wiki backup.
 - **Remove post**: moderator-initiated deterministic R4/R5/R6/R12 detection,
   followed by removal and policy-controlled escalation.
 - **Remove & escalate**: one press on a post or comment that removes the
@@ -265,6 +265,16 @@ Redis state is installation-scoped and idempotent:
 - `punish:lock:{username}` — non-expiring owner-token lock. It is released
   with WATCH/MULTI/EXEC, never with an unsafe GET-then-DEL sequence. There is
   no in-app recovery because deletion cannot fence a stale owner.
+- `modactions:wiki:escalation-log:active` and
+  `modactions:wiki:escalation-log:lock` — mirror bookkeeping and a short-lived
+  append lock. Finalized rows are also backed up in private, moderator-only
+  v1 wiki pages named `escalation-log/YYYY-MM` (and rotated pages such as
+  `escalation-log/YYYY-MM-2`) under the Reddit 450 KiB safety threshold; old
+  pages are never edited again. Each page is JSONL: one compact JSON object per
+  line, with the normalized username in `username` followed by the
+  `ModActionRecord` fields (`id`, `at`, `rule`, `action`, `label`, `modUser`,
+  `targetThingId`; finalized lines have no `state`). Redis remains authoritative
+  and the wiki pages are an append-only backup.
 
 ## Remove & escalate action
 

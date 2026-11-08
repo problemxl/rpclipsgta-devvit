@@ -7,6 +7,7 @@ import {
   assertUserActionLockHeld,
   releaseUserActionLock,
 } from '../lib/user-lock.js';
+import { mirrorAppend, type HistoryMirrorDeps } from '../lib/history-mirror.js';
 
 export type PendingResolution = 'inspect' | 'applied' | 'not-applied';
 
@@ -25,6 +26,8 @@ export interface ReconcilePendingDeps {
   /** Current moderator membership; this action never calls Reddit to mutate. */
   readonly authorizeActor: (subredditName: string, actor: string) => Promise<boolean>;
   readonly now?: () => number;
+  /** Best-effort Reddit wiki backup; Redis history remains authoritative. */
+  readonly historyMirror?: HistoryMirrorDeps;
 }
 
 export interface ReconcilePendingInput {
@@ -207,6 +210,19 @@ export async function reconcilePending(
             ? 'post-state did not match the requested reconciliation'
             : 'history transaction was not confirmed; no safe success reported',
         });
+      }
+
+      if (input.resolution === 'applied' && deps.historyMirror) {
+        const { state: _pendingState, ...finalizedRecord } = pending;
+        try {
+          await mirrorAppend(deps.historyMirror, {
+            subredditName: input.subredditName,
+            username,
+            record: finalizedRecord,
+          });
+        } catch (error) {
+          console.error(`[reconcile] escalation wiki mirror failed: ${detailOf(error)}`);
+        }
       }
 
       return audit({ status: 'reconciled', username, recordId, resolution: input.resolution });

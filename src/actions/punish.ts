@@ -7,6 +7,7 @@ import {
   releaseUserActionLock,
   userActionLockKey,
 } from '../lib/user-lock.js';
+import { mirrorAppend, type HistoryMirrorDeps } from '../lib/history-mirror.js';
 
 const RULES_WIKI = 'https://www.reddit.com/r/RPClipsGTA/wiki/subreddit/rules/';
 const MODMAIL_APPEAL =
@@ -29,6 +30,8 @@ export interface PunishDeps {
     note?: string;
   }) => Promise<void>;
   readonly now?: () => number;
+  /** Best-effort Reddit wiki backup; Redis history remains authoritative. */
+  readonly historyMirror?: HistoryMirrorDeps;
 }
 
 export interface PunishInput {
@@ -320,6 +323,20 @@ export async function punish(
           `[punish] Reddit action applied but pending record ${pendingRecord.id} ` +
             'could not be finalized after 3 safe attempts'
         );
+      } else if (deps.historyMirror) {
+        // markApplied/verification proves this is the finalized form. Do not
+        // mirror the pending marker or any action whose outcome is ambiguous.
+        const { state: _pendingState, ...finalizedRecord } = pendingRecord;
+        try {
+          await mirrorAppend(deps.historyMirror, {
+            subredditName: input.subredditName,
+            username: input.targetUser,
+            record: finalizedRecord,
+          });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          console.error(`[punish] escalation wiki mirror failed: ${detail}`);
+        }
       }
     }
 

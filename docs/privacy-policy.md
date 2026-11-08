@@ -24,7 +24,7 @@ The App does not ask for or intentionally collect real names, email addresses, p
 
 ## 3. Storage, Processing, and External Requests
 
-Application data is stored exclusively in Devvit-provided Redis associated with the App's Reddit installation. This includes escalation-history rows, per-user action-lock tokens, the cached Twitch OAuth token, and operational deduplication keys. The App has no external database. The widget and v1 `config/sidebar` wiki text that it writes are Reddit-native content on the relevant subreddit, not a separate external database.
+Application state is stored in Devvit-provided Redis associated with the App's Reddit installation. This includes the authoritative escalation-history rows, per-user action-lock tokens, the cached Twitch OAuth token, and operational deduplication keys. After an escalation row is finalized, the App also writes an append-only backup line to private, moderator-only Reddit-native v1 wiki pages named `escalation-log/YYYY-MM` (with numbered rotation pages when needed). These wiki pages are Reddit content on the relevant subreddit, not an external database; Redis remains authoritative. The App has no external database. The widget and v1 `config/sidebar` wiki text that it writes are likewise Reddit-native content, not a separate external database.
 
 The App's only outbound network requests outside Reddit/Devvit are to these two allowlisted Twitch domains:
 

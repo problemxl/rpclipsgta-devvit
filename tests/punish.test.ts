@@ -14,6 +14,7 @@ import {
   type RedisSetOptions,
   type RedisStringLike,
 } from '../src/lib/history.js';
+import type { HistoryMirrorDeps } from '../src/lib/history-mirror.js';
 
 const NOW = 1_000_000_000;
 const DAY = 24 * 60 * 60 * 1000;
@@ -191,6 +192,17 @@ class FakeRedis implements FakeRedisShape {
   }
 }
 
+function mirrorDeps(redis: FakeRedis): HistoryMirrorDeps & { update: ReturnType<typeof vi.fn> } {
+  const update = vi.fn(async (_subredditName: string, _page: string, _content: string) => undefined);
+  return {
+    redis,
+    getWikiPage: async () => undefined,
+    updateWikiPage: update,
+    sleep: async () => undefined,
+    update,
+  };
+}
+
 function deps(overrides: Partial<PunishDeps> = {}, redis = new FakeRedis()): PunishDeps {
   const actualRedis = (overrides.redis ?? redis) as FakeRedisShape;
   return {
@@ -305,6 +317,34 @@ describe('punish', () => {
     const current = deps({}, redis);
     await expect(punish(current, input)).resolves.toMatchObject({ action: 'warn', priors: 0 });
     expect(current.submitComment).toHaveBeenCalled();
+  });
+
+  it('mirrors only a successfully finalized action', async () => {
+    const redis = new FakeRedis();
+    const mirror = mirrorDeps(redis);
+    const current = deps({ redis, historyMirror: mirror });
+
+    await expect(punish(current, input)).resolves.toMatchObject({ finalized: true });
+    expect(mirror.update).toHaveBeenCalledTimes(1);
+    expect(mirror.update.mock.calls[0]?.[2]).toContain('"username":"target"');
+
+    const pendingRedis = new FakeRedis();
+    const pendingMirror = mirrorDeps(pendingRedis);
+    const pendingCurrent = deps({
+      redis: pendingRedis,
+      historyMirror: pendingMirror,
+      submitComment: vi.fn(async () => 'malformed receipt'),
+    });
+    await expect(punish(pendingCurrent, input)).rejects.toThrow('pending record retained');
+    expect(pendingMirror.update).not.toHaveBeenCalled();
+
+    const failedRedis = new FakeRedis();
+    const failedMirror = mirrorDeps(failedRedis);
+    const failedHistory = createHistoryStore(failedRedis);
+    vi.spyOn(failedHistory, 'markApplied').mockResolvedValue(false);
+    const failedCurrent = deps({ redis: failedRedis, history: failedHistory, historyMirror: failedMirror });
+    await expect(punish(failedCurrent, input)).resolves.toMatchObject({ finalized: false });
+    expect(failedMirror.update).not.toHaveBeenCalled();
   });
 
   it('fails closed when strict history cannot be read', async () => {

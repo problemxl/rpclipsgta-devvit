@@ -12,8 +12,9 @@
  * everywhere else.
  *
  * Escalations are executed entirely in the app: the ladder and decay policy
- * are pure code, action history is in installation Redis, and Reddit receives
- * the warning comment or ban directly.
+ * are pure code, action history is authoritative in installation Redis with a
+ * best-effort Reddit wiki backup, and Reddit receives the warning comment or
+ * ban directly.
  */
 
 import { Devvit, SettingScope } from '@devvit/public-api';
@@ -1037,6 +1038,7 @@ const reconcilePendingForm = Devvit.createForm(
           (await context.reddit
             .getModerators({ subredditName: name, username, limit: 1, pageSize: 1 })
             .all()).length > 0,
+        historyMirror: createHistoryMirrorDeps(context),
       },
       input
     );
@@ -1054,9 +1056,46 @@ Devvit.addMenuItem({
   },
 });
 
+function createHistoryMirrorDeps(context: Devvit.Context) {
+  return {
+    redis: context.redis,
+    getWikiPage: async (subredditName: string, page: string) => {
+      try {
+        const wikiPage = await context.reddit.getWikiPage(subredditName, page, { wikiVersion: 'v1' });
+        return wikiPage.content;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        // Reddit reports a not-yet-created page as a 404. Other read failures
+        // must abort the append rather than overwrite an existing backup.
+        if (/404|not found/i.test(detail)) return undefined;
+        throw new Error(`[history-mirror-read] wiki ${page} failed for r/${subredditName}: ${detail}`);
+      }
+    },
+    updateWikiPage: async (subredditName: string, page: string, content: string) => {
+      await context.reddit.updateWikiPage({
+        subredditName,
+        page,
+        content,
+        reason: 'Append finalized escalation history backup',
+        wikiVersion: 'v1',
+      });
+    },
+    setWikiPageSettings: async (subredditName: string, page: string) => {
+      await context.reddit.updateWikiPageSettings({
+        subredditName,
+        page,
+        listed: false,
+        permLevel: 2,
+        wikiVersion: 'v1',
+      });
+    },
+  };
+}
+
 function createPunishDeps(context: Devvit.Context): PunishDeps {
   return {
     history: createHistoryStore(context.redis),
+    historyMirror: createHistoryMirrorDeps(context),
     // The same Redis client serializes punishments per user via the lock in
     // punish().
     redis: context.redis,
