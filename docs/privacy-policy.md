@@ -2,7 +2,7 @@
 
 **Last Updated: 2026-11-01**
 
-This Privacy Policy explains how **esclation-bot** (the "App"), maintained by u/rhythmkiller, handles information when it operates in r/RPClipsGTA and authorized development or test subreddits.
+This Privacy Policy explains how **rpcclipsgta-moderator** (the "App"), maintained by u/rhythmkiller, handles information when it operates in r/RPClipsGTA and authorized development or test subreddits.
 
 ## 1. Overview
 

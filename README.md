@@ -106,7 +106,7 @@ submits them for Reddit admin review (typically 1–2 business days). Until a
 domain is approved, every scheduled refresh fails with
 `7 PERMISSION_DENIED: … HTTP request to domain: … is not allowed` in the app
 logs and the widget is not created. Track and re-check approval status at
-`https://developers.reddit.com/apps/esclation-bot/developer-settings`; after
+`https://developers.reddit.com/apps/rpcclipsgta-moderator/developer-settings`; after
 approval, the next scheduled refresh succeeds without a redeploy (re-upload and
 re-install only if denials persist). Reddit policy also requires apps that use
 `fetch` to link Terms & Conditions and a Privacy Policy in the app details
@@ -414,7 +414,7 @@ resolve an ambiguous Reddit outcome or force-unlock in production.
 5. Host the public [Terms & Conditions](docs/terms.md) and [Privacy Policy](docs/privacy-policy.md)
    source documents (for example, with GitHub Pages or a gist). Paste both
    public URLs into the app's developer-settings page at
-   `https://developers.reddit.com/apps/esclation-bot/developer-settings`.
+   `https://developers.reddit.com/apps/rpcclipsgta-moderator/developer-settings`.
    Reddit requires both links before `devvit publish` will succeed. The Twitch
    credentials remain in app settings and are never committed to the repository.
 6. `devvit upload` (or `devvit publish`).
