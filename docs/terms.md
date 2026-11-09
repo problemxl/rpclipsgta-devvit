@@ -2,7 +2,7 @@
 
 **Last Updated: 2026-11-01**
 
-These Terms & Conditions ("Terms") govern your access to and use of **rpcclipsgta-moderator** (the "App"), a Reddit application maintained by u/rhythmkiller for r/RPClipsGTA and its development and test subreddits.
+These Terms & Conditions ("Terms") govern your access to and use of **rpcclipsgta-mod** (the "App"), a Reddit application maintained by u/rhythmkiller for r/RPClipsGTA and its development and test subreddits.
 
 ## 1. Acceptance of Terms
 
